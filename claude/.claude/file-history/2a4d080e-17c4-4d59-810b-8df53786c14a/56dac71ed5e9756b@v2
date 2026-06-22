@@ -1,0 +1,51 @@
+#!/bin/bash
+# Auto-mirror an Android device over TCP/IP with scrcpy.
+# Flow: find a phone already in TCP mode -> else onboard via USB (enable adb tcpip)
+#       -> connect -> mirror -> on exit/disconnect, rescan and retry.
+set -u
+
+ADB_PORT=5555
+SUBNET=192.168.1.0/24
+
+find_tcp_ip() {            # echo first LAN host with adb (5555) open, or nothing
+    nmap -sT -p "$ADB_PORT" --open -n -T4 "$SUBNET" -oG - \
+        | awk '/Up$/{ip=$2} /open/{print ip}' \
+        | head -n1
+}
+
+onboard_via_usb() {        # wait for USB device, enable tcpip, echo its LAN IP
+    echo "Waiting for USB device... connect the phone with the USB-C cable." >&2
+    local usb=""
+    while [ -z "$usb" ]; do
+        usb=$(adb devices | awk 'NR>1 && $2=="device" && $1 !~ /:/{print $1; exit}')
+        [ -z "$usb" ] && sleep 2
+    done
+    echo "USB device found: $usb. Enabling adb tcpip on $ADB_PORT..." >&2
+    adb -s "$usb" tcpip "$ADB_PORT"; sleep 3
+    local ip=""
+    while [ -z "$ip" ]; do
+        sleep 5
+        ip=$(find_tcp_ip)
+    done
+    echo "$ip"
+}
+
+while true; do
+    echo "Looking for an Android device in TCP/IP mode..."
+    DEVICE_IP="$(find_tcp_ip)"
+    [ -z "$DEVICE_IP" ] && DEVICE_IP="$(onboard_via_usb)"
+
+    echo "Connecting to $DEVICE_IP:$ADB_PORT ..."
+    adb connect "$DEVICE_IP:$ADB_PORT" >/dev/null 2>&1
+
+    if [ "$(adb -s "$DEVICE_IP:$ADB_PORT" get-state 2>/dev/null)" != "device" ]; then
+        echo "Device $DEVICE_IP not responding; rescanning in 5s."
+        sleep 5
+        continue
+    fi
+
+    echo "Launching scrcpy to $DEVICE_IP:$ADB_PORT"
+    scrcpy --tcpip="$DEVICE_IP:$ADB_PORT" --fullscreen --stay-awake --max-fps=30 --no-audio
+    echo "scrcpy exited ($?). Rescanning in 5s."
+    sleep 5
+done

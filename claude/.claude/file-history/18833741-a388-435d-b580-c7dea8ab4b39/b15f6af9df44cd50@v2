@@ -1,0 +1,104 @@
+# Offline EKF2 reconstruction & tuning
+
+Re-runs PX4's EKF2 estimator offline, in Python, from a `.ulg` flight log using
+tuning parameters supplied in a YAML file. It reproduces the NED position and
+velocity estimates **and their covariance**, so you can see how a parameter
+change would have moved the estimate and the ±3σ envelope relative to the actual
+flight. If the YAML values equal what flew, the reconstruction closely matches
+the logged estimator.
+
+This is the Kalman-corrected sibling of `../ekf_ned_reconstruction` (which does
+IMU-only strapdown). It shares that tool's ULG/IMU/GPS plumbing and adds the full
+24-state EKF2 predict + measurement-update so covariance is reproduced, not just
+the trajectory.
+
+## Install
+
+Pure Python; no build step. Dependencies (all standard):
+
+```
+pip install -r requirements.txt   # numpy scipy sympy matplotlib pyulog PyYAML
+```
+
+## Usage
+
+```bash
+# 1. Write a YAML of the flight's own EKF2 params (this is the editable surface):
+python3 ekf2_offline.py LOG.ulg --dump-params params.yaml
+
+# 2. Run with that YAML (omit --params to just use the log's params):
+python3 ekf2_offline.py LOG.ulg --params params.yaml
+```
+
+Edit any value in `params.yaml` (every noise term and every time-delay term is
+exposed and annotated with the PX4 `EKF2_*` parameter it maps to) and re-run to
+see the effect against the real flight.
+
+Options: `--out-dir DIR`, `--ekf-instance N`, `--imu-source {auto,fifo,vehicle_imu,sensor_combined}`,
+`--seed-mode {log_diag,cold}`, `--show`.
+
+### Outputs (PNG + pickled matplotlib Figure, under `./ekf2_figures/`)
+
+- `<log>_pos_vel_recon` — NED position & velocity: logged EKF estimate, reconstructed
+  EKF, GPS overlay, and the **±3σ band from the reconstructed covariance**.
+- `<log>_variance_cmp` — reconstructed vs logged covariance diagonal (pos/vel).
+
+Reopen a pickle with the sibling tool's `show_figure.py`.
+
+## How it works
+
+- **State**: the 24-state PX4 SymForce filter — quaternion, NED vel, NED pos,
+  gyro/accel (delta) bias, earth/body mag, wind. Compared against the logged
+  `estimator_states` (the delayed fusion-horizon state, with the true covariance
+  diagonal) — *not* the output-predicted `vehicle_local_position`.
+- **IMU**: rebuilt from the raw `sensor_*_fifo` (~770 Hz, coning/batch-mean +
+  calibration) because the logged `vehicle_imu` is decimated to ~2 Hz; then
+  summed to the predict rate (`EKF2_PREDICT_US`).
+- **Covariance Jacobians** `A`, `G` are derived symbolically with SymPy from the
+  exact `predict_covariance` model in PX4's `ekf_derivation/derivation.py`
+  (the same analytic math the firmware's generated C++ is built from) and
+  evaluated per step. The covariance update is `P = A P Aᵀ + G·var_u·Gᵀ + Q_add`.
+- **Fusions** (this flight's active set, in PX4's per-cycle order): mag-heading →
+  GPS 3D velocity → GPS horizontal position → baro height (via a scalar bias
+  estimator) → GPS height (the reference). Sequential scalar updates with the
+  same short-form covariance update and innovation gating as PX4.
+- **Time delays**: each sensor is fused at the fusion horizon shifted by
+  `EKF2_*_DELAY` (+ half a predict interval), via per-sensor queues.
+- **Seeding**: state + covariance diagonal seeded from the first GPS-aided
+  `estimator_states` sample (`--seed-mode log_diag`), or PX4's
+  `initialiseCovariance` (`--seed-mode cold`). Robustness: GPS velocity/position
+  are reset to GPS if fusion is gated out for longer than 0.5 s (PX4 has the same
+  reset safety net), and logging-dropout IMU samples are skipped.
+
+## Validation (test log `OD1A072_pos_hold.ulg`, a high-vibration RTK hover)
+
+Running with the log's own params, after a short burn-in:
+
+| quantity | North | East | Down |
+|---|---|---|---|
+| position RMS (recon vs log) | 0.08 m | 0.07 m | 0.24 m |
+| velocity RMS (recon vs log) | 0.20 m/s | 0.16 m/s | 0.15 m/s |
+| position variance ratio recon/log | 0.99 | 0.99 | 1.18 |
+| velocity variance ratio recon/log | 0.95 | 0.96 | 1.20 |
+
+Per-fusion innovation variances match the logged `estimator_innovation_variances`
+to within ~1% (heading, GPS h-pos/h-vel, baro) — i.e. the covariance and fusion
+math reproduce the flight.
+
+## Known limitations
+
+- **High-vibration logs**: the EKF input is rebuilt from FIFO; on extreme-vibration
+  airframes the reconstructed strapdown drifts more than the firmware's
+  `vehicle_imu`. The GPS reset safety net and dropout-skipping keep the state
+  bounded and tracking, but transient velocity excursions can remain. Horizontal
+  channels match best.
+- **Vertical channel** (Down) is slightly less matched than horizontal — the
+  baro-bias-estimator + dual GPS/baro height interplay is the next refinement.
+- **Off-diagonals of P are not logged**, so an exact cold covariance match is
+  impossible; `log_diag` seeds the diagonal and lets correlations rebuild.
+- **float64** (PX4 is float32) and SymPy CSE ordering ⇒ close, not bit-exact.
+- **Mag declination** uses `EKF2_MAG_DECL`; PX4 with `EKF2_DECL_TYPE` geo uses a
+  WMM value (minor 2nd-order effect on pos/vel for a hover).
+- Omitted (negligible here, off in this flight): gravity fusion, accel-bias
+  manoeuvre inhibit, output predictor, optical-flow/range/airspeed/EV/wind.
+```

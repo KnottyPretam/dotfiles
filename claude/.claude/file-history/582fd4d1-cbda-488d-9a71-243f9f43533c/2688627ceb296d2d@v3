@@ -1,0 +1,164 @@
+# Plan: EKF2 End-to-End Estimator Reference (sensors → prefilter → EKF → outputs → selector)
+
+## Context
+
+The user wants a single comprehensive technical reference on PX4's **EKF2 estimator**: every sensor
+that feeds it, the prefiltering between the driver level and the filter, the core EKF math (states,
+prediction, covariance, fusion), the outputs, and a high-level treatment of the EKF *selector* plus how
+**R** (measurement noise) and **Q** (process noise) are "bumped" at runtime. It must read like the
+existing `knightwerx-vault/px4-notes` entries (esp. `imu_clarification_2026-05-14.*`, which pairs a
+`.md`/`.html` with a pipeline `.svg`): blockquote provenance header, TL;DR, numbered sections, dense
+file:line tables, a parameter reference, and a file reference. Deliver **both Markdown and HTML**, with
+**hand-authored SVG block diagrams**, in `/home/choudhury/knightwerx-vault/px4-notes/`.
+
+This supersedes the previous (narrow) height-reference note plan — that scenario becomes a short
+cross-referenced subsection here, not the whole document.
+
+### Decisions locked with the user
+- **Fusion depth = Tiered.** Full equations + call traces for the always-on core (IMU strapdown
+  predict, Q/covariance, the generic Kalman update, vel/pos/height, mag, GPS). EVERY other source
+  (airspeed, sideslip, drag, optical flow, range, external vision, gravity, aux-vel, zero-velocity,
+  zero-yaw, fake pos/hgt) still gets a full row in a master fusion table + a short paragraph. Nothing
+  omitted; depth ∝ importance.
+- **Diagrams = hand-authored SVG files** embedded like the existing notes (graphviz/`dot` is not
+  installed; `pandoc 3.1.3`, `inkscape`, `python3` are available — SVG authored as XML / via a small
+  python emitter, validated with inkscape).
+
+## Deliverables (in `/home/choudhury/knightwerx-vault/px4-notes/`)
+- `ekf2_estimator_pipeline_2026-05-25.md`
+- `ekf2_estimator_pipeline_2026-05-25.html`  (pandoc: `-s --toc --metadata title=…`)
+- `ekf2_estimator_pipeline_2026-05-25_pipeline.svg`  — end-to-end data pipeline (4 layers)
+- `ekf2_estimator_pipeline_2026-05-25_cycle.svg`     — EKF update cycle: Run→update→predict→fuse→output predictor, with R/Q-inflation hooks annotated
+- `ekf2_estimator_pipeline_2026-05-25_selector.svg`  — EKF2Selector scoring/failover
+
+## Git provenance to embed (verified at write time; re-confirm before writing)
+- HEAD: `791030d72193440844b8ca8230568fc64f02e6ee`  ·  Branch: `hotfix`  ·  Describe: `ext/ODD-0.0.0-3-g791030d721`
+- Repo: `PX4-Autopilot` (KW fork) · Local: `/home/choudhury/repos/PX4-Autopilot` · Date: 2026-05-25
+- No PX4 source is modified and nothing is committed; provenance lives **inside** the note (house style).
+
+## Document outline (identical content for .md and .html)
+
+**Header blockquote** (date / repo / local path / branch / HEAD) + **TL;DR**: 24-state EKF fuses at a
+*delayed* time horizon; an output predictor propagates the newest IMU forward to "now" for low-latency
+attitude/vel/pos; sensors enter via uORB → per-sensor delay/ring-buffer; a selector promotes 1 of N
+instances. NED throughout; biases are *delta* biases.
+
+1. **Scope & board context** — what this covers; which sensors are actually wired on
+   `armada-ctrl-zero-h7-oem` (3 IMUs incl. ICM-20948 mag) — cross-link `imu_clarification` note.
+2. **End-to-end pipeline** — embed `_pipeline.svg`; narrate 4 layers (driver → sensors-module prefilter
+   → EKF2 ingest/buffer → EKF core → output predictor → output topics).
+3. **Sensor input layer**
+   - 3.1 Topic→struct→entry-point→buffer table (vehicle_imu/sensor_combined, vehicle_magnetometer,
+     vehicle_air_data, sensor_gps, airspeed_validated, vehicle_optical_flow, distance_sensor,
+     vehicle_visual_odometry, landing_target_pose).
+   - 3.2 IMU prefilter path: driver → `VehicleIMU` (calibration + coning-corrected `Integrator`, **no
+     LPF** on the EKF path; the notched/LPF'd `vehicle_angular_velocity`/`vehicle_acceleration` go to
+     *controllers*, not EKF — cross-ref imu note). Integrator/coning math.
+   - 3.3 Time alignment & buffering: `EKF2_*_DELAY`, the `setXxxData` time-shift
+     `t − delay_ms·1e3 − dt_ekf_avg·5e5`, `RingBuffer`, `_obs_buffer_length`, the **IMU down-sampler**
+     (quaternion-accumulated Δθ, frame-rotated Δv) → `_dt_ekf_avg`, fusion horizon `_time_delayed_us`.
+   - 3.4 Sample structs from `common.h` (imu/mag/baro/gps/flow/extVision/airspeed/range/auxVel) + units.
+   - 3.5 EKF-side sensor prefilters: baro `_baro_lpf` (AlphaFilter) + `compensateBaroForDynamicPressure`;
+     GPS checks; ground-effect deadzone.
+   - 3.6 Input parameter table (delays / noise / gates / body offsets).
+4. **The 24-state vector** — table: index ↔ `stateSample` member ↔ symbol ↔ units ↔ meaning. Emphasize
+   `delta_ang_bias` [rad], `delta_vel_bias` [m/s] are *delta* biases. Covariance `P` 24×24.
+5. **EKF update cycle** — embed `_cycle.svg` (call stack + 14-controller dispatch + output predictor;
+   R/Q hooks annotated).
+   - 5.1 State prediction (strapdown): quaternion from corrected Δθ; `v += R·(Δv−Δv_b) + g·dt`;
+     trapezoidal position.
+   - 5.2 Covariance prediction + **Q**: SymForce `predict_covariance.h`; Q-construction table mapping
+     `EKF2_GYR/ACC/GYR_B/ACC_B/MAG_E/MAG_B/WIND_NSD` → states; symmetry/limits; bias-inhibit.
+   - 5.3 Generic measurement update: `fuse()` (ekf_helper.cpp:789); `y=z−h(x)`, `S=HPHᵀ+R`,
+     `K=PHᵀ/S`, `x−=Ky`, `P−=KHP`; **test ratio** `y²/(gate²·S) < 1`.
+6. **Fusion sources (tiered)**
+   - 6.1 Master fusion table — all 14 controllers (fn @ file:line, z, h(x), states, R-param, gate-param,
+     generated Jacobian header). Nothing omitted.
+   - 6.2 Deep dives: vel/pos/height (`vel_pos_fusion` + `height_control` dispatcher + baro/gnss height +
+     height bias estimators); magnetometer (3-axis + heading + declination); GPS (pos/vel/yaw).
+   - 6.3 Short paragraphs: airspeed, sideslip, drag, optical flow, range, external vision, gravity,
+     aux-vel, zero-velocity, zero-yaw, fake pos/hgt.
+   - 6.4 Height/position **bias estimator** math (scalar Kalman; `(_sensor_ref != _sensor)` freeze) —
+     condensed from prior note; fold in the `EKF2_HGT_REF=0` baro-reference case as the worked example.
+   - 6.5 `EKFGSF_yaw` — high level (bank of N AHRS+EKF for emergency yaw reset).
+7. **Outputs**
+   - 7.1 Output predictor (delay-compensation complementary filter): `_output_buffer`,
+     `calculateOutputStates` (forward INS), `correctOutputStates` (q/vel/pos error feedback, gains from
+     `EKF2_TAU_VEL`/`EKF2_TAU_POS`), IMU lever-arm correction. Equations.
+   - 7.2 Output-topic table — the 22 `Publish*` methods → topic → key fields → rate.
+8. **EKF selector & runtime noise adaptation (high level + diagrams)**
+   - 8.1 `EKF2Selector` — embed `_selector.svg`; N instances → gyro/accel error accumulators +
+     combined/relative test ratios → hysteresis → primary select/failover → republish system topics.
+     `EKF2_SEL_*` param table.
+   - 8.2 **R/Q "bumping"** table (location · trigger · what inflates · param): R relaxations (GPS
+     pos/vel/hgt noise vs `pos_noaid_noise`, 1.5× vertical, bias `max(0.01²,R)` floor) and Q/P inflation
+     (bias process noise, bias-estimator **×1000** boost on offset detect, mag/wind growth gating,
+     `increaseQuatYawErrVariance`, reset variances, gyro/accel **bias-inhibit** freeze).
+9. **Parameter reference** — consolidated `EKF2_*` table, defaults verified against `ekf2_params.c`.
+10. **File reference** — every cited source file.
+(Optional **FAQ** if space allows, matching house style.)
+
+## Verified anchors (lock these; spot-check the rest at write time)
+- States: `EKF/common.h:269-277` (quat0-3, vel4-6, pos7-9, Δang_b10-12, Δvel_b13-15, magI16-18,
+  magB19-21, wind22-23). Symbolic model: `EKF/python/ekf_derivation/derivation.py:39,64,99`.
+- Cycle: `EKF/ekf.cpp:158` `update()`, `:253` `predictState`; `EKF/covariance.cpp:102`
+  `predictCovariance` (+ `python/ekf_derivation/generated/predict_covariance.h`); `EKF/control.cpp:46`
+  `controlFusionModes`, dispatch order lines **106,109,112,115,119,123,126,127,131,136,139,141,144,145**
+  (mag, optical-flow, gps, airdata/airspeed, beta/sideslip, drag, height, gravity, EV, aux-vel,
+  zero-yaw, zero-vel, fake-pos, fake-hgt); generic update `EKF/ekf_helper.cpp:789` `fuse()`.
+- Ingest: `EKF/estimator_interface.cpp` `setIMUData/setMagData/setBaroData/setGpsData/…`;
+  `EKF/imu_down_sampler.cpp/.hpp`; `EKF/RingBuffer.h`; baro LPF `EKF/baro_height_control.cpp:67,73`;
+  `compensateBaroForDynamicPressure` in `EKF/ekf_helper.cpp` (~238 — verify).
+- Generated Jacobians: `EKF/python/ekf_derivation/generated/compute_{mag_innov_innov_var_and_hx,
+  mag_{y,z}_innov_var_and_h, mag_declination_*, yaw_321/312_*, airspeed_*, sideslip_*, drag_{x,y}_*,
+  flow_*, gravity_*, gnss_yaw_*}.h`.
+- Bias estimator: `EKF/bias_estimator.cpp` (predict `P+=ψ·dt`, fuse `S=P+max(0.01²,R)`, `K=P/S`,
+  **×1000** boost on offset detect), `EKF/height_bias_estimator.hpp:42-74` (reference-freeze guard).
+- Output predictor: `EKF/output_predictor.cpp:168` calc, `:242` correct, `:327`/`:361` apply.
+- Outputs: `EKF2.cpp:688` `_ekf.update()`; `Publish*` methods at lines 923–1862 (Attitude 983,
+  LocalPosition 1420, GlobalPosition 1169, Odometry 1547, Innovations 1256, TestRatios 1333,
+  Variances 1377, Status 1655, StatusFlags 1706, SensorBias 1589, States 1643, Wind 1832,
+  YawEstimatorStatus 1812, baro/gnss/rng/ev bias 1003/1017/1031/1046, OpticalFlowVel 1862).
+- Selector: `EKF2Selector.cpp` `UpdateErrorScores`/`SelectInstance`; params `ekf2_params_selector.c`
+  (`EKF2_SEL_ERR_RED`, `EKF2_SEL_IMU_RAT/ANG/ACC/VEL`).
+- Param defaults VERIFIED in `ekf2_params.c`: `EKF2_PREDICT_US 10000`(:53), `EKF2_IMU_CTRL 3`(:65),
+  `EKF2_GYR_NOISE 1.5e-2`(:277), `EKF2_ACC_NOISE 3.5e-1`(:288), `EKF2_GYR_B_NOISE 1e-3`(:299),
+  `EKF2_ACC_B_NOISE 3e-3`(:310), `EKF2_MAG_B_NOISE 1e-4`(:321), `EKF2_MAG_E_NOISE 1e-3`(:332),
+  `EKF2_WIND_NSD 1e-2`(:345), `EKF2_GPS_V_NOISE 0.3`(:356), `EKF2_GPS_P_NOISE 0.5`(:367),
+  `EKF2_BARO_NOISE 3.5`(:389), `EKF2_MAG_NOISE 5e-2`(:411), `EKF2_BARO_GATE 5.0`(:547),
+  `EKF2_HGT_REF 1`(:657), `EKF2_BARO_CTRL 1`(:668), `EKF2_GPS_CTRL 7`(:706).
+  ⚠ `common.h` struct initializers differ from param defaults (e.g. baro 2.0, gps_v 0.5) — **cite
+  `ekf2_params.c` as the authoritative default**; mention the struct-init nuance once.
+
+## Generation steps (execution phase — NOT in plan mode)
+1. Author the three `.svg` diagrams (XML or small python emitter); validate with
+   `inkscape --query-width …` or open-check; keep them dependency-free.
+2. Write the `.md` per outline; embed SVGs via `![alt](file.svg)`.
+3. `pandoc ekf2_estimator_pipeline_2026-05-25.md -s --toc --metadata title="EKF2 Estimator — End-to-End Pipeline, Math & Outputs (2026-05-25)" -o ekf2_estimator_pipeline_2026-05-25.html`.
+
+## Critical source files (read-only; nothing modified)
+`EKF2.cpp/.hpp`, `EKF2Selector.cpp/.hpp`, `ekf2_params.c`, `ekf2_params_selector.c`;
+`EKF/common.h`, `ekf.cpp`, `ekf.h`, `control.cpp`, `covariance.cpp`, `ekf_helper.cpp`,
+`estimator_interface.cpp/.h`, `imu_down_sampler.cpp/.hpp`, `RingBuffer.h`, `output_predictor.cpp/.h`,
+`vel_pos_fusion.cpp`, `mag_fusion.cpp`/`mag_control.cpp`, `gps_control.cpp`/`gnss_height_control.cpp`/
+`gps_yaw_fusion.cpp`, `baro_height_control.cpp`/`height_control.cpp`, `airspeed_fusion.cpp`,
+`sideslip_fusion.cpp`, `drag_fusion.cpp`, `optflow_fusion.cpp`/`optical_flow_control.cpp`,
+`range_height_control.cpp`/`sensor_range_finder.cpp`, `ev_*_control.cpp`, `gravity_fusion.cpp`,
+`auxvel_fusion.cpp`, `zero_velocity_update.cpp`, `zero_innovation_heading_update.cpp`,
+`fake_*_control.cpp`, `bias_estimator.cpp/.hpp`, `height_bias_estimator.hpp`,
+`position_bias_estimator.hpp`, `EKFGSF_yaw.cpp/.h`,
+`python/ekf_derivation/derivation.py` + `generated/*.h`; upstream `src/modules/sensors/vehicle_imu/`.
+
+## Verification
+1. `ls -la …/ekf2_estimator_pipeline_2026-05-25.{md,html,_pipeline.svg,_cycle.svg,_selector.svg}` — all exist.
+2. HTML opens standalone (TOC + the 3 SVGs render); `grep -c '<table>' …html` ≥ expected; `<title>` correct.
+3. Spot-check every cited `file:line` against the repo at `791030d721`; confirm param defaults match
+   `ekf2_params.c` (not the `common.h` struct inits).
+4. Confirm the 14-controller dispatch order, the 24-state table, the generic-update equations, the
+   output-predictor equations, the 22 output topics, and the selector + R/Q-bump tables are all present.
+5. Confirm git provenance block matches `git rev-parse HEAD` / branch / describe at write time.
+
+## Notes
+- One document, two formats + 3 SVGs. No PX4 source changed; nothing committed. Reuse/condense the prior
+  `ekf2_height_ref_baro_2026-05-21` height-bias material as the worked bias-estimator example and
+  cross-link it rather than duplicating.

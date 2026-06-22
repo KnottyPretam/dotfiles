@@ -1,0 +1,82 @@
+# Map SITL chirp outputs to flight-test `actuator_outputs_2`
+
+## Context
+
+The chirp SITL runner works, but the user analyzes flight-test logs via **`actuator_outputs_2`**,
+which never appears in SITL (SITL has only `actuator_outputs_0`). Goal: reconcile the two so the
+chirp can be inspected in SITL the same way as in flight. Chosen approach: **map & compare** (no
+flight-code changes), aligning **by output function** rather than by instance index.
+
+### Why the instances differ (root cause — traced in code)
+- `actuator_outputs` multi-instance = **one per output *driver*** (`MixingOutput`), assigned in
+  advertise/startup order (`platforms/common/uORB/PublicationMulti.hpp:72`,
+  `src/lib/mixer_module/mixer_module.cpp:689`). Not a logging setting.
+- **SITL = one driver, `pwm_out_sim`, a singleton** (`PWMSim::task_spawn`, can't start twice) ⇒ only
+  `actuator_outputs_0` (PWM-µs; servos `output[0–7]`, motors `output[8–9]`) + normalized
+  `actuator_outputs_sim` for gazebo.
+- **Flight = several drivers**, each its own instance; on this airframe the motors live in board
+  defaults (not the shared airframe), on a separate ESC bus.
+- The chirp is **instance-independent**: `control_allocator` publishes single-instance
+  **`actuator_motors`** (Motor1–12) and **`actuator_servos`** (Servo1–8) before any per-bus mapping;
+  every `actuator_outputs_N[ch]` is one of those re-mapped/scaled for one bus via `<PREFIX>_FUNCn`.
+
+### Flight-log finding — VALIDATED on `OD1A064_rpyChirp.ulg`
+Ran the correlation mapper (read-only, host pyulog) on the provided flight log:
+- Instances present: **`1` and `2`** (no `_0`), both ~94 Hz.
+- **`actuator_outputs_2` = `UAVCAN_SV` (servo controller) = the 8 swashplate/elevon servos.** Its
+  channels match **Servo1–8 at corr 0.96–0.99**, in `UAVCAN_SV_FUNC1–8` order = `{201,202,203,207,204,205,206,208}`.
+- `actuator_outputs_1` = `UAVCAN_EC` = the **2 motors** (`UAVCAN_EC_FUNC1/2 = 101/102`).
+- `CA_CHIRP_*` params are **empty** in this log ⇒ the flight roll/pitch/yaw chirp used a *different*
+  mechanism than the new `CA_CHIRP` feature → compare by **function + signal shape/frequency**, not
+  identical injection.
+
+### The mapping (what the user needs)
+| function | flight log | SITL log |
+|----------|-----------|----------|
+| Servo1–8 (swash 201–206, elevons 207–208) | `actuator_outputs_2[ch]` (UAVCAN_SV order) **and** `actuator_servos[0–7]` | `actuator_outputs_0[0–7]` (PWM_MAIN order) **and** `actuator_servos[0–7]` |
+| Motor1–2 (101/102) | `actuator_outputs_1[0–1]` (UAVCAN_EC) **and** `actuator_motors[0–1]` | `actuator_outputs_0[8–9]` **and** `actuator_motors[0–1]` |
+
+`actuator_servos`/`actuator_motors` are **function-indexed and present in both logs** → the canonical,
+instance-independent comparison layer. The per-bus `actuator_outputs_N` channel order differs (UAVCAN_SV
+vs PWM_MAIN), so aligning raw `actuator_outputs` requires the function map (which the tool builds).
+
+## What gets built — under `Tools/chirp_sysid/` (host-side analysis: pyulog/numpy on the host; the
+flight log is not under the container mount, so this runs on the host, not in the container)
+
+### 1. `output_map.py` — function-aware mapper / comparator
+- **`--ulog FILE`**: for each `actuator_outputs` instance+channel, identify the carried function by
+  correlating the (normalized) channel against every `actuator_motors`/`actuator_servos` channel;
+  print `instance:channel → Motor_n/Servo_n (corr)`. Also dump nonzero `*_FUNC*` params as
+  cross-check, and flag the chirped axis. (Validated: this produced corr 0.96–0.99 on the flight log.)
+- **`--compare SITL.ulg FLIGHT.ulg [--function Servo3|Motor1|…]`**: align by function via the common
+  `actuator_servos`/`actuator_motors` layer; report correlation + normalized RMS over the chirp
+  window and optionally write an overlay PNG, so the user sees the SITL chirp vs the flight chirp for
+  the same physical actuator.
+
+Reuse the ulog pattern already used in runner verification (`pyulog.ULog(path, message_name_filter_list=[…])`, `.data_list`, `.initial_parameters`).
+
+### 2. `OUTPUTS.md` (linked from `README.md`)
+The root-cause + the concrete flight finding above (incl. the mapping table and that
+`actuator_outputs_2 = UAVCAN_SV servos`), the SITL channel layout, and how to run `output_map.py`.
+
+## Critical files (reference, read-only)
+`src/lib/mixer_module/mixer_module.cpp` / `platforms/common/uORB/PublicationMulti.hpp` (instance rule);
+`src/modules/simulation/pwm_out_sim/PWMSim.{cpp,hpp}` (SITL singleton + `actuator_outputs_sim`);
+`src/modules/control_allocator/ControlAllocator.cpp` (`actuator_motors`/`actuator_servos`);
+`src/modules/logger/logged_topics.cpp:155` (logs up to 3 `actuator_outputs` instances);
+airframes `13269_twinrotor_tailsitter` (UAVCAN_EC/SV funcs on hardware) & `1069_gazebo-classic_twinrotor_tailsitter` (SITL PWM_MAIN).
+
+## Verification
+- `python3 Tools/chirp_sysid/output_map.py --ulog /home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26/OD1A064_rpyChirp.ulg`
+  → expect `actuator_outputs_2[0–7] → Servo1–8` (the result already confirmed), `actuator_outputs_1[0–1] → Motor1/2`.
+- `--ulog Tools/chirp_sysid/logs/cyclic_pitch_*.ulg` → `actuator_outputs_0[0–7] → Servo1–8`, `[8–9] → Motor1/2`.
+- `--compare <sitl cyclic ulog> <flight ulg> --function Servo3` → correlation/RMS + overlay showing the
+  SITL cyclic chirp on a swashplate servo lines up (shape/sweep) with the flight servo in `actuator_outputs_2`.
+
+## Notes
+- Analysis-only; no flight-code or chirp-feature changes.
+- `actuator_outputs_N` values are not numerically identical across SITL vs flight (sim PWM-µs vs
+  UAVCAN servo units); the comparison is by function and normalized signal.
+- This flight log's chirp predates/avoids `CA_CHIRP`, so the comparison validates the output *path/shape*,
+  not an identical command; for an apples-to-apples chirp, run the `CA_CHIRP` SITL runner and compare
+  against a future flight that uses `CA_CHIRP`.

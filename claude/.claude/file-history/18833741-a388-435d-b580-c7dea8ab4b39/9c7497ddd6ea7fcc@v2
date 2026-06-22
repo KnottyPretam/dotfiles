@@ -1,0 +1,70 @@
+"""ULog access helpers + EKF-instance / IMU-device resolution.
+
+Lifted from ekf_ned_reconstruction.py (get_dataset/require/vec3/tsec,
+find_ekf_instance, ekf_imu_devices) so the two tools read alike.
+"""
+
+import sys
+
+import numpy as np
+
+
+def load_ulog(path):
+    from pyulog import ULog
+    return ULog(path)
+
+
+def get_dataset(ulog, name, multi_id=0):
+    for d in ulog.data_list:
+        if d.name == name and d.multi_id == multi_id:
+            return d
+    return None
+
+
+def require(ds, name):
+    if ds is None:
+        sys.exit(f"ERROR: required topic '{name}' not found in log")
+    return ds
+
+
+def has_field(ds, name):
+    return ds is not None and name in ds.data
+
+
+def vec3(ds, base):
+    """Stack 'base[0..2]' fields into an (N, 3) array."""
+    return np.column_stack([ds.data[f"{base}[{i}]"] for i in range(3)])
+
+
+def tsec(ds):
+    """timestamp field in seconds (float64)."""
+    return np.asarray(ds.data["timestamp"], dtype=np.float64) * 1e-6
+
+
+def field(ds, name, dtype=np.float64):
+    return np.asarray(ds.data[name], dtype=dtype) if name in ds.data else None
+
+
+def find_ekf_instance(ulog, requested):
+    """Use the requested estimator instance if present, else the first available
+    one (multi-EKF logs may only carry the selected primary, e.g. instance 1)."""
+    if get_dataset(ulog, "estimator_states", requested) is not None:
+        return requested
+    for i in range(6):
+        if get_dataset(ulog, "estimator_states", i) is not None:
+            return i
+    sys.exit("ERROR: no estimator_states found in log")
+
+
+def ekf_imu_devices(ulog, inst):
+    """(gyro_device_id, accel_device_id) the EKF instance uses -- to match
+    FIFO / CAL / vehicle_imu by device id."""
+    for src in (get_dataset(ulog, "estimator_sensor_bias", inst),
+                get_dataset(ulog, "estimator_status", inst),
+                get_dataset(ulog, "estimator_sensor_bias", 0)):
+        if src is not None and "gyro_device_id" in src.data:
+            return int(src.data["gyro_device_id"][0]), int(src.data["accel_device_id"][0])
+    vi = get_dataset(ulog, "vehicle_imu", inst) or get_dataset(ulog, "vehicle_imu", 0)
+    if vi is not None:
+        return int(vi.data["gyro_device_id"][0]), int(vi.data["accel_device_id"][0])
+    return None, None

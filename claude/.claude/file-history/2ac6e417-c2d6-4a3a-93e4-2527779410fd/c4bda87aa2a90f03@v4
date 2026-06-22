@@ -1,0 +1,144 @@
+# Add actuator source plots (motors, servos, outputs) with flat-top FFT
+
+## Context
+The script already has "source" plots (`motor_rpm_sources.png`, `motor_current_sources.png`,
+`motor_pwm_sources.png`) built by `_plot_source_panel` / `plot_vibration_sources` —
+time series on top, PSD on bottom, all related channels overlaid. We want the same
+two-panel view for the autopilot's per-channel actuator commands:
+`actuator_motors.control[*]`, `actuator_servos.control[*]`, and
+`actuator_outputs[*].output[*]`. These show what the mixer / control allocator is
+commanding each motor/servo/output and how that demand is distributed in frequency.
+
+Key difference from the existing source plots: the user wants the **same FFT as the
+imu_fft plots** — the flat-top single-FFT `direct_fft` (l.~132), **not** the Welch PSD
+that `_plot_source_panel` currently uses.
+
+Verified in the log (`log_1_2026-4-29-13-48-36.ulg`):
+- `actuator_motors` (plural), single instance, `control[0..11]`; only `control[0]`/
+  `control[1]` populated, `control[2..11]` all-NaN. ~5 Hz (dt ≈ 197 ms).
+- `actuator_servos` (plural), single instance, `control[0..7]`; `control[0..5]` active,
+  `control[6]`/`control[7]` constant. ~5 Hz.
+- `actuator_outputs`, **two instances (multi_id 1 and 2)**, `output[0..15]`, **no
+  `timestamp_sample`**, ~100 Hz (dt ≈ 9.94 ms, Nyquist ≈ 50 Hz).
+  - Instance 1: only output[0]/output[1] vary, saturating to 65535 (the "raw"/idle instance).
+  - Instance 2: output[0..6] vary with realistic PWM (≈360–700 µs).
+
+Decisions (confirmed with user):
+- Skip non-varying channels: drop all-NaN and near-zero-variance channels.
+- Time base: prefer `timestamp_sample` (fall back to `timestamp`), shifted by `T_OFFSET`.
+  (motors/servos have it; actuator_outputs falls back to `timestamp`.)
+- `actuator_outputs_*` → emit **one plot per instance**, named with the multi_id.
+- Output filenames: `actuator_motor_sources.png`, `actuator_servo_sources.png`,
+  `actuator_outputs_<i>_sources.png`.
+- Channel overlay + 2-panel layout identical to `motor_current_sources.png`.
+- The existing `motor_pwm_sources.png` (Welch, single picked instance) stays as-is;
+  these new direct-FFT per-instance output plots are additive.
+
+## Changes — `analyze_imu_vibration.py`
+
+### 1. Extend `_plot_source_panel` with an `fft_kind` arg (backward-compatible)
+Current signature: `_plot_source_panel(t, channels, title, units, outpath, t0, t1)`.
+- New signature: add `fft_kind="welch"` (default preserves existing motor/ESC/PWM plots).
+- **NaN-safe channel skip:** in the per-channel loop, after `seg = sig[mask]`, add
+  `if not np.isfinite(seg).all(): continue` *before* the existing `np.std(seg) < 1e-6`
+  check. (NaN channels currently slip past the variance check since `nan < 1e-6` is
+  False; this only removes channels that would otherwise plot as NaN — safe for
+  existing callers.)
+- **PSD branch:** replace the single `welch(...)` call with:
+  ```python
+  if fft_kind == "direct":
+      freqs, _, psd = direct_fft(seg, fs)        # flat-top, same as imu_fft plots
+  else:
+      freqs, psd = welch(seg, fs=fs, window="hann", nperseg=nperseg,
+                         noverlap=nperseg // 2, scaling="density", detrend="constant")
+  ```
+- **Suptitle:** make the method + resolution adapt:
+  ```python
+  if fft_kind == "direct":
+      method, res = "flat-top FFT", (fs / n_in)
+  else:
+      method, res = "Welch", (fs / nperseg)
+  fig.suptitle(f"{title}  —  {method}, window t={t0:.1f}–{t1:.1f}s, "
+               f"fs≈{fs:.0f} Hz, Δf≈{res:.2f} Hz")
+  ```
+  (`nperseg` stays computed for the Welch path; unused in the direct path.)
+- Everything else (time-series top panel, xlim `0..fs/2`, axis labels, legends) unchanged.
+
+### 2. New function: `plot_actuator_control_sources(ulog, outdir, t0, t1)`
+Add next to `plot_vibration_sources`. Drives all three topics from one spec list;
+generalizes the channel-key prefix (`control[` vs `output[`) and handles per-instance.
+```python
+def plot_actuator_control_sources(ulog, outdir, t0, t1):
+    """Per-channel actuator command sources, overlaid, with the same flat-top
+    direct_fft used by the imu_fft plots (time series top, PSD bottom). Mirrors
+    the motor_current_sources layout.
+      actuator_motors.control[*]      -> actuator_motor_sources.png
+      actuator_servos.control[*]      -> actuator_servo_sources.png
+      actuator_outputs[i].output[*]   -> actuator_outputs_<i>_sources.png (per instance)
+    """
+    specs = [
+        ("actuator_motors", "control[", "norm", "actuator_motor_sources.png",
+         "actuator_motors control per channel", False),
+        ("actuator_servos", "control[", "norm", "actuator_servo_sources.png",
+         "actuator_servos control per channel", False),
+        ("actuator_outputs", "output[", "PWM", None, None, True),
+    ]
+    for topic, prefix, units, fname, title, per_instance in specs:
+        instances = all_instances(ulog, topic)
+        if not instances:
+            print(f"[act_sources] no {topic}; skipping")
+            continue
+        for d in instances:
+            if "timestamp_sample" in d.data:
+                t = d.data["timestamp_sample"].astype(np.int64) / 1e6 - T_OFFSET
+            else:
+                t = t_seconds(d, ulog)
+            keys = sorted((k for k in d.data if k.startswith(prefix)),
+                          key=lambda s: int(s[len(prefix):-1]))
+            if not keys:
+                continue
+            channels = {k: d.data[k] for k in keys}
+            if per_instance:
+                out_fname = f"{topic}_{d.multi_id}_sources.png"
+                out_title = f"{topic}[{d.multi_id}] output per channel"
+            else:
+                out_fname, out_title = fname, title
+            _plot_source_panel(t, channels, out_title, units,
+                               outdir / out_fname, t0, t1, fft_kind="direct")
+```
+
+### 3. Wire into `main()`
+After the `plot_vibration_sources(ulog, OUTDIR, t0, t1)` call add:
+```python
+plot_actuator_control_sources(ulog, OUTDIR, t0, t1)
+```
+
+### 4. Update module docstring
+Add to the Outputs list (near the other `*_sources.png` entries):
+- `actuator_motor_sources.png        : actuator_motors control[*] time-series + flat-top FFT PSD`
+- `actuator_servo_sources.png        : actuator_servos control[*] time-series + flat-top FFT PSD`
+- `actuator_outputs_<i>_sources.png  : actuator_outputs[i] output[*] time-series + flat-top FFT PSD`
+
+## Reused, not reinvented
+- `_plot_source_panel` (extended) — same 2-panel layout as `motor_current_sources.png`.
+- `direct_fft` (l.~132) — the exact flat-top FFT the imu_fft plots use.
+- `all_instances` (l.88), `get_topic` (l.82), `t_seconds` (l.91), `T_OFFSET` shift,
+  and the `timestamp_sample` time-base idiom from `plot_timing_vehicle_imu` (l.~524).
+
+## Verification
+```
+cd /home/choudhury/tools/dev/imu_vibe
+python3 analyze_imu_vibration.py \
+  /home/choudhury/analysis/flight_tests/oddjob/firstHover/UNORGANIZED/first_tunes/log_1_2026-4-29-13-48-36.ulg
+```
+Confirm:
+1. Console prints `[sources] wrote ...` for `actuator_motor_sources.png`,
+   `actuator_servo_sources.png`, `actuator_outputs_1_sources.png`,
+   `actuator_outputs_2_sources.png`.
+2. All four PNGs exist in `imuVibe_log_1_2026-4-29-13-48-36_plots/`.
+3. Visual check: same 2-panel layout as `motor_current_sources.png` (time series top,
+   PSD bottom, channels overlaid); motors plot shows only `control[0]`/`control[1]`;
+   servos plot shows active channels (constants skipped); actuator_outputs_2 shows the
+   realistic PWM channels; suptitle reads "flat-top FFT".
+4. `motor_rpm_sources.png` / `motor_current_sources.png` / `motor_pwm_sources.png`
+   still render unchanged (Welch default path intact).

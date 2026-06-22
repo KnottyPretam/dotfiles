@@ -1,0 +1,47 @@
+#include "ms_gimbalControl.h"
+#include <iostream>
+#include <string>
+#include <cstring> // For memset
+
+ms_gimbalControl::ms_gimbalControl(const std::string& componentName) : kw_component(componentName)
+{
+
+}
+
+ms_gimbalControl::~ms_gimbalControl()
+{
+
+}
+
+void ms_gimbalControl::createComponent(kw_observer* _outputObserver)
+{
+    kw_component::createComponent(_outputObserver);
+}
+
+void ms_gimbalControl::mainThread() // Runs a thread for this component
+{
+    while (running) 
+    {
+        // Check queue for data to process
+        // Find Message name to call correct callback
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+void ms_gimbalControl::rotation_test()
+{
+
+    // vehicleData-> GET MESSAGE
+
+    vehicleData->
+
+    direction++;
+
+    if (direction >= 5)
+    {
+        direction = 1;
+    }
+
+
+    // SEND MESSAGE
+}

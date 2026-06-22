@@ -1,0 +1,222 @@
+# Diagnose & fix `mirror.sh` (Android auto-mirror) hangs
+
+## Context
+
+On the Raspberry Pi `kwx-user@192.168.1.180` (hostname `OddjobVideoPlayer`) a script
+`/home/kwx-user/SandmanMirror/mirror.sh` auto-mirrors an Android phone's screen onto the Pi's
+display using **scrcpy over TCP/IP** (adb port 5555). It is launched at boot by the systemd
+service **`androidmirror.service`**. The user reports it "hangs sometimes but not all the time."
+Goal: explain what the script does, find the intermittent-hang cause, and propose concrete fixes.
+
+> Investigation was done over SSH with **read-only** commands only (driven through a pty via an
+> inline Python helper, since `sshpass` isn't installed locally). No changes were made to the Pi.
+> Mid-session the Pi became unreachable (ARP `FAILED` on both the wired and Wi-Fi NICs → "No route
+> to host"), which corroborates a flaky network — relevant to finding #2 below.
+
+## What the script is (observed state)
+
+- Service: `androidmirror.service` → `ExecStart=/home/kwx-user/SandmanMirror/mirror.sh`, `User=root`,
+  `Environment=DISPLAY=:0`, `Environment=XDG_RUNTIME_DIR=/run/user/1000`.
+- Tools present: `adb` 1.0.41 (platform-tools 34.0.5), `scrcpy` 3.3.4, `nmap`.
+- When healthy (captured live): `scrcpy --tcpip=192.168.1.24:5555 --fullscreen --stay-awake --max-fps=30`
+  mirroring a Samsung SM-S916U1 (Android 15). Logs also showed `Authorization required, but no
+  authorization protocol specified` and `XDG_RUNTIME_DIR (/run/user/1000) is not owned by us (uid 0)`.
+
+Intended flow (from the code): scan the LAN for a phone already in TCP mode → if found, run scrcpy;
+if not, wait for a USB device, enable `adb tcpip 5555`, rescan, `adb connect`, then run scrcpy; retry forever.
+
+## Diagnosis — why it hangs intermittently
+
+### Finding 1 (root cause): a broken counter makes the device-onboarding code unreachable, so success depends on one race-y scan
+
+The first scrcpy loop can never exit because of this line:
+
+```bash
+if [[ "$COUNT" -le 2 ]]; then
+       COUNT= $COUNT+1          # BUG
+else
+       break
+fi
+```
+
+`COUNT= $COUNT+1` does **not** increment `COUNT`. Bash parses `COUNT=` as a temporary
+environment-assignment prefix (empty) for the command `$COUNT+1`, i.e. it tries to run a command
+literally named `0+1` ("0+1: command not found") and leaves the **shell** variable `COUNT` unchanged
+at `0`. So `[[ "$COUNT" -le 2 ]]` is always true and the loop's `break` is never reached. Consequences:
+
+1. The script **never falls through** to the USB-onboarding block (`adb tcpip 5555` → rescan →
+   `adb connect`) or the second scrcpy loop. The only behavior the device ever exhibits is: do *one*
+   `nmap` scan, then loop forever launching scrcpy at whatever that single scan returned.
+2. That first `nmap` scan has **no retry** and the loop has **no `sleep`** on failure.
+
+So the outcome is decided by whether **one un-retried `nmap` scan** happens to catch the phone:
+
+- Phone already in TCP mode and answering on :5555 at that instant → `DEVICE_IP` set → scrcpy
+  connects → **works**.
+- Phone not discoverable at that instant (just plugged in over USB, adb-tcpip not yet enabled, phone
+  asleep, DHCP not settled, or nmap simply missed it) → `DEVICE_IP` is **empty** → the loop spins on
+  `scrcpy --tcpip=":5555"` (empty host), which fails immediately, with **no sleep** between attempts
+  → a tight busy-loop that never recovers and never reaches the USB-setup path → **blank fullscreen /
+  apparent hang**.
+
+This is exactly "hangs sometimes but not always." A related corollary of the same bug: because the
+loop never re-runs `nmap`, if the phone's **IP changes** (new DHCP lease) mid-life, the script keeps
+hammering the old IP forever and never recovers.
+
+### Finding 2 (secondary, once running): scrcpy can freeze on a dead TCP socket; the network is flaky
+
+scrcpy is launched in the foreground with no liveness guard. If the link to the phone drops
+mid-session (we directly observed ARP to the Pi itself failing intermittently, and the host is
+**dual-homed** — both `enp195s0f0` 192.168.1.50 and Wi-Fi `wlp194s0` 192.168.1.222 sit on
+192.168.1.0/24), scrcpy can block on the dead socket without exiting → the mirror freezes and the
+script waits on the foreground `scrcpy` call indefinitely.
+
+### Finding 3: `wait` is dead/misleading code (not the hang)
+
+Both scrcpy loops do `echo "SCRCPY exited normally. Not restarting."; wait` on a clean (exit 0)
+scrcpy. `wait` with no arguments waits only for **background** jobs (started with `&`/coproc); this
+script starts none, so `wait` returns immediately and does nothing. Worse, the loop then relaunches
+scrcpy anyway, so "Not restarting" is never honored. Remove it.
+
+### Finding 4: systemd unit problems
+
+- **Stray first line `text`** in `/etc/systemd/system/androidmirror.service` (looks pasted from a
+  ```` ```text ```` markdown fence). systemd logs `:1: Assignment outside of section. Ignoring.`
+  Harmless but should be deleted.
+- **`User=root` against a uid-1000 desktop session.** `DISPLAY=:0` / `XDG_RUNTIME_DIR=/run/user/1000`
+  are owned by `kwx-user` (uid 1000); the `Authorization required` and `XDG_RUNTIME_DIR ... not owned
+  by us` log lines show root being refused by X/PulseAudio — another intermittent failure-to-display.
+- **No `Restart=`.** If the script ever exits, systemd won't restart it.
+
+### Finding 5: minor robustness issues
+
+- `DEVICE_IP=$(grep . <<< $DEVICE_IP)` (unquoted) and the `nmap | awk` pick *all* hosts with 5555
+  open — multiple/wrong devices yield a malformed `--tcpip`. Take exactly one IP and quote it.
+- The `adb shell cmd notification post ... \` lines continue onto an `adbTag '...'` line, so the real
+  command is `... -t 'Title' adbTag 'text'` — `adbTag` is a stray argument; the notifications are
+  malformed (and live in the unreachable block anyway). Cosmetic.
+- `nmap` default scan type is SYN (`-sS`, needs root). If the service is moved to run as `kwx-user`,
+  add `-sT` (TCP connect scan) so discovery still works unprivileged.
+
+## Proposed changes
+
+### A) Replace `mirror.sh` with a corrected, simpler version (preserves original intent)
+
+Fixes #1 (no broken counter, no unreachable code, always sleeps on retry, never launches scrcpy with
+an empty IP, re-scans every cycle), #2 (verify the device is live before launching scrcpy), #3
+(remove `wait`), and #5 (single quoted IP, `-sT` nmap).
+
+```bash
+#!/bin/bash
+# Auto-mirror an Android device over TCP/IP with scrcpy.
+# Flow: find a phone already in TCP mode -> else onboard via USB (enable adb tcpip)
+#       -> connect -> mirror -> on exit/disconnect, rescan and retry.
+set -u
+
+ADB_PORT=5555
+SUBNET=192.168.1.0/24
+
+find_tcp_ip() {            # echo first LAN host with adb (5555) open, or nothing
+    nmap -sT -p "$ADB_PORT" --open -n -T4 "$SUBNET" -oG - \
+        | awk '/Up$/{ip=$2} /open/{print ip}' \
+        | head -n1
+}
+
+onboard_via_usb() {        # wait for USB device, enable tcpip, echo its LAN IP
+    echo "Waiting for USB device... connect the phone with the USB-C cable." >&2
+    local usb=""
+    while [ -z "$usb" ]; do
+        usb=$(adb devices | awk 'NR>1 && $2=="device" && $1 !~ /:/{print $1; exit}')
+        [ -z "$usb" ] && sleep 2
+    done
+    echo "USB device found: $usb. Enabling adb tcpip on $ADB_PORT..." >&2
+    adb -s "$usb" tcpip "$ADB_PORT"; sleep 3
+    local ip=""
+    while [ -z "$ip" ]; do
+        sleep 5
+        ip=$(find_tcp_ip)
+    done
+    echo "$ip"
+}
+
+while true; do
+    echo "Looking for an Android device in TCP/IP mode..."
+    DEVICE_IP="$(find_tcp_ip)"
+    [ -z "$DEVICE_IP" ] && DEVICE_IP="$(onboard_via_usb)"
+
+    echo "Connecting to $DEVICE_IP:$ADB_PORT ..."
+    adb connect "$DEVICE_IP:$ADB_PORT" >/dev/null 2>&1
+
+    if [ "$(adb -s "$DEVICE_IP:$ADB_PORT" get-state 2>/dev/null)" != "device" ]; then
+        echo "Device $DEVICE_IP not responding; rescanning in 5s."
+        sleep 5
+        continue
+    fi
+
+    echo "Launching scrcpy to $DEVICE_IP:$ADB_PORT"
+    scrcpy --tcpip="$DEVICE_IP:$ADB_PORT" --fullscreen --stay-awake --max-fps=30 --no-audio
+    echo "scrcpy exited ($?). Rescanning in 5s."
+    sleep 5
+done
+```
+
+Notes:
+- `--no-audio` is included (confirmed): silences the `ALSA underrun` / PulseAudio noise and the
+  root↔uid-1000 audio mismatch on this display-only player.
+- This drops the elaborate on-phone toast notifications. If wanted, re-add them as a small helper
+  `notify(){ adb shell cmd notification post -S bigText -t 'Screen Mirror' tag "$1"; }` — but they
+  are not required for correctness and were malformed in the original.
+
+### B) Fix the systemd unit `/etc/systemd/system/androidmirror.service`
+
+Remove the stray `text` line, add `Restart=`, and run as the desktop user `kwx-user` so X/Pulse
+auth stops failing:
+
+```ini
+[Unit]
+Description=Script to Auto Mirror Android devices
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=kwx-user
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/home/kwx-user/SandmanMirror/mirror.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+If running as `kwx-user` still trips X authorization, add
+`ExecStartPre=/usr/bin/xhost +SI:localuser:kwx-user` or point `Environment=XAUTHORITY=/home/kwx-user/.Xauthority`.
+Because `kwx-user`'s nmap runs unprivileged, the rewrite uses `-sT` (TCP connect scan).
+
+## Apply procedure (after approval)
+
+All edits land on the Pi; `mirror.sh` is owned by `kwx-user` (editable directly), the unit is
+root-owned (needs `sudo`; `kwx-user` is in `sudo`). Steps:
+0. **Pi must be reachable** — it went unreachable mid-diagnosis (ARP failed on both NICs). I'll
+   re-probe `192.168.1.180` first and only proceed once SSH succeeds.
+1. **Back up** originals into the existing `~/SandmanMirror/Archive/` (timestamped copies of
+   `mirror.sh` and the unit file).
+2. Write the new `mirror.sh`; `chmod +x`.
+3. Write the corrected unit; `sudo systemctl daemon-reload`.
+4. `sudo systemctl restart androidmirror.service`.
+
+I'll apply this over SSH (same read/write-careful pty approach). Note: moving adb from root to
+`kwx-user` means a fresh per-user adb server — on the next USB connect the phone may show the
+"Allow USB debugging?" prompt once for `kwx-user`'s key (kwx-user already has `~/.android`, so it
+may already be authorized).
+
+## Verification
+
+- `systemctl status androidmirror.service` → `active (running)`, no `Assignment outside of section`.
+- `journalctl -u androidmirror.service -f` shows `Looking for an Android device...` then either a
+  connect or the USB prompt — and **no** `command not found` and **no** tight-loop CPU spin
+  (`systemctl status` CPU time should climb slowly, not race).
+- Unplug / disconnect the phone → confirm the log cleanly rescans every ~5s (not a busy-loop) and
+  re-mirrors when the phone returns; change the phone's IP and confirm it re-discovers it.
+- Confirm `Authorization required` no longer appears (now running as `kwx-user`).

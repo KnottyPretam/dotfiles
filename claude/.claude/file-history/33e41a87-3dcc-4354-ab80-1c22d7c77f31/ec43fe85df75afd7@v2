@@ -1,0 +1,149 @@
+# Recreate `vehicle_angular_velocity` from FIFO gyro + tunable filter YAML
+
+## Context
+
+For the oddjob vibe analysis we want to *retune the PX4 gyro/dgyro filters offline* and see the
+effect on the IMU signal (notably the ~99.4 Hz vibration line) without reflashing/reflying. To trust
+any retuning, we must first prove we can reproduce PX4's `vehicle_angular_velocity` exactly from the
+raw `sensor_gyro_fifo`, using the same filter chain, the same calibration, and the same output rate.
+
+This delivers: (1) a Python tool that recreates `vehicle_angular_velocity.xyz` (gyro) and
+`.xyz_derivative` (dgyro) from the FIFO, (2) a YAML to change `IMU_GYRO_CUTOFF`, `IMU_DGYRO_CUTOFF`,
+`IMU_GYRO_NF0_FRQ/BW` (+ NF1) and re-filter, and (3) verification plots showing the recreation matches
+the logged signal. Test log: `OD1A079_nexus_endurance.ulg`. (Coning compensation is not part of
+`vehicle_angular_velocity` — it only affects `vehicle_imu` delta-angle — so it is correctly ignored.)
+
+User decisions: **full-fidelity match** (board rotation + static offset + EKF bias) and
+**validate-then-retune** (seed YAML with the log's real params so the first run proves correctness,
+then edit to explore; optional `candidate:` overlay for what-if tunings).
+
+## Facts established from the log + PX4 source (OD1A079)
+
+- Controller gyro = `sensor_selection.gyro_device_id` = **3670026** = `sensor_gyro_fifo` **multi_id=0**
+  (NOT 6684714 used in the PSD CSVs). FIFO raw rate ≈ **8036.3 Hz** (`vehicle_imu_status.gyro_raw_rate_hz`).
+- `vehicle_angular_velocity` output ≈ **803.6 Hz** (`gyro_rate_hz`) = raw/10; n=623,264; fields
+  `xyz[0..2]`, `xyz_derivative[0..2]`.
+- Params in this log: `IMU_GYRO_CUTOFF=25`, `IMU_DGYRO_CUTOFF=30`, `NF0_FRQ=0`, `NF0_BW=20`,
+  `NF1_FRQ=0`, `IMU_GYRO_RATEMAX=800`, `DNF_EN=0` (dynamic notch OFF), `SENS_BOARD_ROT=24`
+  (=`ROTATION_PITCH_90`), `SENS_BOARD_Y_OFF=-4.0°`, gyro 3670026 = `CAL_GYRO1` (`ROT=-1` → follows
+  board; `XOFF=0.01447 YOFF=0.00383 ZOFF=-0.00875`).
+- ⇒ For this log the gyro chain reduces to **one 2nd-order Butterworth @ 25 Hz** (notches/dynamic-notch
+  all off). The notch code path is still implemented so the user can enable NF0/NF1 when retuning.
+
+## Reuse (do not rewrite)
+
+Import from `/home/choudhury/tools/dev/imu_vibe/analyze_imu_vibration.py` via the existing
+`sys.path.insert(0, "/home/choudhury/tools/dev/imu_vibe"); import analyze_imu_vibration as aiv`
+pattern (same as `vibe_psd_100hz_summary.py`; keeps `T_OFFSET=0`):
+- `aiv.fifo_to_series(d)` → per-sample `(t_s, x, y, z)` in rad/s with scale applied + reconstructed
+  per-sample timestamps (`analyze_imu_vibration.py:114`).
+- `aiv.direct_fft(x, fs, t)` → flat-top PSD (`:144`).
+- `aiv.get_topic` / `aiv.all_instances` (`:94`/`:100`).
+- Save figures as `.png` + companion `.pkl.gz` and reopen with the existing
+  `/home/choudhury/tools/dev/imu_vibe/show_figure.py` (project convention; use the **picklable-plots** skill).
+- In-air window: reimplement the small `inflight_window(ulog)` helper from `vibe_psd_100hz_summary.py:77`
+  (`vehicle_land_detected.landed==0`).
+
+## The exact algorithm to implement (per axis, fs = FIFO rate ≈ 8036.3 Hz)
+
+Reproduce these PX4 formulas verbatim (run each IIR over the **whole** per-sample series with
+`scipy.signal.lfilter`; state is continuous across batches in PX4). Init each filter to steady state
+at the first sample (`lfilter_zi*x[0]`) to avoid a startup transient — mirrors PX4 `reset()`.
+
+1. **Scale**: `data = fifo.scale * raw_int16` (already done inside `fifo_to_series`).
+2. **Notch 0, then Notch 1** — applied only if `FRQ > 0` (`NotchFilter.hpp`; `VehicleAngularVelocity.cpp:754/759`):
+   `α=tan(π·BW/fs); β=-cos(2π·FRQ/fs); a0i=1/(α+1)`
+   `b=[a0i, 2β·a0i, a0i]`, `a=[1, 2β·a0i, (1-α)·a0i]`.
+3. **Gyro Butterworth (`IMU_GYRO_CUTOFF`)** — always (passthrough if `fc<=0` or `fc>=fs/2`)
+   (`LowPassFilter2p.hpp:77-86`):
+   `fr=fs/fc; Ω=tan(π/fr); c=1+2cos(π/4)Ω+Ω²`
+   `b=[Ω²/c, 2Ω²/c, Ω²/c]`, `a=[1, 2(Ω²-1)/c, (1-2cos(π/4)Ω+Ω²)/c]`.
+   Result `filt` = the recreated *uncalibrated* angular velocity (full rate).
+4. **dgyro = 1st-order alpha LPF of the derivative of `filt`** (NOT a Butterworth)
+   (`AlphaFilter.hpp:67-88`; `VehicleAngularVelocity.cpp:770-782`):
+   `accel_raw[n] = (filt[n]-filt[n-1])·fs` (prepend `filt[0]` ⇒ `accel_raw[0]=0`; PX4 carries prev
+   continuously). `α = (1/fs)/(1/(2π·fc)+1/fs)` with `fc=IMU_DGYRO_CUTOFF`.
+   `accel = lfilter([α], [1, -(1-α)], accel_raw)`. (Disabled ⇒ `α=1`.)
+5. **Decimate to FC output rate ("same integration rate")**: for each logged
+   `vehicle_angular_velocity.timestamp_sample` `t_o`, take `filt`/`accel` at the per-sample index
+   whose reconstructed µs timestamp matches `t_o` (`np.searchsorted`, nearest). Yields the same
+   ~803.6 Hz grid and timestamps as the FC. (Filter params do not change the publish instants, so this
+   grid is reused for retuned runs too.)
+6. **Full calibration → body frame** (`VehicleAngularVelocity.cpp:925/929`, `Gyroscope.cpp:129`):
+   `R = Dcm(roll=0, pitch=-4°, yaw=0) @ get_rot_matrix(ROTATION_PITCH_90)` — copy PX4's exact
+   Euler→DCM from `src/lib/matrix/matrix/Dcm.hpp`/`Euler.hpp` (replicate in numpy). Look up the gyro's
+   `CAL_GYROx_*` by matching `CAL_GYROx_ID == selected device_id` (here x=1).
+   - `xyz_recreated = R @ (filt_dec - offset) - bias(t)`  where `offset=[XOFF,YOFF,ZOFF]` and
+     `bias(t)` = ZOH-interpolated `estimator_sensor_bias.gyro_bias[*]` (rows with
+     `gyro_device_id==3670026`) at the output times.
+   - `dgyro_recreated = R @ accel_dec`  (no offset, no bias — derivative kills DC).
+   - `thermal_offset` (from `sensor_correction`) defaults to 0; include if the topic is present.
+   - **Validate R**: also fit an orthogonal-Procrustes rotation between recreated-sensor-frame and
+     logged-body-frame; assert it ≈ the analytic `R` (catches any Euler-convention/transpose error).
+
+## New files
+
+1. `/home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26/recreate_angular_velocity.py`
+2. `/home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26/filter_tune.yaml`
+
+### `filter_tune.yaml` (seeded with this log's real params ⇒ first run reproduces the FC)
+
+```yaml
+log: OD1A079_nexus_endurance.ulg   # .ulg path (CLI arg overrides)
+# gyro_device_id: 3670026          # default = sensor_selection.gyro_device_id (auto)
+# start_s: null                    # in-air comparison window; default = vehicle_land_detected
+# end_s: null
+
+IMU_GYRO_CUTOFF:  25.0   # gyro 2nd-order Butterworth (Hz); 0 disables
+IMU_DGYRO_CUTOFF: 30.0   # dgyro 1st-order LPF (Hz); 0 disables
+IMU_GYRO_NF0_FRQ: 0.0    # notch 0 centre (Hz); 0 disables
+IMU_GYRO_NF0_BW:  20.0   # notch 0 bandwidth (Hz)
+IMU_GYRO_NF1_FRQ: 0.0    # notch 1 centre (Hz); 0 disables
+IMU_GYRO_NF1_BW:  20.0   # notch 1 bandwidth (Hz)
+
+# Optional what-if overlay drawn on the PSD plots alongside the baseline above:
+# candidate:
+#   IMU_GYRO_NF0_FRQ: 99.4
+#   IMU_GYRO_NF0_BW:  8.0
+#   IMU_GYRO_CUTOFF:  20.0
+```
+
+### `recreate_angular_velocity.py` flow
+- `argparse`: `ulog` (positional, default from YAML), `--config filter_tune.yaml`, `--start/--end`,
+  `--outdir` (default `./recreate_av_<logstem>_plots/`). Mirror `analyze_imu_vibration.py`'s arg style.
+- Load ulog (filtered topic list: `sensor_gyro_fifo`, `sensor_selection`, `vehicle_angular_velocity`,
+  `vehicle_land_detected`, `vehicle_imu_status`, `estimator_sensor_bias`, optional `sensor_correction`)
+  to keep the 1 GB log fast.
+- Auto-select FIFO by `sensor_selection.gyro_device_id`; print the FC's actual `IMU_*` (from
+  `ulog.initial_parameters`) next to the YAML values so the user sees the baseline.
+- Run steps 1–6; **verify** at step 5 that recreated output count/timestamps equal the logged ones.
+- Emit plots + a metrics text file.
+
+## Verification plots (→ `recreate_av_OD1A079_nexus_endurance_plots/`, each `.png` + `.pkl.gz`)
+1. `recreate_gyro_timeseries.png` — 3 axes: logged `xyz` vs recreated, ~2 s in-air zoom; residual + per-axis RMS in title.
+2. `recreate_dgyro_timeseries.png` — 3 axes: logged `xyz_derivative` vs recreated dgyro.
+3. `recreate_gyro_psd.png` — 3 axes, in-air segment: PSD of raw FIFO (unfiltered) vs recreated-filtered
+   vs logged; mark 25 Hz & ~99.4 Hz. Overlay `candidate` filtered PSD if present.
+4. `recreate_dgyro_psd.png` — PSD of recreated vs logged `xyz_derivative`.
+5. `recreate_match_metrics.txt` — per-axis RMS, normalized RMSE (% of signal RMS), correlation, max
+   error, for gyro and dgyro, over the in-air window; plus selected device/rates and the fitted-vs-analytic R check.
+
+## Success criteria (verify by running)
+- Output timestamps/count equal logged `vehicle_angular_velocity` (exact, by construction).
+- Per-axis gyro **NRMSE < ~5%** and PSD lines overlay (25 Hz rolloff + the ~99.4 Hz peak); dgyro similar.
+- Procrustes-fitted rotation ≈ analytic `R` (within a couple degrees).
+
+## How to test end-to-end
+```bash
+cd /home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26
+python3 recreate_angular_velocity.py OD1A079_nexus_endurance.ulg --config filter_tune.yaml
+# inspect overlays/PSDs; confirm match metrics. Reopen interactively:
+python3 /home/choudhury/tools/dev/imu_vibe/show_figure.py recreate_av_OD1A079_nexus_endurance_plots/recreate_gyro_psd.pkl.gz
+# then retune: edit filter_tune.yaml (e.g. enable a candidate notch at 99.4 Hz) and re-run.
+```
+
+## Notes / caveats
+- The **dgyro filter is 1st-order (alpha/EMA)**, not a Butterworth — the YAML knob is the cutoff; the
+  filter type is fixed to match PX4.
+- Decimation reuses the *logged* publish instants, so retuned runs stay on the FC's real output grid.
+- Static offset + EKF bias shift only DC; the vibration/PSD content depends only on the filter + R.

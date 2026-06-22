@@ -1,0 +1,128 @@
+# Plan: Fix runtime bugs in the shipped `px4_realtime_plot.py` refactor
+
+## Context
+
+The previous plan (in-place artists + PNG/PKL save + clickable points) was implemented and merged.
+Running it surfaced three concrete bugs:
+
+1. **Live windows pop up over each other** during the refresh loop.
+2. **Live windows show up blank**, even though `savefig` and `pickle.dump` produce PNG/PKL files
+   that *do* contain the data.
+3. **Saved `.pkl` files open as static figures** — clicking points does nothing.
+
+Root causes:
+
+- (1) and (2) are the same root cause: `plt.pause(0.05)` (`px4_realtime_plot.py:708`).
+  `plt.pause` only grabs the **active** figure manager, calls `show(block=False)` every 50 ms
+  (under `gtk4agg` this raises windows → "popping up"), and runs `canvas.start_event_loop` on the
+  active canvas only. The other figures' `draw_idle()` events never get pumped, so their canvases
+  stay blank. `savefig` works because `print_figure` forces a `draw()` independently of the GUI
+  event loop — which is exactly the asymmetry the user observed.
+- (3) is matplotlib's documented pickle behavior: `CallbackRegistry.__getstate__` drops every
+  callback, so the live `mplcursors` connections are gone after `pickle.load`. We must re-attach
+  them on reload.
+
+## Approach
+
+Three small, targeted changes — all in `px4_realtime_plot.py` (still the only source file).
+
+### 1. Replace `plt.pause(0.05)` with explicit per-canvas event pumping
+
+In `main()`'s loop, replace the single `plt.pause(0.05)` call with:
+
+```python
+for fig, *_ in figs.values():
+    fig.canvas.flush_events()
+time.sleep(0.05)
+```
+
+`canvas.flush_events()` runs the canvas's own event loop briefly — processing the pending
+`draw_idle()` for *that* figure. Doing this for every figure in `figs` flushes them all. Replacing
+the `show(block=False)` call inside `plt.pause` with nothing also removes the focus-stealing that
+makes the windows "pop up over each other." `time.sleep(0.05)` keeps the loop at the same cadence.
+
+(`fig.canvas.draw_idle()` in `draw_all()` stays as-is — that's correct scheduling; the bug was
+that nothing was pumping the schedule for the non-active figures.)
+
+### 2. Add a `--view <pkl ...>` mode so saved `.pkl` files are clickable on reload
+
+The saved figure's `Line2D` artists, labels, and styles all survive `pickle.dump`/`load` cleanly
+(verified during the previous round). What gets dropped is the canvas callback registry — i.e.,
+the `mplcursors` connection. So we ship a tiny reload path that re-attaches a cursor and re-uses
+the existing `_make_key_handler` (so `d` clears labels exactly as in the live windows).
+
+Add to `argparse`:
+```python
+ap.add_argument("--view", nargs="+", metavar="PKL",
+                help="Reopen one or more saved .pkl figures with clickable data points "
+                     "(no MAVLink connection).")
+```
+
+Add a small entry function called near the top of `main()`, before any MAVLink setup, that
+short-circuits when `args.view` is set:
+
+```python
+DATA_LABELS = {"EKF", "GPS", "setpoint", "actual"}  # excludes the unlabeled & ±3σ lines
+
+def view_pkls(paths):
+    held = []   # keep cursors alive
+    for p in paths:
+        with open(p, "rb") as fh:
+            fig = pickle.load(fh)
+        clickable = [ln for ax in fig.axes for ln in ax.get_lines()
+                     if ln.get_label() in DATA_LABELS]
+        cursor = mplcursors.cursor(clickable, multiple=True)
+        fig.canvas.mpl_connect("key_press_event", _make_key_handler(cursor, list(fig.axes)))
+        held.append(cursor)
+    print(f"Loaded {len(paths)} figure(s). Click points to label; 'd' clears. Close windows to exit.")
+    plt.show()                  # blocking — pure viewer mode
+```
+
+The `±3σ` lines have label `r"$\pm 3\sigma$"` (and the lower one has no label at all), so the
+label filter naturally excludes them — same selection rule the live `make_figures` uses.
+
+### 3. Tiny docstring/help update
+
+- Mention the new `--view` mode in the module docstring near the existing "Reopen a .pkl with…"
+  sentence. Replace the manual `pickle.load + plt.show` hint with `--view <pkl>` since that path
+  also restores clicking.
+
+### Reused existing pieces (do not rewrite)
+- `_make_key_handler(cursor, ax3)` (`px4_realtime_plot.py:389`) — reused verbatim by `view_pkls`,
+  so `d` works identically. `a` will be a no-op on a static pkl (no live data) but doesn't error.
+- `mplcursors.cursor(...)` and the data-label convention from `_build_ned_artists` /
+  `_build_att_artists` (`:366`, `:379`) — the label set `{"EKF","GPS","setpoint","actual"}` is the
+  contract; if a series gets renamed there it must be renamed in `DATA_LABELS` here too.
+- The save-trigger logic, threading, MAVLink reader, `make_figures` and draw functions — all
+  untouched. The only edits are the loop's pause line, the new `--view` flag + `view_pkls`
+  function, and the docstring.
+
+## What I will not change yet
+
+If after fix (1) the live windows still spawn fresh windows on each refresh (i.e. Bug 1 was
+*literal* new windows, not just focus-raising), that's a different bug. Nothing in our code
+creates figures inside the loop, so the hypothesis above is high-confidence — but if the symptom
+survives, the next step would be a small reproducer that prints `len(plt.get_fignums())` each
+refresh to confirm. Flagging here so it's not silently dropped.
+
+## Verification
+
+1. **Headless re-run of the previous smoke tests** (Agg + temp dir): make sure none of the changes
+   regress in-place updates, save → PNG/PKL → pickle round-trip, or the `a`/`d` key handlers.
+2. **Headless `--view` smoke**: run `save_figs` to produce a `position_ned.pkl`, then in a fresh
+   process call `view_pkls(["position_ned.pkl"])` under `MPLBACKEND=Agg` (drop the `plt.show()`
+   blocking call for the test or run it in a thread). Assert the reloaded figure has a Cursor
+   attached, and simulate a `MouseEvent` at a data point's pixel coords (same technique used last
+   round) — `cursor.selections` should grow to 1.
+3. **Manual interactive acceptance (with display, `gtk4agg`)**:
+   - Confirm windows no longer pop to the foreground every second.
+   - Confirm live plots actually show data while armed (the central symptom).
+   - Disarm → check exactly one PNG + one PKL per figure written.
+   - Run `python3 px4_realtime_plot.py --view position_ned.pkl velocity_ned.pkl` and confirm
+     clicking points drops labels and `d` clears them.
+
+### Critical file
+- `/home/choudhury/tools/dev/px4_plotter/px4_realtime_plot.py` — the loop's `plt.pause` line
+  (currently `:708`), the `argparse` block in `main()` (currently around `:593`–`:601`),
+  the new `view_pkls` helper (near `make_figures` or just above `main`), and the docstring's
+  "Reopen a .pkl with…" line.

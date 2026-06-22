@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Load a pickled matplotlib Figure and display it (or re-export it to an image).
+
+Works on the *.fig.pkl files written by ekf_ned_reconstruction.py (or any pickled
+matplotlib Figure).
+
+Usage:
+    python3 show_figure.py <figure.fig.pkl>                 # open an interactive window
+    python3 show_figure.py <figure.fig.pkl> --save out.png  # re-export instead of showing
+"""
+
+import argparse
+import os
+import pickle
+import sys
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("pkl", help="path to a pickled matplotlib Figure (.fig.pkl)")
+    ap.add_argument("--save", metavar="IMG",
+                    help="re-export to this image file (.png/.pdf/.svg) instead of showing")
+    ap.add_argument("--dpi", type=int, default=150, help="dpi for --save (default: 150)")
+    args = ap.parse_args()
+
+    path = os.path.abspath(os.path.expanduser(args.pkl))
+    if not os.path.isfile(path):
+        sys.exit(f"ERROR: file not found: {path}")
+
+    import matplotlib
+    if args.save:
+        matplotlib.use("Agg")          # no display needed when only saving
+    import matplotlib.pyplot as plt
+
+    with open(path, "rb") as f:
+        fig = pickle.load(f)
+    if not hasattr(fig, "savefig"):
+        sys.exit(f"ERROR: {path} is not a matplotlib Figure (got {type(fig).__name__})")
+
+    if args.save:
+        out = os.path.abspath(os.path.expanduser(args.save))
+        fig.savefig(out, dpi=args.dpi)
+        print(f"Saved {out}")
+        return
+
+    # Make sure the figure is managed by pyplot so plt.show() displays it -- needed
+    # for figures that were pickled without being registered with pyplot.
+    if not plt._pylab_helpers.Gcf.get_all_fig_managers():
+        mgr = plt.figure().canvas.manager
+        mgr.canvas.figure = fig
+        fig.set_canvas(mgr.canvas)
+
+    print(f"Showing {path}  (close the window to exit)")
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()

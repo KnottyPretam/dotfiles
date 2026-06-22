@@ -1,0 +1,58 @@
+# Plan: Add a 'thunderball' time_base option to Thunderball/RunPlots.m
+
+## Context
+
+`RunPlots.m` selects how the plot time axis is offset via `opts.time_base`, a
+`switch` with two cases (lines 62–73):
+- `'avionics'` — no offset: `f_t = @(t_us) t_us*1E-6` (raw avionics seconds).
+- `'log_start'` — subtract the first `actuator_outputs_2` timestamp so time starts
+  at 0: `f_t = @(t_us) (t_us - to)*1E-6`.
+
+The default is `'avionics'` (line 15). The user wants a new, explicitly-named
+`'thunderball'` time-base option that applies the log-start offset, while keeping
+`'avionics'` as the default and leaving `'log_start'` intact. The sibling
+`/home/choudhury/repos/kwx/Tpro/RunPlots.m` has the same switch (referencing
+`actuator_outputs_0` instead of `_2`) and was reviewed for the pattern.
+
+Decisions confirmed with user:
+- Add `'thunderball'` as a **new** case (do not rename `'log_start'`; keep it).
+- `'thunderball'` behaves the same as `'log_start'` (subtract first
+  `actuator_outputs_2` timestamp — log-start relative).
+- Default stays `'avionics'` (line 15 unchanged).
+- Do **not** modify the wrapper `run_plots.m` (case 100 stays on the avionics
+  default; `'thunderball'` is opt-in via `opts.time_base`).
+
+## Change
+
+Single file: `/home/choudhury/repos/kwx/Thunderball/RunPlots.m`
+
+In the `switch opts.time_base` block (lines 62–73), add a new case after the
+existing `'log_start'` case, mirroring it exactly:
+
+```matlab
+    case 'thunderball'
+        % Thunderball-specific: time from log start (same offset as log_start)
+        to = d.actuator_outputs_2.timestamp(1);
+        tf = d.actuator_outputs_2.timestamp(end);
+        f_t = @(t_us) (t_us - to)*1E-6;
+```
+
+No other changes. `f_t`, `to`, `tf` are consumed downstream exactly as for the
+other cases (plot helpers at lines 222–226, derived data, and the final
+`xlim(ax(1),f_t([to tf]))` at line 918), so the new case needs nothing further.
+
+## Verification
+
+This is MATLAB; run interactively (e.g. via the `!` prefix or in MATLAB):
+
+1. Confirm `'avionics'` remains the default and unchanged — running the existing
+   wrapper `run_plots.m` (case 100) still produces absolute-avionics-time axes.
+2. Set the new option and re-run to confirm the offset applies:
+   ```matlab
+   clear opts; opts.time_base = 'thunderball'; opts.servo_range = 75;
+   [d,ax,fh,opts] = RunPlots('/home/choudhury/analysis/flight_tests/oddjob/oddjob3_hang_05-29-26/<somelog>.ulg', opts);
+   ```
+   Expect the x-axis to start at ~0 s (log-start relative), matching what
+   `'log_start'` produces, and differing from `'avionics'` by the first
+   `actuator_outputs_2` timestamp.
+3. Confirm `'log_start'` still works (case left intact).

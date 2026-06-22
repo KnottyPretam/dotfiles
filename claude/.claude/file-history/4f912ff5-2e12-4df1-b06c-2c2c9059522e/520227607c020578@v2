@@ -1,0 +1,89 @@
+# Add barometric Down position to the NED reconstruction plots
+
+## Context
+
+`ekf_ned_reconstruction.py` overlays an IMU-only strapdown reconstruction against the
+EKF estimate (±3σ), GPS, and the setpoint, in a shared local-NED frame. The vertical
+(Down) channel currently has no independent sensor reference of its own — GPS Down comes
+from the (noisy) GPS altitude solution. The barometer is the EKF's primary height source,
+so adding a baro-derived Down trace gives a useful independent vertical reference on the
+existing plots.
+
+**Scope note (from clarification):** the original request said "Down position *and*
+velocity". On review the user decided that since the barometer measures altitude (a
+vertical *position*), not velocity, a differentiated baro velocity should **not** be
+fabricated. Final scope is therefore **baro Down position only**, added to the Down
+panels of **both** output figures; the velocity panels are left untouched.
+
+Verified against the project log (`/home/choudhury/analysis/flight_tests/oddjob/log_0_2026-5-22-18-05-08.ulg`):
+- `vehicle_air_data.baro_alt_meter` exists at ~10 Hz (baro altitude in metres).
+- The baro datum sits ~44 m above `ref_alt` and `estimator_baro_bias` drifts several
+  metres over the log, so an absolute `-(baro_alt - ref_alt)` would plot tens of metres
+  offset from the EKF/GPS Down. → anchor to the seed at `t_init` instead.
+
+## Anchoring convention (chosen)
+
+```
+down_baro(t) = p0_down - (baro_alt(t) - baro_alt(t_init))
+```
+
+so the trace starts exactly on the seed Down `p0[2]` at `t_init` (same convention as the
+IMU recon) and then tracks *relative* vertical motion. Climb → `baro_alt` rises →
+`down_baro` decreases (more negative = up), matching NED.
+
+## Changes — single file: `ekf_ned_reconstruction.py`
+
+### 1. New loader `baro_to_ned(ulog, p0_down, t_init)` (near `gps_to_ned`, ~line 452)
+- `get_dataset(ulog, "vehicle_air_data", 0)`; return `None` if absent (graceful skip).
+- `t = tsec(d)`, `alt = np.asarray(d.data["baro_alt_meter"], float)`.
+- `a0 = float(np.interp(t_init, t, alt))`; `down = p0_down - (alt - a0)`.
+- Return `dict(t=t, down=down)`.
+
+### 2. Wire into `main` (~line 716, after `gps`/`sp`)
+- `baro = baro_to_ned(ulog, float(init["p0"][2]), init["t_init"])`.
+- Print one line: baro present (rate/span) or "vehicle_air_data absent — baro Down skipped".
+- Pass `baro` into both figure builders.
+
+### 3. `make_recon_figure(...)` — add `baro` param
+- Only on the Down-position axis (`r == 2`, `col == 0`): plot
+  `ax.plot(baro["t"] - t0, baro["down"], color="C6", lw=1.0, label="baro Down position")`
+  guarded by `if baro is not None`.
+- Include `baro["down"]` in the `_fit_ylim` list for that axis when `not full_scale`.
+- The figure-level legend is built from `axes[0,0]`, which never sees baro. After
+  `handles, labels = axes[0,0].get_legend_handles_labels()`, append the baro entry from
+  `axes[2,0].get_legend_handles_labels()` (only labels not already present). Bump
+  `fig.legend(..., ncol=5)` → `ncol=6`.
+
+### 4. `make_gps_drift_figure(...)` — add `baro` param
+- On the Down panel (`axes[2]`, the `r == 2` panel): plot the baro Down trace with the
+  same style/label, guarded by `if baro is not None`.
+- That panel has no legend today and the main legend lives on `axes[0]`. Append the baro
+  handle to the `axes[0].legend(...)` call (build handles/labels manually, add baro), so
+  the label appears once. Label "baro Down position" makes the Down-only scope clear.
+
+### 5. Docstring (lines ~22–25)
+- Update the two figure descriptions to mention the added baro Down position trace.
+
+Reuse existing helpers `get_dataset`, `tsec`, `_fit_ylim`; match the existing `C#`
+color / `lw`/`label` plotting idiom. New color `C6` (unused in both figures; `C4`/`C5`
+are taken by HDOP/VDOP).
+
+## Verification
+
+```
+cd /home/choudhury/tools/dev/ekf_ned_reconstruction
+python3 ekf_ned_reconstruction.py /home/choudhury/analysis/flight_tests/oddjob/log_0_2026-5-22-18-05-08.ulg
+```
+- Console prints the new baro line.
+- Open `ekfPosVel_figures/log_0_2026-5-22-18-05-08_ned_reconstruction.png`: the Down
+  *position* panel (middle-left) shows the new `baro Down position` trace starting on the
+  seed at the init line; Down *velocity* panel unchanged; legend lists "baro Down position".
+- Open `..._gps_drift.png`: the Down (3rd) panel shows the baro trace; legend updated.
+- Sanity: baro Down should track the EKF/GPS Down shape (this log is near-stationary in
+  altitude, so all Down traces stay within ~1–2 m).
+- Regression: also run a log **without** `vehicle_air_data` (e.g.
+  `/home/choudhury/log_3_2026-5-12-12-56-56_1.ulg`) — script must print the "skipped"
+  note and produce figures unchanged (no crash).
+```
+python3 ekf_ned_reconstruction.py /home/choudhury/log_3_2026-5-12-12-56-56_1.ulg
+```

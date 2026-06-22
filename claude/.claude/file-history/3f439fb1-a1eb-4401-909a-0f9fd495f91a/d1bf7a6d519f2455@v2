@@ -1,0 +1,25 @@
+---
+name: ekf-ned-reconstruction-tool
+description: The ekf_ned_reconstruction.py tool and the vehicle_imu-decimation gotcha in these PX4 logs
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 3f439fb1-a1eb-4401-909a-0f9fd495f91a
+---
+
+`ekf_ned_reconstruction.py` reconstructs NED position/velocity by replicating PX4 EKF2's
+strapdown predict step (`Ekf::predictState`) with NO Kalman correction (full strapdown, EKF
+bias frozen at init, seeded from the EKF state at first solution-valid time), and plots it vs
+the EKF estimate (±3σ from `estimator_states.covariances`) and vs GPS projected into the EKF's
+NED frame. Output: `<cwd>/figures/<log>_ned_reconstruction.{png,fig.pkl}`.
+
+**Gotcha:** in the oddjob/xtech flight logs, `vehicle_imu` is logged decimated to ~1.4 Hz
+(unusable for integration). The tool defaults to `sensor_combined` (~133 Hz primary IMU) instead.
+**Why:** these logs throttle `vehicle_imu`; `sensor_combined` carries the same calibrated primary
+gyro/accel. **How to apply:** keep using `sensor_combined`; the user plans to switch back to
+`--imu-source vehicle_imu` once logging carries it at full rate (the path is already wired).
+
+Also note these logs have ~28% dropouts (gaps up to ~2.2 s) — integration uses each sample's own
+`integral_dt` and splices over gaps (NOT inter-sample Δt, which injects huge one-step attitude
+kicks). EKF state layout (verified): quaternion=states[0:4] (scalar-first), NED vel=4:7, NED
+pos=7:10; 3σ = 3·√covariances[i].

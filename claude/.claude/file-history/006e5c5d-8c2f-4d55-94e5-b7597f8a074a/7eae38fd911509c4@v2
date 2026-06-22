@@ -1,0 +1,149 @@
+# Chirp injection for Twin Rotor Tailsitter actuator system-ID
+
+## Context
+
+We want a way to do **actuator system identification** on the twin-rotor tailsitter by
+injecting a swept-frequency *chirp* directly into the control allocator, **bypassing the
+multicopter attitude/rate controllers**. Normally `mc_att_control` → `mc_rate_control`
+produce `vehicle_torque_setpoint` / `vehicle_thrust_setpoint`, which the control allocator
+turns into actuator outputs. For system ID we instead want a clean, repeatable chirp to
+drive one control axis at a time (with the rotors held at a fixed RPM) so we can measure the
+open-loop actuator/airframe frequency response.
+
+The single authoritative place to do this for this airframe is
+`ActuatorEffectivenessTwinRotorTailsitter::updateSetpoint()`. For the twin-rotor tailsitter
+the effectiveness *matrix* is all-zeros (motors & servos are added with empty axis vectors in
+`getEffectivenessMatrix()`, lines 181‑197), so `updateSetpoint()` computes **every** motor and
+servo output itself from the 6-axis `control_sp` (lines 202‑272). Injecting there gives full,
+clean control of the outputs while reusing the existing swashplate/elevon geometry.
+
+The five requested chirps map onto the axes that `updateSetpoint` already consumes:
+
+| Requested chirp        | Inject into                              | Code reference |
+|------------------------|------------------------------------------|----------------|
+| Cyclic pitch (@6k rpm) | `control_sp(PITCH)` → symmetric cyclic   | `.cpp:239` |
+| Cyclic yaw   (@6k rpm) | `control_sp(YAW)` → differential cyclic  | `.cpp:239` |
+| Collective roll (@6k)  | `control_sp(ROLL)` → diff. collective    | `.cpp:240` |
+| Collective             | `collective_pitch` term                  | `.cpp:219,240` |
+| RPM                    | motor output `actuator_sp(0/1)` directly | `.cpp:218,222‑223` |
+
+Because rotor RPM **and** collective both derive from `THRUST_Z` today (`.cpp:218‑219`), a clean
+RPM chirp and a clean collective chirp must be decoupled: collective is chirped on the
+`collective_pitch` term while the motor is held; RPM is chirped on the motor output while
+collective/cyclic stay at baseline. During the cyclic/collective chirps the motors are held at a
+settable command `CA_CHIRP_RPM` (the normalized motor value that equals ~6000 rpm on the
+hardware), instead of going through the throttle curve.
+
+## Chirp equation (confirmed)
+
+Settable in YAML: `freq_init (f0)`, `freq_final (f1)`, `chirp_order (k)`, `total_time (T)`, plus `amp (A)`.
+Running elapsed time `t` sweeps `0 → T`.
+
+```
+beta = (f1 - f0) / T^k                                   # T>0; k>=0  (T^0 = 1)
+out  = A * sin( 2*pi * ( beta/(k+1) * t^(k+1) + f0 * t ) )
+```
+
+Instantaneous frequency `= beta*t^k + f0`, sweeping exactly `f0 → f1` over `T`.
+`k = 1` is the textbook linear chirp. At `t = 0`, `out = 0` (smooth start).
+
+## Design
+
+**Bypass semantics:** when chirp mode is active the incoming `control_sp` (from the MC
+controllers) is *replaced*, not added to — a local copy is zeroed and only the selected axis is
+driven by the chirp. When chirp mode is off (`CA_CHIRP_MODE == 0`) behavior is byte-for-byte
+unchanged.
+
+**Timing / run mode (one-shot per arm):** chirp start time is captured on the first armed frame
+after enabling; `t = (hrt_absolute_time() - start)/1e6`. When `t > T` the chirp output returns to
+baseline (held RPM / trims). Disarming resets the start latch so the next arm replays the sweep.
+A param change also resets the latch.
+
+### Files
+
+1. **NEW `.../ActuatorEffectiveness/Chirp.hpp` (+ `Chirp.cpp`)** — small, pure helper
+   implementing the equation above: `configure(f0,f1,order,T,amp)`, `float update(float t)`,
+   `bool finished(float t)`. Isolated specifically so the equation is unit-testable
+   deterministically (no dependence on `hrt`). Guards `T<=0`.
+
+2. **EDIT `ActuatorEffectivenessTwinRotorTailsitter.hpp`**
+   - Add a `ChirpMode` enum (`OFF, CYCLIC_PITCH, CYCLIC_YAW, COLLECTIVE, COLLECTIVE_ROLL, RPM`).
+   - Add `Chirp _chirp;`, chirp param values (`_chirp_mode`, `_chirp_amp`, `_chirp_T`,
+     `_chirp_order`, `_chirp_f0`, `_chirp_f1`, `_chirp_rpm`), `param_t` handles for them in
+     `ParamHandles`, and chirp run-state (`_chirp_start_time`, `_chirp_started`).
+   - Declare `void applyChirp(float t, matrix::Vector<float, NUM_AXES> &sp, float &motor_cmd,
+     float &collective_add);` (made callable from the test for deterministic routing checks —
+     separates signal/routing from `hrt` timekeeping).
+
+3. **EDIT `ActuatorEffectivenessTwinRotorTailsitter.cpp`**
+   - Constructor (`~lines 40‑114`): `param_find` the new `CA_CHIRP_*` handles, following the
+     existing pattern.
+   - `updateParams()` (`117‑171`): `param_get` the new values into members; on change reset
+     `_chirp_started`; call `_chirp.configure(...)`.
+   - Move the `_vehicle_status_sub.update()` armed-state read from `throttleSpoolupProgress()`
+     (`339‑344`) to the **top** of `updateSetpoint()` so both the chirp logic and spoolup use the
+     cached `_armed`/`_armed_time` (single subscriber, no behavior change for the normal path).
+   - In `updateSetpoint()` (`202‑272`): make a local `sp = control_sp`. If `_chirp_mode != OFF`,
+     compute one-shot `t`, call `applyChirp(t, sp, motor_cmd, collective_add)` which zeros `sp`,
+     routes the chirp onto the selected axis, and sets `motor_cmd` (= `CA_CHIRP_RPM` for
+     cyclic/collective, = `CA_CHIRP_RPM + chirp` for RPM). Then:
+       - motors: when chirping, `actuator_sp(0)=actuator_sp(1)= mainMotorEnaged()? motor_cmd : NAN`
+         (bypass throttle curve); else unchanged (`218,222‑223`).
+       - collective: `collective_pitch = interpolateN(-sp(THRUST_Z), pitch_curve) + collective_add`.
+       - swashplate loop (`234‑264`) and surface loop (`266‑271`) use `sp(...)` instead of
+         `control_sp(...)` (≈4 references) — identical when chirp is off.
+
+4. **EDIT `src/modules/control_allocator/module.yaml`** — add a new `group: Chirp (System ID)`
+   block after the twin-rotor params (`~line 695`), mirroring the existing `CA_TWIN*` style:
+
+   | Param | Type | Default | Notes |
+   |-------|------|---------|-------|
+   | `CA_CHIRP_MODE` | enum 0‑5 | 0 | Off / Cyclic pitch / Cyclic yaw / Collective / Collective roll / RPM |
+   | `CA_CHIRP_AMP`  | float | 0 | amplitude, in the selected axis's units |
+   | `CA_CHIRP_T`    | float (s) | 10 | sweep duration `T` (min 0.1) |
+   | `CA_CHIRP_ORD`  | float | 1 | chirp order `k` (min 0; 1 = linear) |
+   | `CA_CHIRP_F0`   | float (Hz) | 0.1 | `freq_init` |
+   | `CA_CHIRP_F1`   | float (Hz) | 10 | `freq_final` |
+   | `CA_CHIRP_RPM`  | float | 0 | held/baseline normalized motor cmd ≈ 6000 rpm (min 0, max 2) |
+
+   These are read by the existing control_allocator module (no new module needed) — the idiomatic
+   PX4 way, since they're `CA_*` params consumed by a class already inside this module.
+
+5. **NEW `.../ActuatorEffectiveness/ActuatorEffectivenessTwinRotorTailsitterTest.cpp`** — gtest
+   modeled on `ActuatorEffectivenessHelicopterTest.cpp`. See Verification.
+
+6. **EDIT `.../ActuatorEffectiveness/CMakeLists.txt`** — add `Chirp.cpp`/`Chirp.hpp` to the
+   `ActuatorEffectiveness` library (`34‑67`) and register
+   `px4_add_functional_gtest(SRC ActuatorEffectivenessTwinRotorTailsitterTest.cpp LINKLIBS ActuatorEffectiveness)` (after line 77).
+
+## Verification
+
+**Unit tests (deterministic, the core "logic"):** in
+`ActuatorEffectivenessTwinRotorTailsitterTest.cpp`:
+- *Chirp math:* `update(0)==0`; values at several `t` match the closed-form equation; finite-diff
+  instantaneous frequency ≈ `f0` at `t=0` and ≈ `f1` at `t=T`; `k=1` ⇒ linear chirp; `finished(t>T)`.
+- *Routing (via `applyChirp(t, …)` with explicit `t`):* each mode drives the correct axis to
+  `amp*sin(phase(t))` and leaves the others at 0; `motor_cmd == CA_CHIRP_RPM` for cyclic/collective
+  modes; `motor_cmd == CA_CHIRP_RPM + chirp` for RPM mode.
+- *`updateSetpoint` invariants:* cyclic/collective modes ⇒ `actuator_sp(0)==actuator_sp(1)==CA_CHIRP_RPM`
+  (throttle path bypassed, time-independent); `CA_CHIRP_MODE==0` ⇒ outputs identical to the existing
+  throttle-curve behavior (set `CA_HELI_THR_C*` like the Helicopter test and assert).
+
+Run via the global `devcon` docker:
+```bash
+devcon                                  # opens shell in the px4_dev container at this repo
+make px4_sitl_test
+make tests TESTFILTER="functional-ActuatorEffectivenessTwinRotorTailsitter"
+# or run the binary directly:
+./build/px4_sitl_test/functional-ActuatorEffectivenessTwinRotorTailsitter
+```
+
+**SITL spot-check (optional, end-to-end):** start the twin-rotor tailsitter SITL model, then in the
+pxh shell set `CA_AIRFRAME 11`, choose a chirp (`CA_CHIRP_MODE 1`, set `CA_CHIRP_AMP/T/F0/F1/ORD`,
+`CA_CHIRP_RPM`), arm, and watch outputs:
+```bash
+listener actuator_servos      # cyclic/collective servos sweeping
+listener actuator_motors      # motors held at CA_CHIRP_RPM (or sweeping in RPM mode)
+```
+Confirm the swept axis oscillates with increasing frequency over `CA_CHIRP_T`, the motors stay at
+`CA_CHIRP_RPM` for cyclic/collective modes, and output returns to baseline after `T` (re-arm to repeat).

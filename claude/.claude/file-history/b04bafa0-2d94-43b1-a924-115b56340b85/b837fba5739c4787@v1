@@ -1,0 +1,377 @@
+#!/usr/bin/env python3
+"""
+Real-time PX4 NED position and velocity plotter over MAVLink.
+
+Two separate 3x1 figures:
+  Figure 1  Position NED:  EKF (LOCAL_POSITION_NED) + GPS-derived NED +
+                          3sigma bounds (from LOCAL_POSITION_NED_COV) +
+                          setpoint (from POSITION_TARGET_LOCAL_NED).
+  Figure 2  Velocity NED:  EKF + GPS-derived + 3sigma + setpoint.
+
+Refreshes at 1 Hz while the vehicle is armed (used here as a proxy for
+"SD logger is recording" -- matches the PX4 default SDLOG_MODE=0 / 2).
+On the arm->disarm edge, saves both figures as timestamped PNGs in the
+current working directory and stops updating until the next arm.
+
+Usage:
+    python3 px4_realtime_plot.py --device /dev/ttyUSB0 --baud 57600
+
+Dependencies:
+    pip install pymavlink matplotlib numpy
+    # plus a working matplotlib backend, e.g. on Ubuntu:
+    sudo apt install python3-tk
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import numpy as np
+from pymavlink import mavutil
+
+# --------------------------------------------------------------------------- #
+# Constants                                                                   #
+# --------------------------------------------------------------------------- #
+EARTH_RADIUS_M = 6_378_137.0          # WGS84 equatorial radius
+BUFFER_SECONDS = 300                  # rolling window length on the plots
+REFRESH_HZ     = 1.0                  # plot redraw rate
+
+# Diagonal indices of the 45-element upper-triangular packing of the 9x9
+# state covariance in LOCAL_POSITION_NED_COV. Order: x, y, z, vx, vy, vz.
+COV_DIAG_IDX = {"x": 0, "y": 9, "z": 17, "vx": 24, "vy": 30, "vz": 35}
+
+# POSITION_TARGET_LOCAL_NED.type_mask bits (1 = "ignore this field")
+SP_IGNORE = {"x": 1 << 0, "y": 1 << 1, "z": 1 << 2,
+             "vx": 1 << 3, "vy": 1 << 4, "vz": 1 << 5}
+
+
+# --------------------------------------------------------------------------- #
+# Geodesy: flat-Earth LLA -> NED (good to ~cm over a few km)                  #
+# --------------------------------------------------------------------------- #
+def lla_to_ned(lat, lon, alt, lat0, lon0, alt0):
+    dlat = math.radians(lat - lat0)
+    dlon = math.radians(lon - lon0)
+    n = dlat * EARTH_RADIUS_M
+    e = dlon * EARTH_RADIUS_M * math.cos(math.radians(lat0))
+    d = -(alt - alt0)
+    return n, e, d
+
+
+# --------------------------------------------------------------------------- #
+# Thread-safe rolling buffers                                                 #
+# --------------------------------------------------------------------------- #
+class Telemetry:
+    def __init__(self, window_s: float = BUFFER_SECONDS):
+        self.lock = threading.Lock()
+        n = int(window_s * 20)  # generous upper bound on samples per series
+
+        # EKF local position / velocity
+        self.t_local = deque(maxlen=n)
+        self.local = {k: deque(maxlen=n) for k in ("x", "y", "z", "vx", "vy", "vz")}
+
+        # 1-sigma per axis (sqrt of the diagonal of the EKF covariance)
+        self.t_cov = deque(maxlen=n)
+        self.sigma = {k: deque(maxlen=n) for k in COV_DIAG_IDX}
+
+        # GPS-derived NED position + velocity (from GPS_RAW_INT)
+        self.t_gps = deque(maxlen=n)
+        self.gps_pn = deque(maxlen=n); self.gps_pe = deque(maxlen=n); self.gps_pd = deque(maxlen=n)
+        self.gps_vn = deque(maxlen=n); self.gps_ve = deque(maxlen=n); self.gps_vd = deque(maxlen=n)
+
+        # Setpoints
+        self.t_sp = deque(maxlen=n)
+        self.sp_pn = deque(maxlen=n); self.sp_pe = deque(maxlen=n); self.sp_pd = deque(maxlen=n)
+        self.sp_vn = deque(maxlen=n); self.sp_ve = deque(maxlen=n); self.sp_vd = deque(maxlen=n)
+
+        self.origin: tuple[float, float, float] | None = None  # (lat0, lon0, alt0)
+        self.armed = False
+        self.t0: float | None = None  # epoch of first sample, used as plot time origin
+
+
+# --------------------------------------------------------------------------- #
+# MAVLink ingest thread                                                       #
+# --------------------------------------------------------------------------- #
+def mavlink_reader(conn, tel: Telemetry, stop_evt: threading.Event):
+    while not stop_evt.is_set():
+        msg = conn.recv_match(blocking=True, timeout=1.0)
+        if msg is None:
+            continue
+
+        t = time.time()
+        mtype = msg.get_type()
+
+        with tel.lock:
+            if tel.t0 is None and mtype in (
+                "LOCAL_POSITION_NED", "GPS_RAW_INT", "POSITION_TARGET_LOCAL_NED"
+            ):
+                tel.t0 = t
+
+            if mtype == "HEARTBEAT":
+                tel.armed = bool(
+                    msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
+
+            elif mtype == "LOCAL_POSITION_NED":
+                tel.t_local.append(t)
+                tel.local["x"].append(msg.x)
+                tel.local["y"].append(msg.y)
+                tel.local["z"].append(msg.z)
+                tel.local["vx"].append(msg.vx)
+                tel.local["vy"].append(msg.vy)
+                tel.local["vz"].append(msg.vz)
+
+            elif mtype == "LOCAL_POSITION_NED_COV":
+                tel.t_cov.append(t)
+                for k, idx in COV_DIAG_IDX.items():
+                    var = max(float(msg.covariance[idx]), 0.0)
+                    tel.sigma[k].append(math.sqrt(var))
+
+            elif mtype == "HOME_POSITION":
+                # Prefer HOME_POSITION over first GPS as the NED origin
+                tel.origin = (msg.latitude * 1e-7,
+                              msg.longitude * 1e-7,
+                              msg.altitude * 1e-3)
+
+            elif mtype == "GPS_RAW_INT":
+                if msg.fix_type < 3:
+                    continue  # need a 3D fix before we trust anything
+                lat = msg.lat * 1e-7
+                lon = msg.lon * 1e-7
+                alt = msg.alt * 1e-3
+                if tel.origin is None:
+                    tel.origin = (lat, lon, alt)
+                lat0, lon0, alt0 = tel.origin
+
+                n, e, d = lla_to_ned(lat, lon, alt, lat0, lon0, alt0)
+                tel.t_gps.append(t)
+                tel.gps_pn.append(n); tel.gps_pe.append(e); tel.gps_pd.append(d)
+
+                # GPS_RAW_INT carries ground speed + course only; derive horizontal
+                # NED velocity from those. vD is not provided -> NaN.
+                v_ground = msg.vel * 1e-2                # cm/s -> m/s
+                cog_rad  = math.radians(msg.cog * 1e-2)  # cdeg -> rad
+                tel.gps_vn.append(v_ground * math.cos(cog_rad))
+                tel.gps_ve.append(v_ground * math.sin(cog_rad))
+                tel.gps_vd.append(float("nan"))
+
+            elif mtype == "POSITION_TARGET_LOCAL_NED":
+                bm = msg.type_mask
+                def keep(field, val):
+                    return val if not (bm & SP_IGNORE[field]) else float("nan")
+                tel.t_sp.append(t)
+                tel.sp_pn.append(keep("x",  msg.x))
+                tel.sp_pe.append(keep("y",  msg.y))
+                tel.sp_pd.append(keep("z",  msg.z))
+                tel.sp_vn.append(keep("vx", msg.vx))
+                tel.sp_ve.append(keep("vy", msg.vy))
+                tel.sp_vd.append(keep("vz", msg.vz))
+
+
+# --------------------------------------------------------------------------- #
+# Stream-rate setup                                                           #
+# --------------------------------------------------------------------------- #
+def set_stream_rates(conn, rates_hz: dict[int, float]):
+    """Use MAV_CMD_SET_MESSAGE_INTERVAL to request specific message rates."""
+    for msg_id, hz in rates_hz.items():
+        interval_us = int(1e6 / hz) if hz > 0 else -1
+        conn.mav.command_long_send(
+            conn.target_system, conn.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            msg_id, interval_us, 0, 0, 0, 0, 0,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Plotting                                                                    #
+# --------------------------------------------------------------------------- #
+def make_figures():
+    fig_pos, ax_pos = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
+    fig_pos.suptitle("Position NED  (EKF, GPS, setpoint, $\\pm 3\\sigma$)")
+    for ax, lbl in zip(ax_pos, ("N (m)", "E (m)", "D (m)")):
+        ax.set_ylabel(lbl); ax.grid(True, alpha=0.3)
+    ax_pos[-1].set_xlabel("Time (s)")
+
+    fig_vel, ax_vel = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
+    fig_vel.suptitle("Velocity NED  (EKF, GPS, setpoint, $\\pm 3\\sigma$)")
+    for ax, lbl in zip(ax_vel, ("$v_N$ (m/s)", "$v_E$ (m/s)", "$v_D$ (m/s)")):
+        ax.set_ylabel(lbl); ax.grid(True, alpha=0.3)
+    ax_vel[-1].set_xlabel("Time (s)")
+
+    fig_pos.tight_layout()
+    fig_vel.tight_layout()
+    return (fig_pos, ax_pos), (fig_vel, ax_vel)
+
+
+def snapshot(tel: Telemetry):
+    """Copy buffers under the lock into numpy arrays."""
+    with tel.lock:
+        t0 = tel.t0 if tel.t0 is not None else time.time()
+        def A(d): return np.array(d, dtype=float)
+        snap = {
+            "t_local": A(tel.t_local) - t0,
+            "local":   {k: A(tel.local[k]) for k in tel.local},
+            "t_cov":   A(tel.t_cov) - t0,
+            "sigma":   {k: A(tel.sigma[k]) for k in tel.sigma},
+            "t_gps":   A(tel.t_gps) - t0,
+            "gps_p":   {"n": A(tel.gps_pn), "e": A(tel.gps_pe), "d": A(tel.gps_pd)},
+            "gps_v":   {"n": A(tel.gps_vn), "e": A(tel.gps_ve), "d": A(tel.gps_vd)},
+            "t_sp":    A(tel.t_sp) - t0,
+            "sp_p":    {"n": A(tel.sp_pn), "e": A(tel.sp_pe), "d": A(tel.sp_pd)},
+            "sp_v":    {"n": A(tel.sp_vn), "e": A(tel.sp_ve), "d": A(tel.sp_vd)},
+        }
+    return snap
+
+
+def redraw(snap, ax_pos, ax_vel):
+    pos_axes  = ("x",  "y",  "z")           # EKF position field names
+    vel_axes  = ("vx", "vy", "vz")
+    ned_keys  = ("n",  "e",  "d")
+    pos_ylab  = ("N (m)", "E (m)", "D (m)")
+    vel_ylab  = ("$v_N$ (m/s)", "$v_E$ (m/s)", "$v_D$ (m/s)")
+
+    t_loc = snap["t_local"]
+    t_cov = snap["t_cov"]
+    t_gps = snap["t_gps"]
+    t_sp  = snap["t_sp"]
+
+    # ---------- Position figure ----------
+    for i, (ax, ek, gk, sk) in enumerate(zip(ax_pos, pos_axes, ned_keys, ned_keys)):
+        ax.clear()
+        ax.set_ylabel(pos_ylab[i]); ax.grid(True, alpha=0.3)
+
+        if t_loc.size:
+            y = snap["local"][ek]
+            ax.plot(t_loc, y, "C0-", lw=1.3, label="EKF")
+            if t_cov.size and snap["sigma"][ek].size:
+                sig = np.interp(t_loc, t_cov, snap["sigma"][ek])
+                ax.plot(t_loc, y + 3 * sig, "C0:", lw=0.9, alpha=0.7, label=r"$\pm 3\sigma$")
+                ax.plot(t_loc, y - 3 * sig, "C0:", lw=0.9, alpha=0.7)
+        if t_gps.size:
+            ax.plot(t_gps, snap["gps_p"][gk], "C1.", ms=3, label="GPS")
+        if t_sp.size:
+            ax.plot(t_sp, snap["sp_p"][sk], "C3--", lw=1.1, label="setpoint")
+        if i == 0:
+            ax.legend(loc="upper right", fontsize=8, ncol=4)
+    ax_pos[-1].set_xlabel("Time (s)")
+
+    # ---------- Velocity figure ----------
+    for i, (ax, ek, gk, sk) in enumerate(zip(ax_vel, vel_axes, ned_keys, ned_keys)):
+        ax.clear()
+        ax.set_ylabel(vel_ylab[i]); ax.grid(True, alpha=0.3)
+
+        if t_loc.size:
+            y = snap["local"][ek]
+            ax.plot(t_loc, y, "C0-", lw=1.3, label="EKF")
+            if t_cov.size and snap["sigma"][ek].size:
+                sig = np.interp(t_loc, t_cov, snap["sigma"][ek])
+                ax.plot(t_loc, y + 3 * sig, "C0:", lw=0.9, alpha=0.7, label=r"$\pm 3\sigma$")
+                ax.plot(t_loc, y - 3 * sig, "C0:", lw=0.9, alpha=0.7)
+        if t_gps.size:
+            ax.plot(t_gps, snap["gps_v"][gk], "C1.", ms=3, label="GPS")
+        if t_sp.size:
+            ax.plot(t_sp, snap["sp_v"][sk], "C3--", lw=1.1, label="setpoint")
+        if i == 0:
+            ax.legend(loc="upper right", fontsize=8, ncol=4)
+    ax_vel[-1].set_xlabel("Time (s)")
+
+
+def save_figs(fig_pos, fig_vel):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = Path.cwd()
+    p1 = outdir / f"position_ned_{ts}.png"
+    p2 = outdir / f"velocity_ned_{ts}.png"
+    fig_pos.savefig(p1, dpi=140, bbox_inches="tight")
+    fig_vel.savefig(p2, dpi=140, bbox_inches="tight")
+    print(f"[{ts}] Disarm detected -> saved {p1.name} and {p2.name}")
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                        #
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", default="udpin:127.0.01:14551",
+                    help="Serial port (default: /dev/serial/by-id/usb-mRo_mRoControlZeroH7_OEM_0-if00).")
+    ap.add_argument("--baud", type=int, default=57600,
+                    help="Baud rate (default: 57600, matches stock SiK).")
+    ap.add_argument("--source-system", type=int, default=250,
+                    help="MAVLink source system id for this script.")
+    args = ap.parse_args()
+
+    print(f"Opening {args.device} @ {args.baud} baud...")
+    conn = mavutil.mavlink_connection(
+        args.device, baud=args.baud, source_system=args.source_system
+    )
+    conn.wait_heartbeat()
+    print(f"Heartbeat from sys {conn.target_system} comp {conn.target_component}")
+
+    # Ask PX4 to stream what we need. Keep totals modest -- the SiK link is
+    # only ~4 kB/s effective at 57600.
+    set_stream_rates(conn, {
+        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED:        10,
+        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED_COV:     2,
+        mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT:                2,
+        mavutil.mavlink.MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED:  5,
+        mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION:              1,
+        mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT:                  1,
+    })
+
+    tel = Telemetry()
+    stop_evt = threading.Event()
+    reader = threading.Thread(target=mavlink_reader,
+                              args=(conn, tel, stop_evt), daemon=True)
+    reader.start()
+
+    plt.ion()
+    (fig_pos, ax_pos), (fig_vel, ax_vel) = make_figures()
+    plt.show(block=False)
+
+    was_armed = False
+    last_refresh = 0.0
+    print("Running. Plots refresh while armed; figures save on disarm. "
+          "Ctrl-C to quit.")
+
+    try:
+        while True:
+            with tel.lock:
+                armed_now = tel.armed
+            now = time.time()
+
+            if armed_now:
+                if now - last_refresh >= 1.0 / REFRESH_HZ:
+                    redraw(snapshot(tel), ax_pos, ax_vel)
+                    fig_pos.canvas.draw_idle()
+                    fig_vel.canvas.draw_idle()
+                    last_refresh = now
+                was_armed = True
+            else:
+                if was_armed:
+                    # Arm -> disarm edge: one last refresh, then save.
+                    redraw(snapshot(tel), ax_pos, ax_vel)
+                    fig_pos.canvas.draw_idle()
+                    fig_vel.canvas.draw_idle()
+                    save_figs(fig_pos, fig_vel)
+                    was_armed = False
+                # Disarmed: no redraw, just keep the windows responsive.
+
+            plt.pause(0.05)
+    except KeyboardInterrupt:
+        print("\nInterrupted. Saving final figures...")
+        redraw(snapshot(tel), ax_pos, ax_vel)
+        save_figs(fig_pos, fig_vel)
+    finally:
+        stop_evt.set()
+        reader.join(timeout=2.0)
+
+
+if __name__ == "__main__":
+    main()

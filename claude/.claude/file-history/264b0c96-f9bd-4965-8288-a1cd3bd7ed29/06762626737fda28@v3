@@ -1,0 +1,204 @@
+# Multicopter Attitude & Rate Control — Per-Channel Architecture Map
+
+## Context
+
+This document maps the rate and attitude control loops as they exist in **your** PX4-Autopilot fork on branch `hotfix` (HEAD `791030d7`). It traces signals end-to-end per axis (roll, pitch, yaw), names the parameters, gives the exact control equations from your source, and flags the places where this fork differs from upstream PX4. Use it as a reference for tuning, debugging, and as the foundation for the SysID work tracked elsewhere.
+
+---
+
+## High-level cascade
+
+```
+                  ┌──────────────────────── stabilized / position mode
+                  │
+   sticks ───► generate_attitude_setpoint() ──► vehicle_attitude_setpoint.q_d
+                                                          │
+                                                          ▼
+   vehicle_attitude.q ─────────────────────► AttitudeControl::update(q, rates)
+                                                          │  rate_setpoint = P·eq − D·rates + ψ_FF
+                                                          ▼
+                                              vehicle_rates_setpoint.{roll,pitch,yaw}
+                  ┌──────────────────────── acro mode (sticks → rates directly)
+                  │
+                  ▼
+   vehicle_angular_velocity.{xyz, xyz_derivative} ─► RateControl::update(rate, rate_sp, accel, dt, landed)
+                                                          │  τ = K·[P·(rate_sp−rate) + ∫ − D·accel + FF·rate_sp]
+                                                          ▼
+                                              vehicle_torque_setpoint.xyz[3]      (and vehicle_thrust_setpoint)
+                                                          │
+                                                          ▼
+                                              ControlAllocator ──► actuator_motors.control[0..N]
+```
+
+---
+
+## A. Inner rate loop — `RateControl::update()`
+
+Source: `src/lib/rate_control/rate_control.cpp:71-86`
+
+```cpp
+Vector3f rate_error = rate_sp - rate;
+const Vector3f torque = _gain_p.emult(rate_error) + _rate_int
+                       - _gain_d.emult(angular_accel) + _gain_ff.emult(rate_sp);
+if (!landed) updateIntegral(rate_error, dt);
+```
+
+Per axis i ∈ {x=roll, y=pitch, z=yaw}:
+
+```
+τ[i] = K[i] · ( P[i]·(rate_sp[i] − rate[i]) + ∫_i  −  D[i]·α_meas[i]  +  FF[i]·rate_sp[i] )
+```
+
+Notes that apply to all three rate channels:
+
+- **D term acts on measured angular acceleration**, not on rate-error back-difference. The accel comes pre-computed in `vehicle_angular_velocity.xyz_derivative[]` from the IMU pipeline — no extra LPF inside the controller. (`src/modules/sensors/vehicle_angular_velocity/VehicleAngularVelocity.cpp`)
+- **Integrator anti-windup gate is commented out** in your tree (`rate_control.cpp:92-99`). Saturation flags from `control_allocator_status.unallocated_torque` are written via `setSaturationStatus()` from `MulticopterRateControl.cpp:244`, but the lines that would zero the rate-error sign on saturation are disabled. This is upstream behavior — flag if you intend to rely on it.
+- **Soft I-gain reduction** (`rate_control.cpp:107-108`): `i_factor = max(0, 1 − (err/400°)²)`. Large rate errors reduce integration to avoid post-flip bounce-back. Identical across axes.
+- **Master gain K[i]** (param `MC_ROLLRATE_K` / `MC_PITCHRATE_K` / `MC_YAWRATE_K`, default 1.0) multiplies P, I, D inside the controller after `setGains()` is called.
+
+### Per-axis breakdown (rate loop)
+
+| | **Roll (x)** | **Pitch (y)** | **Yaw (z)** |
+|---|---|---|---|
+| Setpoint source — Acro | sticks → `superexpo(roll) · MC_ACRO_R_MAX` at `MulticopterRateControl.cpp:188-194` | `superexpo(-pitch) · MC_ACRO_P_MAX` (sign flip is PX4 convention) | `superexpo(yaw) · MC_ACRO_Y_MAX` |
+| Setpoint source — Stabilized/Auto | `vehicle_rates_setpoint.roll` from `mc_att_control` | `.pitch` | `.yaw` |
+| Measured feedback | `vehicle_angular_velocity.xyz[0]` | `.xyz[1]` | `.xyz[2]` |
+| Angular accel for D | `xyz_derivative[0]` | `xyz_derivative[1]` | `xyz_derivative[2]` |
+| **P** | `MC_ROLLRATE_P` = 0.15 | `MC_PITCHRATE_P` = 0.15 | `MC_YAWRATE_P` = 0.2 |
+| **I** | `MC_ROLLRATE_I` = 0.2 | `MC_PITCHRATE_I` = 0.2 | `MC_YAWRATE_I` = 0.1 |
+| **D** | `MC_ROLLRATE_D` = 0.003 | `MC_PITCHRATE_D` = 0.003 | `MC_YAWRATE_D` = 0.0 (disabled) |
+| **FF** | `MC_ROLLRATE_FF` = 0.0 | `MC_PITCHRATE_FF` = 0.0 | `MC_YAWRATE_FF` = 0.0 |
+| **K (master)** | `MC_ROLLRATE_K` = 1.0 | `MC_PITCHRATE_K` = 1.0 | `MC_YAWRATE_K` = 1.0 |
+| Integrator limit | `MC_RR_INT_LIM` = 0.30 | `MC_PR_INT_LIM` = 0.30 | `MC_YR_INT_LIM` = 0.30 |
+| Acro stick max | `MC_ACRO_R_MAX` = 720°/s | `MC_ACRO_P_MAX` = 720°/s | `MC_ACRO_Y_MAX` = 540°/s |
+| Output field | `vehicle_torque_setpoint.xyz[0]` | `.xyz[1]` | `.xyz[2]` |
+| Update site | `MulticopterRateControl.cpp:248` (single call for all 3) | same | same |
+| Publish site | `MulticopterRateControl.cpp:261-263, 287-289` | same | same |
+
+**Yaw-specific** in the rate loop:
+- D defaults to 0, P is higher (0.2 vs 0.15), I is halved (0.1 vs 0.2). The reduced I matches the lower yaw authority on a quad and prevents wind-up on heading-hold.
+- Acro max is lower (540°/s vs 720°/s).
+- No structural difference — same equation, same code path; only gain values differ.
+
+**Acro/manual stick path special handling** (`MulticopterRateControl.cpp:184-215`):
+- If rate setpoint from upstream attitude controller is `NaN` for an axis, the controller falls back to feeding the measured rate in for that axis (line 210-212: `_rates_setpoint(i) = isfinite(...) ? ... : rates(i)`), zeroing the error — a no-op for that axis.
+
+---
+
+## B. Outer attitude loop — `AttitudeControl::update()`
+
+Source: `src/modules/mc_att_control/AttitudeControl/AttitudeControl.cpp:55-112`
+
+Math, in order:
+
+1. **Yaw-deprioritized desired attitude** (lines 60-81). Build `qd_red` = rotation that aligns only the thrust axis (`dcm_z`) of current → desired, then blend full `qd` with `qd_red` using yaw weight `_yaw_w`:
+   ```cpp
+   Quatf qd_red(e_z, e_z_d);
+   ...
+   Quatf q_mix = qd_red.inversed() * qd;
+   qd = qd_red * Quatf(cosf(_yaw_w * acosf(q_mix(0))), 0, 0, sinf(_yaw_w * asinf(q_mix(3))));
+   ```
+   This makes the controller bias roll/pitch over yaw — exactly the tilt-priority behavior you want when a maneuver couples all three.
+
+2. **Quaternion error → axis-angle vector** (lines 84-88):
+   ```cpp
+   const Quatf qe = q.inversed() * qd;
+   const Vector3f eq = 2.f * qe.canonical().imag();   // = 2·sin(α/2)·axis
+   ```
+
+3. **P + D + yaw feed-forward** (lines 91-104):
+   ```cpp
+   Vector3f rate_setpoint = eq.emult(_proportional_gain);
+   Vector3f rate_setpoint_d = -rates.emult(_derivative_gain);   // KW addition
+   rate_setpoint += rate_setpoint_d;
+   if (isfinite(_yawspeed_setpoint))
+       rate_setpoint += q.inversed().dcm_z() * _yawspeed_setpoint;   // world-z FF → body frame
+   ```
+
+4. **Hard rate limit per axis** (lines 107-109): `constrain(rate_setpoint(i), ±_rate_limit(i))`.
+
+Per axis ψ ∈ {φ=roll, θ=pitch, ψ=yaw}:
+
+```
+ω_sp[i] = P[i] · eq[i]  −  D[i] · ω_meas[i]    (+ yaw FF only on yaw axis after world→body rotation)
+ω_sp[i] = clip(ω_sp[i], ±rate_max[i])
+```
+
+### Per-axis breakdown (attitude loop)
+
+| | **Roll (φ)** | **Pitch (θ)** | **Yaw (ψ)** |
+|---|---|---|---|
+| Setpoint origin — Stabilized | stick → tilt-magnitude+direction → `q_sp_rp` (`mc_att_control_main.cpp:145-171`) | same coupled tilt path | stick → world yaw rate → integrated into absolute yaw (`mc_att_control_main.cpp:117-129`) |
+| Setpoint origin — Auto | `vehicle_attitude_setpoint.q_d` from `mc_pos_control` | same | same |
+| Measured | `vehicle_attitude.q` (EKF2 ~100 Hz) and `vehicle_angular_velocity.xyz` (for the D term) | same | same |
+| **P** | `MC_ROLL_P` = 6.5 | `MC_PITCH_P` = 6.5 | `MC_YAW_P` = 2.8 |
+| **D** (KW fork only) | `MC_ROLL_D` = 0.0 | `MC_PITCH_D` = 0.0 | `MC_YAW_D` = 0.0 |
+| Yaw weight | — | — | `MC_YAW_WEIGHT` = 0.4 (deprioritizes yaw vs tilt) |
+| Rate limit (clip) | `MC_ROLLRATE_MAX` = 220°/s | `MC_PITCHRATE_MAX` = 220°/s | `MC_YAWRATE_MAX` = 200°/s |
+| Output field | `vehicle_rates_setpoint.roll` | `.pitch` | `.yaw` |
+| Update site | `mc_att_control_main.cpp:303` (single call, all 3) | same | same |
+| Publish site | `mc_att_control_main.cpp:320-326` | same | same |
+
+**Roll & pitch** are structurally identical: same P default, same rate limit, same tilt-magnitude stick-mapping in Stabilized. Stick deflection maps to a tilt-vector magnitude+direction rather than independent roll/pitch angles — important when interpreting `q_d` per-channel.
+
+**Yaw** differs from roll/pitch:
+- Lower P (2.8 vs 6.5) — reflects the smaller yaw control authority of a quad.
+- The P-gain rescaling in `setProportionalGain()` (line 51 of `AttitudeControl.cpp`) divides the yaw gain by `_yaw_w` to compensate for the yaw-weight mix step. **The D-gain is not rescaled**, which means a non-zero `MC_YAW_D` will not be compensated the same way — worth knowing if you tune `MC_YAW_D`.
+- Stick yaw produces a **world-frame yaw rate**, transformed to body frame at line 103: `rate_setpoint += q.inversed().dcm_z() · _yawspeed_setpoint`.
+- `_yawspeed_setpoint` is sourced from `vehicle_attitude_setpoint.yaw_sp_move_rate` (set by `generate_attitude_setpoint()`).
+
+---
+
+## C. KnightWerx fork — deviations from upstream
+
+Commits affecting these loops, found in `git log` on this branch:
+
+### 1. Attitude D-term (commit `76328d9640`, Henry Won, 2024-09-10)
+
+The single substantive controller change vs upstream PX4 in this area. Files modified:
+- `src/modules/mc_att_control/AttitudeControl/AttitudeControl.{cpp,hpp}` — `update()` now takes `rates` and applies `-rates.emult(_derivative_gain)`.
+- `src/modules/mc_att_control/mc_att_control.hpp` — added `_derivative_gain` member, `setDerivativeGain()`.
+- `src/modules/mc_att_control/mc_att_control_main.cpp` — passes `rates` to `update()` (line 303), loads three new params on parameter update.
+- `src/modules/mc_att_control/mc_att_control_params.c` — defines `MC_ROLL_D`, `MC_PITCH_D`, `MC_YAW_D` (all default 0.0).
+
+Effective controller is now **P+D on attitude**, with the inner rate loop unchanged. The hard-coded member init at `AttitudeControl.hpp:106` is `{0.1f, 0.f, 0.f}` (roll-only damping) but the params overwrite that on boot, so the runtime default is `{0,0,0}` unless you set the params.
+
+**Implication for SysID and tuning**: with default params (all D=0), this fork is mathematically identical to upstream. If you set any `MC_*_D > 0`, you're adding rate-proportional damping to the *attitude* loop, which couples back through the rate setpoint sent to the inner loop — the inner-loop FRF is unaffected, but the outer-loop and cascade FRFs will shift.
+
+### 2. Heading-good-for-control reset bypass (in same commit and surroundings, `mc_att_control_main.cpp:331`)
+
+A comment in the file reads "bypassing this check as it has been overactively setting false" — the `heading_good_for_control` reset path that would have re-baselined the yaw setpoint during autonomous flight is disabled. Behavioral effect: yaw setpoints don't get reset under EKF heading-quality drops. Worth knowing if you see unexpected yaw drift in flight logs.
+
+### 3. Rate controller — no fork divergence
+
+`git log hotfix..origin/dev -- src/modules/mc_rate_control/ src/lib/rate_control/` returns nothing. The rate loop in this repo is byte-identical to the dev branch on the same files. The commented-out anti-windup gate (`rate_control.cpp:92-99`) is also upstream behavior, not a local change.
+
+---
+
+## D. Critical files
+
+Rate loop:
+- `src/lib/rate_control/rate_control.cpp` — the math, integrator, anti-windup hooks.
+- `src/lib/rate_control/rate_control.hpp` — gain setters, saturation API.
+- `src/modules/mc_rate_control/MulticopterRateControl.cpp` — uORB I/O, acro stick mapping, axis index assignment, output publishing.
+- `src/modules/mc_rate_control/mc_rate_control_params.c` — `MC_*RATE_*` parameters.
+
+Attitude loop:
+- `src/modules/mc_att_control/AttitudeControl/AttitudeControl.cpp` — quaternion error, yaw weighting, P+D, yaw FF, rate clip.
+- `src/modules/mc_att_control/AttitudeControl/AttitudeControl.hpp` — `_derivative_gain` member (KW).
+- `src/modules/mc_att_control/mc_att_control_main.cpp` — stabilized stick→quaternion (`generate_attitude_setpoint()` line 112), uORB I/O, parameter loading.
+- `src/modules/mc_att_control/mc_att_control_params.c` — `MC_ROLL_P/D`, `MC_PITCH_P/D`, `MC_YAW_P/D`, `MC_YAW_WEIGHT`, `MC_*RATE_MAX`.
+
+Downstream of the rate loop (informational):
+- `src/modules/control_allocator/ControlAllocator.cpp:425, 679` — torque → motor mapping, `actuator_motors` publish.
+
+---
+
+## E. Verification
+
+A few quick checks to confirm the map matches your running build:
+
+1. **Param dump** — after building+flashing, on the autopilot console run `param show MC_ROLL_D MC_PITCH_D MC_YAW_D` and confirm all three exist. If they don't, the binary is built from upstream, not this branch.
+2. **Per-axis topic sanity** — in a 30 s log: `ulog_info -m vehicle_torque_setpoint <log.ulg>` and confirm `xyz[]` carries roll/pitch/yaw torque correlated with stick input on the matching channel. Cross-check `vehicle_rates_setpoint.roll/.pitch/.yaw` against `vehicle_angular_velocity.xyz[0]/[1]/[2]` to confirm sign conventions (pitch in particular — the stick path negates pitch).
+3. **D-term effect, attitude loop** — on the bench (props off, IMU live), set `MC_ROLL_D = 0.05`, command a small attitude setpoint via QGC, and confirm `vehicle_rates_setpoint.roll` shows a negative-proportional response to `vehicle_angular_velocity.xyz[0]`.
+4. **Confirm anti-windup is inactive** — read `rate_control.cpp:92-99` in the built source; verify the lines inside the saturation `if` blocks are commented. If you ever want anti-windup back, that's the one-line uncomment.

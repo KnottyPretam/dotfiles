@@ -1,0 +1,251 @@
+# Plan: persist plant TFs from `run_sysid` + add `replay_margins` script
+
+## Context
+
+Today, `run_sysid` identifies per-axis plant transfer functions, builds controllers from the logged PX4 gains, computes margins, and writes plots + `margins.txt`. The identified plants exist only in-memory and are thrown away at the end of the run — so if you want to ask *"what would the margins look like with these other gains?"* you have to re-run the entire ULG pipeline (slow, and tied to having the log around).
+
+Two changes:
+
+1. **Persist the identified plants.** After `run_sysid` finishes, save a `plants.mat` next to `results.mat` containing the rate and attitude plant TFs per (mode, axis), plus the gains that were used for the original analysis.
+
+2. **Add a replay script.** A new `replay_margins.sh` reads a YAML file of gains, loads the saved plants, reconstructs the controllers using the same formulas as `build_controller_tf.m`, re-runs `analyze_loop`, and writes Bode + Nichols + step plots plus a `margins.txt` with GM / PM / VM per channel. The YAML can filter by axis and/or loop so a user can re-tune one channel at a time.
+
+User decisions (from clarification):
+- Save **both** rate and attitude plants (`tf` and `tf_pade` for each).
+- YAML carries the `run_dir` (one CLI arg: the YAML).
+- Filter by axis and/or loop (default: all of {roll,pitch,yaw} × {rate,attitude}).
+- Margins file contains **GM, PM, VM only** (no disk-equivalent columns) — user was explicit.
+
+---
+
+## Files
+
+| Path | Action | Purpose |
+|---|---|---|
+| `run_sysid.m` | edit | After `results.mat` save, additionally save `plants.mat`. |
+| `replay_margins.m` | new | MATLAB function that loads `plants.mat`, applies YAML gains, emits plots + margins. |
+| `replay_margins.sh` | new | Bash wrapper: parses YAML → JSON via python, launches MATLAB. |
+| `gains_example.yaml` | new | Template YAML for a user to copy. |
+
+No changes to `build_controller_tf.m`, `analyze_loop.m`, `make_plots.m`, `identify_plant.m`, `run_sysid.sh`.
+
+---
+
+## Change 1: `run_sysid.m`
+
+Two small additive edits — no existing behaviour modified.
+
+**(a)** Initialize a `plants = struct()` accumulator before the regimes loop (near line 64, where `results = []; gain_info = struct();` is set up).
+
+**(b)** Inside the per-axis loop body, right after `[C_rate, C_att, info_g] = build_controller_tf(...)` (line 112) capture the plant + gains:
+
+```matlab
+plants.(mode).(ax_name).rate = pack_plant(P_rate);
+plants.(mode).(ax_name).att  = pack_plant(P_att);
+plants.(mode).(ax_name).logged_gains = info_g.gains;
+plants.(mode).(ax_name).missing      = info_g.missing;
+```
+
+**(c)** After the existing `save(... 'results.mat' ...)` on line 197:
+
+```matlab
+plants.cfg = struct('fmin_Hz', cfg.fmin_Hz, ...
+                    'fmax_Hz', cfg.fmax_Hz, ...
+                    'axes',    {cfg.axes}, ...
+                    'regime',  cfg.regime);
+save(fullfile(out_dir, 'plants.mat'), 'plants', '-v7.3');
+```
+
+**(d)** Add helper at the file's helpers section:
+
+```matlab
+function S = pack_plant(P)
+S = struct('tf', P.tf, 'tf_pade', P.tf_pade, ...
+           'num', P.num, 'den', P.den, 'tau', P.tau, ...
+           'ok', P.ok, 'reason', P.reason);
+end
+```
+
+If a regime/axis identification fails, `P.ok=false` and `P.tf=[]` — `pack_plant` still records that, and the replay skips it with a "no plant" row.
+
+---
+
+## Change 2: `replay_margins.m`
+
+Signature: `replay_margins(json_path, run_dir, out_dir)` — bash writes a JSON sidecar so we can use built-in `jsondecode`.
+
+Main flow:
+
+```matlab
+function replay_margins(json_path, run_dir, out_dir)
+here = fileparts(mfilename('fullpath'));
+addpath(here);  addpath(fullfile(here,'utils'));
+set(0,'DefaultFigureVisible','off');
+
+spec   = jsondecode(fileread(json_path));        % .axes .loops .mc.* .fw.*
+S      = load(fullfile(run_dir, 'plants.mat'));
+plants = S.plants;
+fmin   = plants.cfg.fmin_Hz;
+fmax   = plants.cfg.fmax_Hz;
+
+axes_filter  = pick(spec, 'axes',  {'roll','pitch','yaw'});
+loops_filter = pick(spec, 'loops', {'rate','attitude'});
+
+rows = {};
+for mode = {'mc','fw'}
+    m = mode{1};
+    if ~isfield(plants, m) || ~isfield(spec, m); continue; end
+    fig_dir = fullfile(out_dir, 'figures', m);
+    if ~isfolder(fig_dir); mkdir(fig_dir); end
+
+    for ax = axes_filter
+        a = ax{1};
+        if ~isfield(plants.(m), a) || ~isfield(spec.(m), a); continue; end
+        pr = plants.(m).(a).rate;
+        gains = spec.(m).(a);
+        [C_rate, C_att] = build_C_from_gains(m, gains);
+
+        if any(strcmp(loops_filter,'rate')) && pr.ok && ~isempty(C_rate)
+            L = analyze_loop(pr.tf_pade, C_rate, fmin, fmax);
+            replay_plot(L, fig_dir, m, a, 'rate');
+            rows{end+1} = row(m, a, 'rate', L);
+        end
+        if any(strcmp(loops_filter,'attitude')) && pr.ok && ~isempty(C_rate) && ~isempty(C_att)
+            T_rate  = feedback(series(C_rate, pr.tf_pade), 1);
+            G_outer = T_rate * tf(1, [1 0]);
+            L = analyze_loop(G_outer, C_att, fmin, fmax);
+            replay_plot(L, fig_dir, m, a, 'attitude');
+            rows{end+1} = row(m, a, 'attitude', L);
+        end
+    end
+end
+write_replay_margins(fullfile(out_dir,'margins.txt'), rows, run_dir, spec);
+end
+```
+
+Helpers (same file, kept short):
+
+- **`build_C_from_gains(mode, g)`** — re-implements the 8-line formulas from `build_controller_tf.m` lines 31-40 (mc) and 71-80 (fw):
+  - mc: `C_rate = K*(Kp + Ki/s + Kd*s/(tau_d*s+1))`, `C_att = tf(Kp_att, 1)`
+  - fw: `C_rate = Kp + Ki/s + Kd*s/(tau_d*s+1)`, `C_att = tf(Kp_att, 1)`
+  - `tau_d = 1/(2*pi*dterm_cutoff_Hz)`
+  - Source-of-truth comment points back to `build_controller_tf.m`.
+- **`replay_plot(L, fig_dir, mode, axis, loop)`** — emits 3 figures (bode of L from `L.L_response`/`L.w_grid`, `nichols(L.L); ngrid`, `step(L.T, t_end)`) saved as `{mode}_{axis}_{loop}_{bode,nichols,step}.png` + `.fig`. Style mirrors `make_plots.m` (`new_fig`/`save_fig` patterns duplicated locally — small enough not to refactor).
+- **`write_replay_margins(path, rows, run_dir, spec)`** — writes header (run_dir, timestamp, fmin/fmax, axes/loops filter) then three columns: `Mode Axis Loop  GM_dB  PM_deg  VM`. Echoes the gains used per (mode, axis).
+- **`pick(s, key, default)`** — `jsondecode` returns char arrays sometimes wrapped in cells; normalize to cellstr. Returns `default` if the field is absent.
+
+**Why duplicate controller formula instead of calling `build_controller_tf.m` with a synthesized `containers.Map`?** `build_controller_tf` reads PX4 names (`MC_ROLLRATE_K` etc.) and warns on every missing param. Mapping YAML→PX4 names is fragile and noisy. The formula is 8 lines and stable — a one-line comment in `build_C_from_gains` pointing back to `build_controller_tf.m` keeps the source-of-truth clear.
+
+---
+
+## Change 3: `replay_margins.sh`
+
+```bash
+#!/usr/bin/env bash
+# Replay linear analysis with user-supplied gains against a saved plant.
+# Usage: ./replay_margins.sh /path/to/gains.yaml
+set -euo pipefail
+
+yaml="${1:?usage: replay_margins.sh <gains.yaml>}"
+[[ -r "$yaml" ]] || { echo "not readable: $yaml" >&2; exit 1; }
+
+yaml_abs="$(readlink -f "$yaml")"
+yaml_base="$(basename "$yaml_abs" .yaml)"
+ts="$(date +%Y%m%d_%H%M%S)"
+here="$(cd "$(dirname "$0")" && pwd)"
+
+# Extract run_dir from YAML and convert YAML -> JSON sidecar
+read run_dir json_tmp < <(python3 - "$yaml_abs" <<'PY'
+import sys, yaml, json, tempfile, os
+d = yaml.safe_load(open(sys.argv[1]))
+rd = d.pop('run_dir')
+fd, path = tempfile.mkstemp(suffix='.json'); os.close(fd)
+json.dump(d, open(path,'w'))
+print(rd, path)
+PY
+)
+
+[[ -d "$run_dir" && -r "$run_dir/plants.mat" ]] || \
+    { echo "missing plants.mat in $run_dir" >&2; exit 1; }
+
+outdir="${run_dir}/replay_${yaml_base}_${ts}"
+mkdir -p "$outdir"
+cp "$yaml_abs" "$outdir/gains.yaml"
+log="${outdir}/replay.log"
+
+cd "$here"
+nohup matlab -batch "replay_margins('${json_tmp}','${run_dir}','${outdir}')" > "$log" 2>&1 &
+echo "PID=$!"
+echo "log=$log"
+echo "outdir=$outdir"
+```
+
+Mirrors `run_sysid.sh` (set -euo pipefail, nohup matlab -batch, log file). Python3 + PyYAML are confirmed available (`/usr/bin/python3`, PyYAML 6.0.1).
+
+---
+
+## Change 4: `gains_example.yaml`
+
+```yaml
+# Path to the run_sysid output directory that contains plants.mat
+run_dir: /home/choudhury/tools/dev/sysID_matlab/output/log_4_2026-5-13-15-46-26_20260514_170504
+
+# Optional filters. Default: all axes, both loops.
+axes:  [roll, pitch, yaw]
+loops: [rate, attitude]
+
+# MC gains: K is the outer scaling (see MC_*RATE_K in PX4); Kp_att maps MC_*_P.
+mc:
+  roll:  {K: 1.0, Kp: 1.0, Ki: 0.2, Kd: 0.00163, Kp_att: 1.2, dterm_cutoff_Hz: 30}
+  pitch: {K: 1.0, Kp: 0.8, Ki: 0.6, Kd: 0.0,     Kp_att: 4.8, dterm_cutoff_Hz: 30}
+  yaw:   {K: 0.4, Kp: 1.9, Ki: 0.5, Kd: 0.005,   Kp_att: 0.6, dterm_cutoff_Hz: 30}
+
+# FW gains: no K (rate loop is Kp+Ki/s+Kd*s); Kp_att = 1/FW_*_TC if you use TC.
+fw:
+  roll:  {Kp: 0.08, Ki: 0.10, Kd: 0.0, Kp_att: 2.0, dterm_cutoff_Hz: 30}
+  pitch: {Kp: 0.08, Ki: 0.10, Kd: 0.0, Kp_att: 2.0, dterm_cutoff_Hz: 30}
+  yaw:   {Kp: 0.05, Ki: 0.10, Kd: 0.0, Kp_att: 1.0, dterm_cutoff_Hz: 30}
+```
+
+To analyze just one channel: set `axes: [roll]` and `loops: [rate]`.
+
+---
+
+## Output layout
+
+```
+<run_dir>/
+├── plants.mat                                      ← NEW (from run_sysid)
+└── replay_<yaml_base>_<ts>/                        ← NEW (from replay_margins.sh)
+    ├── gains.yaml                                  copy of input
+    ├── margins.txt                                 GM/PM/VM table
+    ├── replay.log
+    └── figures/{mc,fw}/
+        ├── <axis>_<loop>_bode.png + .fig
+        ├── <axis>_<loop>_nichols.png + .fig
+        └── <axis>_<loop>_step.png + .fig
+```
+
+---
+
+## Reused functions
+
+- `analyze_loop.m` — used as-is for margins (it already computes VM).
+- `build_controller_tf.m` — **not** called directly; its rate/att controller formulas are the source-of-truth replicated in `replay_margins.m::build_C_from_gains` (with a comment pointing back).
+- Plot pattern from `make_plots.m` (Bode/Nichols/Step blocks) — duplicated into `replay_plot` (small, focused; no Nyquist).
+
+---
+
+## Verification
+
+1. **Plants persist.** Run `./run_sysid.sh /path/to/log.ulg` against any ULG. Confirm `output/<run>/plants.mat` exists; `matlab -batch "S=load('output/<run>/plants.mat'); disp(fieldnames(S.plants.mc.roll))"` should list `rate att logged_gains missing`.
+
+2. **Round-trip with logged gains.** Copy `gains_example.yaml` → `roundtrip.yaml`. Set `run_dir` to a real run. Copy the logged gains verbatim from that run's `margins.txt` into the YAML. Run `./replay_margins.sh roundtrip.yaml`. The GM/PM/VM rows in the replay's `margins.txt` should match the original run's `margins.txt` GM/PM/VM columns to FP precision.
+
+3. **Sensitivity check.** Double `mc.roll.Kp` in the YAML; rerun. Expect PM to drop and `wc_Hz` (visible in the bode crossover) to increase.
+
+4. **Channel filter.** Set `axes: [yaw]`, `loops: [rate]`. Rerun. Expect only `figures/mc/yaw_rate_{bode,nichols,step}.png` and exactly one data row in `margins.txt`.
+
+5. **Missing-regime handling.** Use an mc-only run with a YAML that omits `fw:`. Expect no fw plots and no error; replay silently skips fw.
+
+6. **Bad path.** Point `run_dir` at a directory without `plants.mat`. Expect the bash script to error out with `missing plants.mat in <dir>` before launching MATLAB.

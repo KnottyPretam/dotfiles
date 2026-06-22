@@ -1,0 +1,123 @@
+"""SymPy build of the EKF2 covariance Jacobians and the yaw measurement H.
+
+Mirrors how PX4 derives its filter: define the symbolic covariance-prediction
+model f_cov exactly as src/.../ekf_derivation/derivation.py:predict_covariance,
+then take the analytic Jacobians
+
+    A = d f_cov / d x          (24 x 24)   state-transition Jacobian
+    G = d f_cov / d [dvel;dang] (24 x 6)   input Jacobian
+
+and lambdify them to NumPy. The covariance update P = A P A' + G var_u G' + Q_add
+is then done in filter.py. This reproduces the *same analytic math* the SymForce
+C++ code is generated from (the generated header is just a CSE'd expansion).
+
+The yaw-heading measurement Jacobian H uses the FULL quat_to_rot form (as the
+yaw fusions in derivation.py do) -- its functional form, hence its Jacobian,
+differs from the simplified rotation used in the prediction.
+"""
+
+import functools
+
+import numpy as np
+import sympy as sp
+
+# State indices (derivation.py:State)
+QW, QX, QY, QZ = 0, 1, 2, 3
+VX, VY, VZ = 4, 5, 6
+PX, PY, PZ = 7, 8, 9
+DABX, DABY, DABZ = 10, 11, 12     # delta-angle (gyro) bias
+DVBX, DVBY, DVBZ = 13, 14, 15     # delta-velocity (accel) bias
+N_STATES = 24
+
+
+def _quat_mult(p, q):
+    """Hamilton product, matching derivation_utils.quat_mult."""
+    return sp.Matrix([
+        p[0] * q[0] - p[1] * q[1] - p[2] * q[2] - p[3] * q[3],
+        p[0] * q[1] + p[1] * q[0] + p[2] * q[3] - p[3] * q[2],
+        p[0] * q[2] - p[1] * q[3] + p[2] * q[0] + p[3] * q[1],
+        p[0] * q[3] + p[1] * q[2] - p[2] * q[1] + p[3] * q[0],
+    ])
+
+
+def _quat_to_rot_simplified(q):
+    """Unit-quaternion DCM (body->earth), derivation_utils.quat_to_rot_simplified."""
+    q0, q1, q2, q3 = q
+    return sp.Matrix([
+        [1 - 2 * q2**2 - 2 * q3**2, 2 * (q1 * q2 - q0 * q3),     2 * (q1 * q3 + q0 * q2)],
+        [2 * (q1 * q2 + q0 * q3),   1 - 2 * q1**2 - 2 * q3**2,   2 * (q2 * q3 - q0 * q1)],
+        [2 * (q1 * q3 - q0 * q2),   2 * (q2 * q3 + q0 * q1),     1 - 2 * q1**2 - 2 * q2**2],
+    ])
+
+
+def _quat_to_rot_full(q):
+    """Full DCM (no unit constraint), derivation_utils.quat_to_rot -- used for yaw H."""
+    q0, q1, q2, q3 = q
+    return sp.Matrix([
+        [q0**2 + q1**2 - q2**2 - q3**2, 2 * (q1 * q2 - q0 * q3),       2 * (q1 * q3 + q0 * q2)],
+        [2 * (q1 * q2 + q0 * q3),       q0**2 - q1**2 + q2**2 - q3**2, 2 * (q2 * q3 - q0 * q1)],
+        [2 * (q1 * q3 - q0 * q2),       2 * (q2 * q3 + q0 * q1),       q0**2 - q1**2 - q2**2 + q3**2],
+    ])
+
+
+@functools.lru_cache(maxsize=1)
+def _build():
+    """Build & lambdify A, G, H_yaw321, H_yaw312. Cached (slow symbolic step runs once)."""
+    x = sp.symbols(f"x0:{N_STATES}", real=True)
+    dv = sp.symbols("dv0:3", real=True)
+    da = sp.symbols("da0:3", real=True)
+    dt = sp.Symbol("dt", real=True)
+
+    q = [x[QW], x[QX], x[QY], x[QZ]]
+    v = sp.Matrix([x[VX], x[VY], x[VZ]])
+    p = sp.Matrix([x[PX], x[PY], x[PZ]])
+    d_ang_b = [x[DABX], x[DABY], x[DABZ]]
+    d_vel_b = [x[DVBX], x[DVBY], x[DVBZ]]
+
+    d_vel_true = sp.Matrix([dv[i] - d_vel_b[i] for i in range(3)])
+    d_ang_true = [da[i] - d_ang_b[i] for i in range(3)]
+
+    R = _quat_to_rot_simplified(q)
+    # q_new = q (x) [1, 0.5*da_true] ; v_new = v + R*dvel_true (+g*dt, drops out of Jacobians);
+    # p_new = p + v*dt ; biases/mag/wind unchanged.
+    q_new = _quat_mult(q, sp.Matrix([1, 0.5 * d_ang_true[0], 0.5 * d_ang_true[1], 0.5 * d_ang_true[2]]))
+    v_new = v + R * d_vel_true
+    p_new = p + v * dt
+
+    state_new = sp.Matrix.vstack(q_new, v_new, p_new, sp.Matrix(x[10:N_STATES]))
+    xvec = sp.Matrix(x)
+    uvec = sp.Matrix([dv[0], dv[1], dv[2], da[0], da[1], da[2]])
+
+    A = state_new.jacobian(xvec)        # 24 x 24
+    G = state_new.jacobian(uvec)        # 24 x 6
+
+    # Yaw measurement predictions use the FULL rotation form.
+    Rf = _quat_to_rot_full(q)
+    yaw321 = sp.atan2(Rf[1, 0], Rf[0, 0])
+    yaw312 = sp.atan2(-Rf[0, 1], Rf[1, 1])
+    H321 = sp.Matrix([yaw321]).jacobian(xvec)   # 1 x 24
+    H312 = sp.Matrix([yaw312]).jacobian(xvec)
+
+    args = list(x) + list(dv) + list(da) + [dt]
+    A_f = sp.lambdify(args, A, modules="numpy")
+    G_f = sp.lambdify(args, G, modules="numpy")
+    H321_f = sp.lambdify(list(x), H321, modules="numpy")
+    H312_f = sp.lambdify(list(x), H312, modules="numpy")
+    return A_f, G_f, H321_f, H312_f
+
+
+def jacobians(x, d_vel, d_ang, dt):
+    """A (24x24), G (24x6) evaluated at state x, IMU deltas, and step dt."""
+    A_f, G_f, _, _ = _build()
+    args = (*[float(v) for v in x], *[float(v) for v in d_vel],
+            *[float(v) for v in d_ang], float(dt))
+    A = np.asarray(A_f(*args), dtype=np.float64)
+    G = np.asarray(G_f(*args), dtype=np.float64)
+    return A, G
+
+
+def yaw_H(x, use_321):
+    """Yaw-heading measurement Jacobian H (24-vector) at state x."""
+    _, _, H321_f, H312_f = _build()
+    f = H321_f if use_321 else H312_f
+    return np.asarray(f(*[float(v) for v in x]), dtype=np.float64).reshape(-1)

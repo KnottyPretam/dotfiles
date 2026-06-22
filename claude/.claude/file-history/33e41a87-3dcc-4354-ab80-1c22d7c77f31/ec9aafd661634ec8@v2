@@ -1,0 +1,531 @@
+#!/usr/bin/env python3
+"""Recreate PX4's vehicle_angular_velocity from raw sensor_gyro_fifo, and retune the
+gyro/dgyro filters offline.
+
+Pipeline (reproduces src/modules/sensors/vehicle_angular_velocity/VehicleAngularVelocity.cpp):
+
+  raw int16 --scale--> [notch0] [notch1] [gyro Butterworth, IMU_GYRO_CUTOFF] = filtered gyro
+  filtered gyro --d/dt * fs--> [alpha LPF, IMU_DGYRO_CUTOFF]                  = filtered dgyro
+  decimate to the logged publish instants (== "same integration rate", ~GYRO_RATEMAX/.. Hz)
+  body = R @ (gyro - cal_offset) - ekf_bias(t)   ;   d_body = R @ dgyro
+
+Filter math is copied verbatim from PX4:
+  LowPassFilter2p.hpp (2nd-order Butterworth), NotchFilter.hpp (biquad notch),
+  AlphaFilter.hpp (1st-order dgyro LPF). Rotation from rotation.{h,cpp} + Gyroscope.cpp.
+
+Usage:
+  python3 recreate_angular_velocity.py [LOG.ulg] --config filter_tune.yaml [--start S] [--end S] [--outdir DIR]
+
+Outputs (in ./recreate_av_<logstem>_plots/, each .png with a companion .pkl.gz for show_figure.py):
+  recreate_gyro_timeseries.png   recreate_gyro_psd.png
+  recreate_dgyro_timeseries.png  recreate_dgyro_psd.png
+  recreate_match_metrics.txt
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+from pyulog import ULog
+from scipy.signal import lfilter, lfilter_zi
+import matplotlib.pyplot as plt
+
+# Reuse the existing analysis module verbatim (fifo_to_series, direct_fft, save_fig,
+# get_topic, all_instances). T_OFFSET stays 0.0 because we never call its main().
+sys.path.insert(0, "/home/choudhury/tools/dev/imu_vibe")
+import analyze_imu_vibration as aiv  # noqa: E402
+
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+
+# Filter params, seeded with OD1A079's actual on-aircraft values (used if YAML omits them).
+PARAM_KEYS = ["IMU_GYRO_CUTOFF", "IMU_DGYRO_CUTOFF",
+              "IMU_GYRO_NF0_FRQ", "IMU_GYRO_NF0_BW",
+              "IMU_GYRO_NF1_FRQ", "IMU_GYRO_NF1_BW"]
+PARAM_DEFAULTS = {"IMU_GYRO_CUTOFF": 25.0, "IMU_DGYRO_CUTOFF": 30.0,
+                  "IMU_GYRO_NF0_FRQ": 0.0, "IMU_GYRO_NF0_BW": 20.0,
+                  "IMU_GYRO_NF1_FRQ": 0.0, "IMU_GYRO_NF1_BW": 20.0}
+
+# PX4 rot_lookup (src/lib/conversion/rotation.h): (roll, pitch, yaw) degrees, indexed by enum.
+ROT_LOOKUP = [
+    (0, 0, 0), (0, 0, 45), (0, 0, 90), (0, 0, 135), (0, 0, 180), (0, 0, 225), (0, 0, 270), (0, 0, 315),
+    (180, 0, 0), (180, 0, 45), (180, 0, 90), (180, 0, 135), (0, 180, 0), (180, 0, 225), (180, 0, 270),
+    (180, 0, 315), (90, 0, 0), (90, 0, 45), (90, 0, 90), (90, 0, 135), (270, 0, 0), (270, 0, 45),
+    (270, 0, 90), (270, 0, 135), (0, 90, 0), (0, 270, 0), (0, 180, 90), (0, 180, 270), (90, 90, 0),
+    (180, 90, 0), (270, 90, 0), (90, 180, 0), (270, 180, 0), (90, 270, 0), (180, 270, 0), (270, 270, 0),
+    (90, 180, 90), (90, 0, 270), (90, 68, 293), (0, 315, 0), (90, 315, 0), (0, 225, 0), (180, 45, 0),
+    (0, 90, 180),
+]
+
+
+# ---------- PX4 filter coefficients ----------
+def butter2_coeffs(fs, fc):
+    """2nd-order Butterworth (LowPassFilter2p::set_cutoff_frequency). None => passthrough."""
+    if fc <= 0.0 or fc >= fs / 2.0 or not np.isfinite(fc):
+        return None
+    fc = max(fc, fs * 0.001)
+    ohm = np.tan(np.pi / (fs / fc))
+    c = 1.0 + 2.0 * np.cos(np.pi / 4.0) * ohm + ohm * ohm
+    b0 = ohm * ohm / c
+    b = np.array([b0, 2.0 * b0, b0])
+    a = np.array([1.0, 2.0 * (ohm * ohm - 1.0) / c,
+                  (1.0 - 2.0 * np.cos(np.pi / 4.0) * ohm + ohm * ohm) / c])
+    return b, a
+
+
+def notch_coeffs(fs, frq, bw):
+    """Biquad notch (NotchFilter::setParameters). None => disabled (frq<=0)."""
+    if frq <= 0.0:
+        return None
+    alpha = np.tan(np.pi * bw / fs)
+    beta = -np.cos(2.0 * np.pi * frq / fs)
+    a0i = 1.0 / (alpha + 1.0)
+    b = np.array([a0i, 2.0 * beta * a0i, a0i])
+    a = np.array([1.0, 2.0 * beta * a0i, (1.0 - alpha) * a0i])
+    return b, a
+
+
+def alpha_coeff(fs, fc):
+    """1st-order alpha LPF weight (AlphaFilter::setCutoffFreq/setParameters). 1.0 => passthrough."""
+    if fc <= 0.0 or fc >= fs / 2.0 or not np.isfinite(fc):
+        return 1.0
+    dt = 1.0 / fs
+    tau = 1.0 / (2.0 * np.pi * fc)
+    return dt / (tau + dt)
+
+
+def lfilt_ss(b, a, x):
+    """Causal IIR initialised to the steady state at x[0] (mirrors PX4 filter reset())."""
+    zi = lfilter_zi(b, a) * x[0]
+    y, _ = lfilter(b, a, x, zi=zi)
+    return y
+
+
+def filter_gyro_axis(x, fs, p):
+    """Notch0 -> Notch1 -> Butterworth, exactly as FilterAngularVelocity()."""
+    y = x
+    for frq, bw in [(p["IMU_GYRO_NF0_FRQ"], p["IMU_GYRO_NF0_BW"]),
+                    (p["IMU_GYRO_NF1_FRQ"], p["IMU_GYRO_NF1_BW"])]:
+        c = notch_coeffs(fs, frq, bw)
+        if c is not None:
+            y = lfilt_ss(c[0], c[1], y)
+    c = butter2_coeffs(fs, p["IMU_GYRO_CUTOFF"])
+    if c is not None:
+        y = lfilt_ss(c[0], c[1], y)
+    return y
+
+
+def dgyro_axis(filt, fs, fc):
+    """Derivative of the *filtered* gyro, then 1st-order alpha LPF (FilterAngularAcceleration())."""
+    accel_raw = np.diff(filt, prepend=filt[0]) * fs   # prepend => first sample 0, no boot spike
+    a = alpha_coeff(fs, fc)
+    if a >= 1.0:
+        return accel_raw
+    b_c, a_c = np.array([a]), np.array([1.0, -(1.0 - a)])
+    zi = lfilter_zi(b_c, a_c) * accel_raw[0]
+    y, _ = lfilter(b_c, a_c, accel_raw, zi=zi)
+    return y
+
+
+# ---------- rotation / calibration ----------
+def euler_to_dcm(roll, pitch, yaw):
+    """matrix::Dcm(Euler) — phi=roll, theta=pitch, psi=yaw (matrix/Dcm.hpp)."""
+    cp, sp = np.cos(roll), np.sin(roll)
+    ct, st = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [ct * cy, -cp * sy + sp * st * cy, sp * sy + cp * st * cy],
+        [ct * sy, cp * cy + sp * st * sy, -sp * cy + cp * st * sy],
+        [-st, sp * ct, cp * ct],
+    ])
+
+
+def get_rot_matrix(rot_enum):
+    r, p, y = ROT_LOOKUP[int(rot_enum)]
+    return euler_to_dcm(np.radians(r), np.radians(p), np.radians(y))
+
+
+def calibration_rotation(P, cal_rot, board_rot):
+    """_rotation = Dcm(level adjustment) @ get_rot_matrix(rot)  (Gyroscope.cpp:129)."""
+    level = euler_to_dcm(np.radians(P.get("SENS_BOARD_X_OFF", 0.0)),
+                         np.radians(P.get("SENS_BOARD_Y_OFF", 0.0)),
+                         np.radians(P.get("SENS_BOARD_Z_OFF", 0.0)))
+    rot = board_rot if int(cal_rot) < 0 else int(cal_rot)   # ROT=-1 => follow board rotation
+    return level @ get_rot_matrix(rot)
+
+
+def procrustes_rotation(src, dst):
+    """Best-fit rotation R minimising ||dst - R@src|| (orthogonal Procrustes). src,dst: (3,N)."""
+    H = src @ dst.T
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    return Vt.T @ np.diag([1, 1, d]) @ U.T
+
+
+def rotation_angle_deg(Ra, Rb):
+    """Angle (deg) of the relative rotation between two 3x3 rotation matrices."""
+    c = (np.trace(Ra @ Rb.T) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+
+# ---------- log helpers ----------
+def get_gyro_by_device(ulog, device_id):
+    for d in aiv.all_instances(ulog, "sensor_gyro_fifo"):
+        if "device_id" in d.data and int(d.data["device_id"][0]) == int(device_id):
+            return d
+    return None
+
+
+def find_cal_index(P, device_id):
+    for x in range(4):
+        if int(P.get(f"CAL_GYRO{x}_ID", 0)) == int(device_id):
+            return x
+    return None
+
+
+def inflight_window(ulog):
+    """(t0, t1) FMU-boot seconds for the in-air segment via vehicle_land_detected.landed==0."""
+    d = aiv.get_topic(ulog, "vehicle_land_detected")
+    if d is not None and "landed" in d.data:
+        t = d.data["timestamp"] / 1e6
+        air = t[d.data["landed"] == 0]
+        if air.size:
+            return float(air[0]), float(air[-1])
+    return None, None
+
+
+def match_index(t_us, out_ts):
+    """For each output timestamp, index of the nearest per-sample FIFO timestamp."""
+    order = np.argsort(t_us, kind="stable")
+    ts = t_us[order]
+    pos = np.clip(np.searchsorted(ts, out_ts), 1, len(ts) - 1)
+    left, right = ts[pos - 1], ts[pos]
+    take = np.where(np.abs(out_ts - left) <= np.abs(out_ts - right), pos - 1, pos)
+    return order[take]
+
+
+def fifo_gap_intervals(d):
+    """(starts_s, ends_s) of FIFO logging dropouts (inter-batch gap > 1.5*dt).
+    The FC had continuous data here; only the SD log dropped samples, so filtering
+    across these gaps rings — exclude a settle window around them when scoring."""
+    ts_last = d.data["timestamp_sample"].astype(np.int64)
+    dt = d.data["dt"].astype(np.int64)
+    ns = d.data["samples"].astype(np.int32)
+    if len(ts_last) < 2:
+        return np.array([]), np.array([])
+    t_first = ts_last - (ns - 1) * dt
+    gap = t_first[1:] - ts_last[:-1]
+    dtn = dt[1:]
+    over = (dtn > 0) & (gap > 1.5 * dtn)
+    return ts_last[:-1][over] / 1e6, t_first[1:][over] / 1e6
+
+
+def gap_valid_mask(out_t, starts, ends, settle):
+    """True where out_t is NOT inside a FIFO gap (+- settle seconds)."""
+    bad = np.zeros(len(out_t), bool)
+    for s, e in zip(starts, ends):
+        bad |= (out_t >= s - settle) & (out_t <= e + settle)
+    return ~bad
+
+
+def gap_free_zoom(t0, t1, starts, ends, dur=2.0):
+    """Find a dur-second window within [t0, t1] containing no FIFO gap."""
+    for c in np.arange(t0 + 0.2 * (t1 - t0), t1 - dur, 0.5):
+        if not np.any((ends >= c) & (starts <= c + dur)):
+            return float(c), float(c + dur)
+    return float(t0), float(t0 + dur)
+
+
+def bias_at(ulog, device_id, out_ts):
+    """ZOH-interpolate estimator_sensor_bias.gyro_bias (this device) onto output times. (3,Nout)."""
+    d = aiv.get_topic(ulog, "estimator_sensor_bias")
+    if d is None or "gyro_bias[0]" not in d.data:
+        return np.zeros((3, len(out_ts)))
+    gid = d.data.get("gyro_device_id")
+    mask = (gid == int(device_id)) if gid is not None else np.ones(len(d.data["timestamp"]), bool)
+    bt = d.data["timestamp"][mask].astype(np.int64)
+    if bt.size == 0:
+        return np.zeros((3, len(out_ts)))
+    bxyz = np.vstack([d.data[f"gyro_bias[{i}]"][mask] for i in range(3)])
+    order = np.argsort(bt)
+    bt, bxyz = bt[order], bxyz[:, order]
+    pos = np.clip(np.searchsorted(bt, out_ts, side="right") - 1, 0, len(bt) - 1)
+    return bxyz[:, pos]
+
+
+# ---------- metrics ----------
+def axis_metrics(rec, log):
+    resid = rec - log
+    rms_log = np.sqrt(np.mean(log ** 2))
+    rms_ac = np.std(log)
+    nrmse = np.sqrt(np.mean(resid ** 2)) / rms_log if rms_log > 0 else np.nan
+    nrmse_ac = np.std(resid) / rms_ac if rms_ac > 0 else np.nan
+    corr = np.corrcoef(rec, log)[0, 1] if np.std(rec) > 0 and rms_ac > 0 else np.nan
+    return dict(rms_resid=float(np.sqrt(np.mean(resid ** 2))), nrmse=float(nrmse),
+                nrmse_ac=float(nrmse_ac), corr=float(corr), maxabs=float(np.max(np.abs(resid))))
+
+
+# ---------- plots ----------
+AX = ["x", "y", "z"]
+
+
+def plot_timeseries(t, rec, log, metric_mask, zoom, title, ylabel, outpath, gaps=None):
+    """Per-axis overlay of recreated vs logged over a gap-free zoom window.
+    Subplot titles report the gap-excluded match metrics (metric_mask)."""
+    z0, z1 = zoom
+    zm = (t >= z0) & (t <= z1)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    for i, ax in enumerate(axes):
+        ax.plot(t[zm], log[i][zm], color="black", lw=1.4, label="logged")
+        ax.plot(t[zm], rec[i][zm], color="tab:red", lw=1.0, ls="--", label="recreated")
+        if gaps is not None:
+            for s, e in zip(*gaps):
+                if e >= z0 and s <= z1:
+                    ax.axvspan(s, e, color="orange", alpha=0.25)
+        m = axis_metrics(rec[i][metric_mask], log[i][metric_mask])
+        ax.set_ylabel(f"{AX[i]}  [{ylabel}]")
+        ax.set_title(f"{AX[i]}:  NRMSE_ac={m['nrmse_ac']*100:.2f}%  corr={m['corr']:.5f}  "
+                     f"maxerr(valid)={m['maxabs']:.2e}", fontsize=9)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("time [s, FMU boot]")
+    fig.suptitle(title + "  (gap-free zoom; orange = FIFO dropouts)")
+    fig.tight_layout()
+    aiv.save_fig(fig, outpath)
+
+
+def _psd_line(ax, sig, t, fs, fmax, **kw):
+    f, _, p = aiv.direct_fft(sig, fs, t=t)
+    m = (f >= 1.0) & (f <= fmax)
+    ax.semilogy(f[m], p[m], **kw)
+
+
+def plot_psd(raw, filt, cand, t_f, fs_f, log, t_o, fs_o,
+             title, ylabel, outpath, marks=(), fmax=500.0):
+    """Per-axis PSD overlay. raw/filt/cand share (t_f, fs_f); log uses (t_o, fs_o).
+    All signal arrays are (3, N) and already sliced to the PSD window."""
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    for i, ax in enumerate(axes):
+        if raw is not None:
+            _psd_line(ax, raw[i], t_f, fs_f, fmax, color="0.7", lw=0.8, label="raw FIFO (unfiltered)")
+        _psd_line(ax, filt[i], t_f, fs_f, fmax, color="tab:blue", lw=1.1, label="recreated (baseline)")
+        _psd_line(ax, log[i], t_o, fs_o, fmax, color="black", lw=1.0, ls="--", label="logged")
+        if cand is not None:
+            _psd_line(ax, cand[i], t_f, fs_f, fmax, color="tab:red", lw=1.0, label="recreated (candidate)")
+        for mf, lbl in marks:
+            if mf <= fmax:
+                ax.axvline(mf, color="tab:green", ls=":", lw=0.8)
+                ax.text(mf, ax.get_ylim()[1], f" {lbl}", fontsize=7, color="tab:green",
+                        va="top", rotation=90)
+        ax.set_xlim(1, fmax)
+        ax.set_xscale("log")
+        ax.set_ylabel(f"{AX[i]}  [{ylabel}]")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("frequency [Hz]")
+    fig.suptitle(title)
+    fig.tight_layout()
+    aiv.save_fig(fig, outpath)
+
+
+# ---------- main ----------
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("ulog", nargs="?", default=None, help="Path to .ulg (overrides YAML 'log').")
+    p.add_argument("--config", default=None, help="YAML filter config (e.g. filter_tune.yaml).")
+    p.add_argument("--start", type=float, default=None, help="In-air window start (s, FMU boot).")
+    p.add_argument("--end", type=float, default=None, help="In-air window end (s, FMU boot).")
+    p.add_argument("--outdir", default=None, help="Output dir (default ./recreate_av_<stem>_plots).")
+    return p.parse_args()
+
+
+def load_cfg(path):
+    if not _HAS_YAML:
+        sys.exit("--config requires PyYAML: pip install pyyaml")
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_params(cfg):
+    p = dict(PARAM_DEFAULTS)
+    for k in PARAM_KEYS:
+        if k in cfg:
+            p[k] = float(cfg[k])
+    return p
+
+
+def main():
+    args = parse_args()
+    cfg = load_cfg(args.config) if args.config else {}
+
+    logpath = Path(args.ulog or cfg.get("log") or "")
+    if not logpath.exists():
+        sys.exit(f"ERROR: log not found: {logpath}")
+
+    params = resolve_params(cfg)
+    cand_cfg = cfg.get("candidate")
+    cand_params = resolve_params(cand_cfg) if cand_cfg else None
+
+    outdir = Path(args.outdir) if args.outdir else Path.cwd() / f"recreate_av_{logpath.stem}_plots"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading {logpath} ...")
+    topics = ["sensor_gyro_fifo", "sensor_selection", "vehicle_angular_velocity",
+              "vehicle_land_detected", "vehicle_imu_status", "estimator_sensor_bias"]
+    ulog = ULog(str(logpath), message_name_filter_list=topics)
+    P = ulog.initial_parameters
+
+    # --- select the gyro the controller actually used ---
+    dev = cfg.get("gyro_device_id")
+    if dev is None:
+        sel = aiv.get_topic(ulog, "sensor_selection")
+        if sel is None or "gyro_device_id" not in sel.data:
+            sys.exit("ERROR: no sensor_selection.gyro_device_id and no gyro_device_id override.")
+        dev = int(sel.data["gyro_device_id"][-1])
+    fifo = get_gyro_by_device(ulog, dev)
+    if fifo is None:
+        sys.exit(f"ERROR: no sensor_gyro_fifo with device_id={dev}")
+
+    fs = 1e6 / float(np.median(fifo.data["dt"]))
+    print(f"Selected gyro device_id={dev}  (sensor_gyro_fifo multi_id={fifo.multi_id})  "
+          f"FIFO rate={fs:.1f} Hz")
+
+    # --- report YAML vs log's actual params ---
+    print("\nFilter params (YAML -> filtering with; log = on-aircraft value):")
+    for k in PARAM_KEYS:
+        log_v = P.get(k, "n/a")
+        print(f"  {k:18s} = {params[k]:8.3f}   (log: {log_v})")
+
+    # --- expand FIFO to a per-sample series & filter the whole flight ---
+    t_s, gx, gy, gz = aiv.fifo_to_series(fifo)     # seconds (T_OFFSET=0), rad/s, scale applied
+    g = np.vstack([gx, gy, gz])
+    filt = np.vstack([filter_gyro_axis(g[i], fs, params) for i in range(3)])
+    accel = np.vstack([dgyro_axis(filt[i], fs, params["IMU_DGYRO_CUTOFF"]) for i in range(3)])
+    if cand_params is not None:
+        cfilt = np.vstack([filter_gyro_axis(g[i], fs, cand_params) for i in range(3)])
+
+    # --- logged signal & decimation to the controller publish instants ---
+    vav = aiv.get_topic(ulog, "vehicle_angular_velocity")
+    out_ts = vav.data["timestamp_sample"].astype(np.int64)
+    log_xyz = np.vstack([vav.data[f"xyz[{i}]"] for i in range(3)])
+    log_dxyz = np.vstack([vav.data[f"xyz_derivative[{i}]"] for i in range(3)])
+
+    t_us = np.rint(t_s * 1e6).astype(np.int64)
+    idx = match_index(t_us, out_ts)
+    match_err = np.abs(t_us[idx] - out_ts)
+    print(f"\nDecimation: {len(out_ts)} logged outputs, mean output rate "
+          f"{1e6/np.median(np.diff(out_ts)):.1f} Hz; "
+          f"timestamp match err max={match_err.max()} us, median={np.median(match_err):.0f} us")
+    filt_dec, accel_dec = filt[:, idx], accel[:, idx]
+
+    # --- full calibration -> body frame ---
+    cal_idx = find_cal_index(P, dev)
+    if cal_idx is not None:
+        offset = np.array([P[f"CAL_GYRO{cal_idx}_XOFF"], P[f"CAL_GYRO{cal_idx}_YOFF"],
+                           P[f"CAL_GYRO{cal_idx}_ZOFF"]])
+        cal_rot = P.get(f"CAL_GYRO{cal_idx}_ROT", -1)
+    else:
+        print(f"WARN: no CAL_GYROx_ID == {dev}; using zero offset, board rotation.")
+        offset, cal_rot = np.zeros(3), -1
+    board_rot = P.get("SENS_BOARD_ROT", 0)
+    R = calibration_rotation(P, cal_rot, board_rot)
+    bias = bias_at(ulog, dev, out_ts)
+
+    rec_xyz = R @ (filt_dec - offset[:, None]) - bias
+    rec_dxyz = R @ accel_dec
+
+    # --- validate rotation convention against a best-fit (Procrustes) ---
+    out_t = out_ts / 1e6
+    t0, t1 = (args.start, args.end)
+    if t0 is None or t1 is None:
+        w0, w1 = inflight_window(ulog)
+        t0 = t0 if t0 is not None else (w0 if w0 is not None else out_t[0])
+        t1 = t1 if t1 is not None else (w1 if w1 is not None else out_t[-1])
+    mask_out = (out_t >= t0) & (out_t <= t1)
+
+    # FIFO logging dropouts: the FC had continuous data, only the SD log dropped FIFO
+    # samples, so filtering across a gap rings. Score on continuous-data samples only.
+    gstart, gend = fifo_gap_intervals(fifo)
+    EXCL_S = 0.10
+    valid = mask_out & gap_valid_mask(out_t, gstart, gend, EXCL_S)
+    n_gaps_air = int(np.sum((gend >= t0) & (gstart <= t1)))
+    kept = valid.sum() / max(mask_out.sum(), 1) * 100.0
+    print(f"\nFIFO dropouts in-air: {n_gaps_air}; scoring on continuous-data samples only "
+          f"(excl. ±{EXCL_S}s around each gap → {kept:.1f}% of in-air samples).")
+
+    R_fit = procrustes_rotation((filt_dec - offset[:, None])[:, valid], (log_xyz + bias)[:, valid])
+    R_err = rotation_angle_deg(R, R_fit)
+    print(f"Rotation: SENS_BOARD_ROT={int(board_rot)}, CAL_GYRO{cal_idx}_ROT={int(cal_rot)};  "
+          f"analytic-vs-Procrustes-fit angle = {R_err:.2f} deg")
+
+    print(f"\nIn-air window {t0:.1f}-{t1:.1f}s — match (all-in-air incl. dropouts in parens):\n")
+    lines = [f"log: {logpath.name}",
+             f"gyro device_id={dev} (fifo multi_id={fifo.multi_id}), FIFO rate={fs:.1f} Hz",
+             f"output rate={1e6/np.median(np.diff(out_ts)):.1f} Hz, n_out={len(out_ts)}, "
+             f"ts match max={match_err.max()} us",
+             f"params: " + ", ".join(f"{k}={params[k]}" for k in PARAM_KEYS),
+             f"rotation SENS_BOARD_ROT={int(board_rot)} CAL_GYRO{cal_idx}_ROT={int(cal_rot)} "
+             f"offset={offset}, analytic-vs-fit={R_err:.2f}deg",
+             f"in-air {t0:.1f}-{t1:.1f}s; FIFO dropouts={n_gaps_air}; "
+             f"scored on {kept:.1f}% of samples (excl. ±{EXCL_S}s around gaps)", ""]
+    for name, rec, log in [("gyro xyz [rad/s]", rec_xyz, log_xyz),
+                           ("dgyro xyz_derivative [rad/s^2]", rec_dxyz, log_dxyz)]:
+        lines.append(name)
+        for i in range(3):
+            m = axis_metrics(rec[i][valid], log[i][valid])
+            ma = axis_metrics(rec[i][mask_out], log[i][mask_out])
+            line = (f"  {AX[i]}: NRMSE_ac={m['nrmse_ac']*100:6.3f}%  corr={m['corr']:.6f}  "
+                    f"rms_resid={m['rms_resid']:.3e}  maxerr={m['maxabs']:.2e}"
+                    f"   (all-in-air NRMSE_ac={ma['nrmse_ac']*100:.2f}%)")
+            lines.append(line)
+            print(line)
+        lines.append("")
+    (outdir / "recreate_match_metrics.txt").write_text("\n".join(lines))
+
+    # --- plots ---
+    zoom = gap_free_zoom(t0, t1, gstart, gend)
+    plot_timeseries(out_t, rec_xyz, log_xyz, valid, zoom,
+                    f"{logpath.stem}: gyro vehicle_angular_velocity.xyz — recreated vs logged",
+                    "rad/s", outdir / "recreate_gyro_timeseries.png", gaps=(gstart, gend))
+    plot_timeseries(out_t, rec_dxyz, log_dxyz, valid, zoom,
+                    f"{logpath.stem}: dgyro xyz_derivative — recreated vs logged",
+                    "rad/s²", outdir / "recreate_dgyro_timeseries.png", gaps=(gstart, gend))
+
+    # PSD over a bounded in-air sub-window (<=60s) to keep the flat-top FFT light.
+    PSD_MAX_S = 60.0
+    p1 = min(t0 + PSD_MAX_S, t1)
+    mf = (t_s >= t0) & (t_s <= p1)
+    mo = (out_t >= t0) & (out_t <= p1)
+    tf, to = t_s[mf], out_t[mo]
+    fs_o = 1e6 / float(np.median(np.diff(out_ts)))
+
+    raw_body = R @ (g[:, mf] - offset[:, None])
+    filt_body = R @ (filt[:, mf] - offset[:, None])
+    cand_body = (R @ (cfilt[:, mf] - offset[:, None])) if cand_params is not None else None
+    marks = [(params["IMU_GYRO_CUTOFF"], f"CUTOFF {params['IMU_GYRO_CUTOFF']:.0f}"), (99.4, "~99.4")]
+    plot_psd(raw_body, filt_body, cand_body, tf, fs, log_xyz[:, mo], to, fs_o,
+             f"{logpath.stem}: gyro PSD — raw vs recreated vs logged", "(rad/s)²/Hz",
+             outdir / "recreate_gyro_psd.png", marks=marks)
+
+    # dgyro PSD: recreated vs logged (both at the decimated output rate)
+    accel_dbody = R @ accel[:, mf]
+    cand_dbody = None
+    if cand_params is not None:
+        caccel = np.vstack([dgyro_axis(cfilt[i], fs, cand_params["IMU_DGYRO_CUTOFF"]) for i in range(3)])
+        cand_dbody = R @ caccel[:, mf]
+    plot_psd(None, accel_dbody, cand_dbody, tf, fs, log_dxyz[:, mo], to, fs_o,
+             f"{logpath.stem}: dgyro PSD — recreated vs logged", "(rad/s²)²/Hz",
+             outdir / "recreate_dgyro_psd.png", marks=[(99.4, "~99.4")])
+
+    print(f"\nWrote plots + metrics to {outdir}/")
+    print(f"Reopen interactively: python3 /home/choudhury/tools/dev/imu_vibe/show_figure.py "
+          f"{outdir}/recreate_gyro_psd.pkl.gz")
+
+
+if __name__ == "__main__":
+    main()

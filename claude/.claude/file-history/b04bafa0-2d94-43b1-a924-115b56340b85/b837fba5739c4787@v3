@@ -1,0 +1,719 @@
+#!/usr/bin/env python3
+"""
+Real-time PX4 plotter over MAVLink.
+
+Up to four separate 3x1 figures. By default only the figures whose source
+messages are actually being received are shown; use --show-all to force all:
+  Position NED:    EKF (LOCAL_POSITION_NED) + GPS-derived NED +
+                   3sigma bounds (LOCAL_POSITION_NED_COV) +
+                   setpoint (POSITION_TARGET_LOCAL_NED).
+  Velocity NED:    EKF + GPS-derived + 3sigma + setpoint.
+  Attitude (deg):  roll/pitch/yaw, actual (ATTITUDE) + setpoint
+                   (ATTITUDE_TARGET quaternion).
+  Attitude rate:   roll/pitch/yaw rates (deg/s), actual + setpoint.
+
+Trigger modes (--trigger) decide when plots refresh and save:
+  arm    refresh while armed; save figures on the arm->disarm edge (default).
+  start  refresh from connect until the link drops or Ctrl-C; mirrors PX4
+         logging from boot to disconnect (SDLOG_MODE >= 1).
+  auto   read SDLOG_MODE from the vehicle and pick arm vs start to match.
+
+Plots update in place and stay interactive: zoom/pan persists across refreshes
+(press 'a' in a window to resume auto-follow after zooming), and clicking data
+points drops value labels (press 'd' to clear a window's labels).
+
+Connects by default to the mavlink-router 'plotter' UDP endpoint
+(udpin:127.0.0.1:14551). On each save trigger it writes one PNG and one pickled
+figure (.pkl) per plot to the working directory, overwriting the previous pair
+(fixed filenames, not one-per-update). Reopen a .pkl with
+pickle.load(open(path, 'rb')) then plt.show().
+
+Usage:
+    python3 px4_realtime_plot.py
+    python3 px4_realtime_plot.py --trigger auto
+    python3 px4_realtime_plot.py --device /dev/ttyUSB0 --baud 57600 --show-all
+
+Dependencies:
+    pip install pymavlink matplotlib numpy mplcursors
+    # plus a working matplotlib backend, e.g. on Ubuntu:
+    sudo apt install python3-tk
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import pickle
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import matplotlib.pyplot as plt
+import mplcursors
+import numpy as np
+from pymavlink import mavutil
+
+# --------------------------------------------------------------------------- #
+# Constants                                                                   #
+# --------------------------------------------------------------------------- #
+EARTH_RADIUS_M = 6_378_137.0          # WGS84 equatorial radius
+BUFFER_SECONDS = 300                  # rolling window length on the plots
+REFRESH_HZ     = 1.0                  # plot redraw rate
+
+DISCOVERY_SECONDS  = 3.0              # only-active: listen this long before picking figures
+HEARTBEAT_TIMEOUT  = 5.0             # 'start'/'auto': link considered down after this gap
+PARAM_READ_TIMEOUT = 3.0             # 'auto': budget for the SDLOG_MODE read
+
+# Diagonal indices of the 45-element upper-triangular packing of the 9x9
+# state covariance in LOCAL_POSITION_NED_COV. Order: x, y, z, vx, vy, vz.
+COV_DIAG_IDX = {"x": 0, "y": 9, "z": 17, "vx": 24, "vy": 30, "vz": 35}
+
+# POSITION_TARGET_LOCAL_NED.type_mask bits (1 = "ignore this field")
+SP_IGNORE = {"x": 1 << 0, "y": 1 << 1, "z": 1 << 2,
+             "vx": 1 << 3, "vy": 1 << 4, "vz": 1 << 5}
+
+# ATTITUDE_TARGET.type_mask bits (1 = "ignore this field"). Note the attitude
+# (quaternion) ignore bit is 128 -- 64 is THROTTLE_IGNORE, which PX4 sets routinely.
+ATT_SP_IGNORE = {
+    "roll_rate":  mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_ROLL_RATE_IGNORE,   # 1
+    "pitch_rate": mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_PITCH_RATE_IGNORE,  # 2
+    "yaw_rate":   mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_YAW_RATE_IGNORE,    # 4
+    "att":        mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE,         # 128
+}
+
+# Figures, in display order. Only those with live data are shown unless --show-all.
+FIGURE_ORDER = ("position", "velocity", "attitude", "attitude_rate")
+
+
+# --------------------------------------------------------------------------- #
+# Geodesy: flat-Earth LLA -> NED (good to ~cm over a few km)                  #
+# --------------------------------------------------------------------------- #
+def lla_to_ned(lat, lon, alt, lat0, lon0, alt0):
+    dlat = math.radians(lat - lat0)
+    dlon = math.radians(lon - lon0)
+    n = dlat * EARTH_RADIUS_M
+    e = dlon * EARTH_RADIUS_M * math.cos(math.radians(lat0))
+    d = -(alt - alt0)
+    return n, e, d
+
+
+# --------------------------------------------------------------------------- #
+# Small helpers: "verify the variable exists, else ignore it"                 #
+# --------------------------------------------------------------------------- #
+def gf(msg, name, default=float("nan")):
+    """Safe field read: msg.<name> if present, else default. Missing -> ignored."""
+    return getattr(msg, name, default)
+
+
+def quat_to_euler(q):
+    """Quaternion (w, x, y, z) -> (roll, pitch, yaw) in radians.
+
+    Returns NaNs if the quaternion is missing, too short, or non-finite.
+    """
+    if q is None or len(q) < 4:
+        return float("nan"), float("nan"), float("nan")
+    w, x, y, z = (float(v) for v in q[:4])
+    if not all(math.isfinite(v) for v in (w, x, y, z)):
+        return float("nan"), float("nan"), float("nan")
+    roll  = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
+    pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))  # clamp asin domain
+    yaw   = math.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    return roll, pitch, yaw
+
+
+# --------------------------------------------------------------------------- #
+# Thread-safe rolling buffers                                                 #
+# --------------------------------------------------------------------------- #
+class Telemetry:
+    def __init__(self, window_s: float = BUFFER_SECONDS):
+        self.lock = threading.Lock()
+        n = int(window_s * 25)  # generous upper bound on samples per series
+
+        # EKF local position / velocity
+        self.t_local = deque(maxlen=n)
+        self.local = {k: deque(maxlen=n) for k in ("x", "y", "z", "vx", "vy", "vz")}
+
+        # 1-sigma per axis (sqrt of the diagonal of the EKF covariance)
+        self.t_cov = deque(maxlen=n)
+        self.sigma = {k: deque(maxlen=n) for k in COV_DIAG_IDX}
+
+        # GPS-derived NED position + velocity (from GPS_RAW_INT)
+        self.t_gps = deque(maxlen=n)
+        self.gps_pn = deque(maxlen=n); self.gps_pe = deque(maxlen=n); self.gps_pd = deque(maxlen=n)
+        self.gps_vn = deque(maxlen=n); self.gps_ve = deque(maxlen=n); self.gps_vd = deque(maxlen=n)
+
+        # Setpoints
+        self.t_sp = deque(maxlen=n)
+        self.sp_pn = deque(maxlen=n); self.sp_pe = deque(maxlen=n); self.sp_pd = deque(maxlen=n)
+        self.sp_vn = deque(maxlen=n); self.sp_ve = deque(maxlen=n); self.sp_vd = deque(maxlen=n)
+
+        # Attitude actual (ATTITUDE) -- radians; converted to deg only at draw time
+        self.t_att = deque(maxlen=n)
+        self.att     = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}
+        self.attrate = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}
+
+        # Attitude setpoint (ATTITUDE_TARGET) -- radians
+        self.t_attsp = deque(maxlen=n)
+        self.attsp     = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}
+        self.attratesp = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}
+
+        self.origin: tuple[float, float, float] | None = None  # (lat0, lon0, alt0)
+        self.armed = False
+        self.t0: float | None = None  # epoch of first sample, used as plot time origin
+        self.last_heartbeat: float | None = None  # for 'start'/'auto' link-drop detection
+        self.seen: dict[str, int] = {}  # mtype -> count received (drives --only-active)
+
+
+# --------------------------------------------------------------------------- #
+# MAVLink ingest thread                                                       #
+# --------------------------------------------------------------------------- #
+def mavlink_reader(conn, tel: Telemetry, stop_evt: threading.Event):
+    while not stop_evt.is_set():
+        msg = conn.recv_match(blocking=True, timeout=1.0)
+        if msg is None:
+            continue
+
+        t = time.time()
+        mtype = msg.get_type()
+
+        with tel.lock:
+            tel.seen[mtype] = tel.seen.get(mtype, 0) + 1
+
+            if tel.t0 is None and mtype in (
+                "LOCAL_POSITION_NED", "GPS_RAW_INT", "POSITION_TARGET_LOCAL_NED",
+                "ATTITUDE", "ATTITUDE_TARGET",
+            ):
+                tel.t0 = t
+
+            if mtype == "HEARTBEAT":
+                tel.last_heartbeat = t
+                tel.armed = bool(
+                    int(gf(msg, "base_mode", 0)) & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED
+                )
+
+            elif mtype == "LOCAL_POSITION_NED":
+                tel.t_local.append(t)
+                for k in ("x", "y", "z", "vx", "vy", "vz"):
+                    tel.local[k].append(gf(msg, k))
+
+            elif mtype == "LOCAL_POSITION_NED_COV":
+                cov = gf(msg, "covariance", None)
+                tel.t_cov.append(t)
+                for k, idx in COV_DIAG_IDX.items():
+                    if cov is not None and len(cov) > idx and math.isfinite(cov[idx]):
+                        tel.sigma[k].append(math.sqrt(max(float(cov[idx]), 0.0)))
+                    else:
+                        tel.sigma[k].append(float("nan"))
+
+            elif mtype == "HOME_POSITION":
+                # Prefer HOME_POSITION over first GPS as the NED origin
+                la, lo, al = gf(msg, "latitude"), gf(msg, "longitude"), gf(msg, "altitude")
+                if all(math.isfinite(v) for v in (la, lo, al)):
+                    tel.origin = (la * 1e-7, lo * 1e-7, al * 1e-3)
+
+            elif mtype == "GPS_RAW_INT":
+                if int(gf(msg, "fix_type", 0)) < 3:
+                    continue  # need a 3D fix before we trust anything
+                lat = gf(msg, "lat") * 1e-7
+                lon = gf(msg, "lon") * 1e-7
+                alt = gf(msg, "alt") * 1e-3
+                if not (math.isfinite(lat) and math.isfinite(lon)):
+                    continue  # no usable position in this message -> ignore it
+                if tel.origin is None:
+                    tel.origin = (lat, lon, alt)
+                lat0, lon0, alt0 = tel.origin
+
+                n, e, d = lla_to_ned(lat, lon, alt, lat0, lon0, alt0)
+                tel.t_gps.append(t)
+                tel.gps_pn.append(n); tel.gps_pe.append(e); tel.gps_pd.append(d)
+
+                # GPS_RAW_INT carries ground speed + course only; derive horizontal
+                # NED velocity from those. vD is not provided -> NaN.
+                v_ground = gf(msg, "vel") * 1e-2                # cm/s -> m/s
+                cog_rad  = math.radians(gf(msg, "cog") * 1e-2)  # cdeg -> rad
+                tel.gps_vn.append(v_ground * math.cos(cog_rad))
+                tel.gps_ve.append(v_ground * math.sin(cog_rad))
+                tel.gps_vd.append(float("nan"))
+
+            elif mtype == "POSITION_TARGET_LOCAL_NED":
+                bm = int(gf(msg, "type_mask", 0))
+                def keep(field, val):
+                    return val if not (bm & SP_IGNORE[field]) else float("nan")
+                tel.t_sp.append(t)
+                tel.sp_pn.append(keep("x",  gf(msg, "x")))
+                tel.sp_pe.append(keep("y",  gf(msg, "y")))
+                tel.sp_pd.append(keep("z",  gf(msg, "z")))
+                tel.sp_vn.append(keep("vx", gf(msg, "vx")))
+                tel.sp_ve.append(keep("vy", gf(msg, "vy")))
+                tel.sp_vd.append(keep("vz", gf(msg, "vz")))
+
+            elif mtype == "ATTITUDE":
+                tel.t_att.append(t)
+                tel.att["roll"].append(gf(msg, "roll"))
+                tel.att["pitch"].append(gf(msg, "pitch"))
+                tel.att["yaw"].append(gf(msg, "yaw"))
+                tel.attrate["roll"].append(gf(msg, "rollspeed"))
+                tel.attrate["pitch"].append(gf(msg, "pitchspeed"))
+                tel.attrate["yaw"].append(gf(msg, "yawspeed"))
+
+            elif mtype == "ATTITUDE_TARGET":
+                bm = int(gf(msg, "type_mask", 0))
+                tel.t_attsp.append(t)
+                if bm & ATT_SP_IGNORE["att"]:        # 128 -> attitude (quaternion) ignored
+                    r = p = y = float("nan")
+                else:
+                    r, p, y = quat_to_euler(gf(msg, "q", None))
+                tel.attsp["roll"].append(r)
+                tel.attsp["pitch"].append(p)
+                tel.attsp["yaw"].append(y)
+
+                def keep_rate(field, val):
+                    return float("nan") if (bm & ATT_SP_IGNORE[field]) else val
+                tel.attratesp["roll"].append(keep_rate("roll_rate",   gf(msg, "body_roll_rate")))
+                tel.attratesp["pitch"].append(keep_rate("pitch_rate", gf(msg, "body_pitch_rate")))
+                tel.attratesp["yaw"].append(keep_rate("yaw_rate",     gf(msg, "body_yaw_rate")))
+
+
+# --------------------------------------------------------------------------- #
+# Stream-rate setup                                                           #
+# --------------------------------------------------------------------------- #
+def set_stream_rates(conn, rates_hz: dict[int, float]):
+    """Use MAV_CMD_SET_MESSAGE_INTERVAL to request specific message rates."""
+    for msg_id, hz in rates_hz.items():
+        interval_us = int(1e6 / hz) if hz > 0 else -1
+        conn.mav.command_long_send(
+            conn.target_system, conn.target_component,
+            mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL,
+            0,
+            msg_id, interval_us, 0, 0, 0, 0, 0,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# Trigger resolution: arm / start / auto                                      #
+# --------------------------------------------------------------------------- #
+def read_sdlog_mode(conn, timeout: float = PARAM_READ_TIMEOUT):
+    """Read the vehicle's SDLOG_MODE parameter (observe-only; never writes).
+
+    Returns the int value, or None on timeout. Call this from the main thread
+    BEFORE the reader thread starts so the two don't race for PARAM_VALUE.
+    """
+    conn.mav.param_request_read_send(
+        conn.target_system, conn.target_component, b"SDLOG_MODE", -1
+    )
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        m = conn.recv_match(type="PARAM_VALUE", blocking=True,
+                            timeout=max(0.1, deadline - time.time()))
+        if m is None:
+            continue
+        pid = m.param_id
+        if isinstance(pid, bytes):
+            pid = pid.decode("ascii", "ignore")
+        if pid.rstrip("\x00").strip() == "SDLOG_MODE":
+            return int(round(float(m.param_value)))
+    return None
+
+
+def resolve_trigger(trigger: str, conn) -> str:
+    """Map the --trigger choice to an effective behavior in {'arm', 'start'}.
+
+    PX4 SDLOG_MODE: 0 = log while armed; 1/2/4 = log from boot/start; -1 = off.
+    """
+    if trigger in ("arm", "start"):
+        return trigger
+    val = read_sdlog_mode(conn)
+    if val is None:
+        print("[auto] SDLOG_MODE read timed out -> using 'arm'.")
+        return "arm"
+    if val == 0:
+        print("[auto] SDLOG_MODE=0 (log while armed) -> behaving as 'arm'.")
+        return "arm"
+    if val in (1, 2, 4):
+        print(f"[auto] SDLOG_MODE={val} (log from boot/start) -> behaving as 'start'.")
+        return "start"
+    if val == -1:
+        print("[auto] SDLOG_MODE=-1 (logging disabled) -> behaving as 'start'.")
+        return "start"
+    print(f"[auto] SDLOG_MODE={val} (unrecognized) -> behaving as 'start'.")
+    return "start"
+
+
+# --------------------------------------------------------------------------- #
+# Plotting                                                                    #
+# --------------------------------------------------------------------------- #
+# Title + per-axis y-labels for each figure key.
+FIGURE_SPECS = {
+    "position":      ("Position NED  (EKF, GPS, setpoint, $\\pm 3\\sigma$)",
+                      ("N (m)", "E (m)", "D (m)")),
+    "velocity":      ("Velocity NED  (EKF, GPS, setpoint, $\\pm 3\\sigma$)",
+                      ("$v_N$ (m/s)", "$v_E$ (m/s)", "$v_D$ (m/s)")),
+    "attitude":      ("Attitude (deg)  (actual, setpoint)",
+                      ("roll (deg)", "pitch (deg)", "yaw (deg)")),
+    "attitude_rate": ("Attitude rate (deg/s)  (actual, setpoint)",
+                      ("roll rate (deg/s)", "pitch rate (deg/s)", "yaw rate (deg/s)")),
+}
+
+
+def _label_axes(ax, ylabels):
+    for a, lbl in zip(ax, ylabels):
+        a.set_ylabel(lbl); a.grid(True, alpha=0.3)
+    ax[-1].set_xlabel("Time (s)")
+
+
+def _build_ned_artists(ax3):
+    """Persistent empty Line2D handles for a position/velocity figure (one dict per row)."""
+    artists = []
+    for ax in ax3:
+        ekf,    = ax.plot([], [], "C0-", lw=1.3, label="EKF")
+        sig_hi, = ax.plot([], [], "C0:", lw=0.9, alpha=0.7, label=r"$\pm 3\sigma$")
+        sig_lo, = ax.plot([], [], "C0:", lw=0.9, alpha=0.7)
+        gps,    = ax.plot([], [], "C1.", ms=3, label="GPS")
+        sp,     = ax.plot([], [], "C3--", lw=1.1, label="setpoint")
+        artists.append({"ekf": ekf, "sig_hi": sig_hi, "sig_lo": sig_lo, "gps": gps, "sp": sp})
+    return artists
+
+
+def _build_att_artists(ax3):
+    """Persistent empty Line2D handles for an attitude/attitude-rate figure (one dict per row)."""
+    artists = []
+    for ax in ax3:
+        act, = ax.plot([], [], "C0-", lw=1.3, label="actual")
+        sp,  = ax.plot([], [], "C3--", lw=1.1, label="setpoint")
+        artists.append({"act": act, "sp": sp})
+    return artists
+
+
+def _make_key_handler(cursor, ax3):
+    """Per-figure key handler: 'd' clears all click labels, 'a' resumes auto-follow."""
+    def _on_key(event):
+        if event.key == "d":
+            for sel in list(cursor.selections):
+                cursor.remove_selection(sel)
+        elif event.key == "a":
+            for ax in ax3:
+                ax.autoscale(enable=True)
+            ax3[0].figure.canvas.draw_idle()
+    return _on_key
+
+
+def make_figures(keys):
+    """Create one 3x1 figure per key; returns ordered {key: (fig, axes, artists, cursor)}.
+
+    Figures, line artists, the legend and the click cursor are all built once here;
+    the refresh loop only pushes new data into the artists with set_data and never
+    clears the axes, so zoom/pan and clicked labels survive across refreshes.
+    """
+    figs = {}
+    for key in keys:
+        title, ylabels = FIGURE_SPECS[key]
+        fig, ax = plt.subplots(3, 1, sharex=True, figsize=(11, 8))
+        fig.suptitle(title)
+        _label_axes(ax, ylabels)
+
+        if key in ("position", "velocity"):
+            artists = _build_ned_artists(ax)
+            clickable = [a[k] for a in artists for k in ("ekf", "gps", "sp")]
+            ncol = 4
+        else:
+            artists = _build_att_artists(ax)
+            clickable = [a[k] for a in artists for k in ("act", "sp")]
+            ncol = 2
+        ax[0].legend(loc="upper right", fontsize=8, ncol=ncol)
+        fig.tight_layout()
+
+        # Click a point to drop a value label; multiple=True lets them accumulate.
+        cursor = mplcursors.cursor(clickable, multiple=True)
+        fig.canvas.mpl_connect("key_press_event", _make_key_handler(cursor, ax))
+
+        figs[key] = (fig, ax, artists, cursor)
+    return figs
+
+
+def active_figures(seen, show_all):
+    """Pick which figures to create from the message types seen so far."""
+    if show_all:
+        return FIGURE_ORDER
+    pos_msgs = ("LOCAL_POSITION_NED", "GPS_RAW_INT", "POSITION_TARGET_LOCAL_NED")
+    att_msgs = ("ATTITUDE", "ATTITUDE_TARGET")
+    pred = {
+        "position":      lambda: any(seen.get(m, 0) for m in pos_msgs),
+        "velocity":      lambda: any(seen.get(m, 0) for m in pos_msgs),
+        "attitude":      lambda: any(seen.get(m, 0) for m in att_msgs),
+        "attitude_rate": lambda: any(seen.get(m, 0) for m in att_msgs),
+    }
+    return tuple(k for k in FIGURE_ORDER if pred[k]())
+
+
+def snapshot(tel: Telemetry):
+    """Copy buffers under the lock into numpy arrays."""
+    with tel.lock:
+        t0 = tel.t0 if tel.t0 is not None else time.time()
+        def A(d): return np.array(d, dtype=float)
+        snap = {
+            "t_local": A(tel.t_local) - t0,
+            "local":   {k: A(tel.local[k]) for k in tel.local},
+            "t_cov":   A(tel.t_cov) - t0,
+            "sigma":   {k: A(tel.sigma[k]) for k in tel.sigma},
+            "t_gps":   A(tel.t_gps) - t0,
+            "gps_p":   {"n": A(tel.gps_pn), "e": A(tel.gps_pe), "d": A(tel.gps_pd)},
+            "gps_v":   {"n": A(tel.gps_vn), "e": A(tel.gps_ve), "d": A(tel.gps_vd)},
+            "t_sp":    A(tel.t_sp) - t0,
+            "sp_p":    {"n": A(tel.sp_pn), "e": A(tel.sp_pe), "d": A(tel.sp_pd)},
+            "sp_v":    {"n": A(tel.sp_vn), "e": A(tel.sp_ve), "d": A(tel.sp_vd)},
+            "t_att":     A(tel.t_att) - t0,
+            "att":       {k: A(tel.att[k])     for k in tel.att},
+            "attrate":   {k: A(tel.attrate[k]) for k in tel.attrate},
+            "t_attsp":   A(tel.t_attsp) - t0,
+            "attsp":     {k: A(tel.attsp[k])     for k in tel.attsp},
+            "attratesp": {k: A(tel.attratesp[k]) for k in tel.attratesp},
+        }
+    return snap
+
+
+def _set_line(ln, x, y):
+    """Update a persistent line's data and make sure it's visible."""
+    ln.set_data(x, y)
+    ln.set_visible(True)
+
+
+def _hide_line(ln):
+    """Empty a persistent line and hide it (so it doesn't affect autoscale)."""
+    ln.set_data([], [])
+    ln.set_visible(False)
+
+
+def _autofollow(ax):
+    """Rescale an axis to its data so the plot follows new samples. Once the user
+    zooms/pans, matplotlib clears the axis's autoscale flag and autoscale_view()
+    leaves their view untouched; pressing 'a' re-enables auto-follow."""
+    ax.relim(visible_only=True)
+    ax.autoscale_view()
+
+
+def _draw_ned(ax3, artists, snap, kind):
+    if kind == "pos":
+        ek_axes = ("x", "y", "z")
+        data_key, gps_key, sp_key = "local", "gps_p", "sp_p"
+    else:
+        ek_axes = ("vx", "vy", "vz")
+        data_key, gps_key, sp_key = "local", "gps_v", "sp_v"
+    ned = ("n", "e", "d")
+    t_loc, t_cov, t_gps, t_sp = snap["t_local"], snap["t_cov"], snap["t_gps"], snap["t_sp"]
+
+    for ax, ek, nk, a in zip(ax3, ek_axes, ned, artists):
+        if t_loc.size:
+            y = snap[data_key][ek]
+            _set_line(a["ekf"], t_loc, y)
+            sig = snap["sigma"][ek]
+            m = np.isfinite(sig)  # np.interp does not skip NaN -> mask it out
+            if t_cov.size and sig.size and m.sum() >= 2:
+                s = np.interp(t_loc, t_cov[m], sig[m])
+                _set_line(a["sig_hi"], t_loc, y + 3 * s)
+                _set_line(a["sig_lo"], t_loc, y - 3 * s)
+            else:
+                _hide_line(a["sig_hi"]); _hide_line(a["sig_lo"])
+        else:
+            _hide_line(a["ekf"]); _hide_line(a["sig_hi"]); _hide_line(a["sig_lo"])
+        if t_gps.size:
+            _set_line(a["gps"], t_gps, snap[gps_key][nk])
+        else:
+            _hide_line(a["gps"])
+        if t_sp.size:
+            _set_line(a["sp"], t_sp, snap[sp_key][nk])
+        else:
+            _hide_line(a["sp"])
+        _autofollow(ax)
+
+
+def _draw_att(ax3, artists, snap, kind):
+    rad2deg = 180.0 / math.pi
+    if kind == "att":
+        act_key, sp_key = "att", "attsp"
+    else:
+        act_key, sp_key = "attrate", "attratesp"
+    t_act, t_sp = snap["t_att"], snap["t_attsp"]
+
+    for ax, comp, a in zip(ax3, ("roll", "pitch", "yaw"), artists):
+        if t_act.size:
+            _set_line(a["act"], t_act, snap[act_key][comp] * rad2deg)
+        else:
+            _hide_line(a["act"])
+        if t_sp.size:
+            _set_line(a["sp"], t_sp, snap[sp_key][comp] * rad2deg)
+        else:
+            _hide_line(a["sp"])
+        _autofollow(ax)
+
+
+def redraw(snap, figs):
+    if "position" in figs:
+        _draw_ned(figs["position"][1], figs["position"][2], snap, "pos")
+    if "velocity" in figs:
+        _draw_ned(figs["velocity"][1], figs["velocity"][2], snap, "vel")
+    if "attitude" in figs:
+        _draw_att(figs["attitude"][1], figs["attitude"][2], snap, "att")
+    if "attitude_rate" in figs:
+        _draw_att(figs["attitude_rate"][1], figs["attitude_rate"][2], snap, "rate")
+
+
+FIGURE_FILENAMES = {
+    "position":      "position_ned",
+    "velocity":      "velocity_ned",
+    "attitude":      "attitude_deg",
+    "attitude_rate": "attitude_rate_deg",
+}
+
+
+def save_figs(figs, reason="save"):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = Path.cwd()
+    saved = []
+    for key, (fig, _ax, _artists, cursor) in figs.items():
+        base = FIGURE_FILENAMES[key]
+        png = outdir / f"{base}.png"
+        fig.savefig(png, dpi=140, bbox_inches="tight")  # PNG first: keeps any on-screen labels
+        saved.append(png.name)
+        # Clear interactive (draggable) labels before pickling so the .pkl stays clean.
+        for sel in list(cursor.selections):
+            cursor.remove_selection(sel)
+        pkl = outdir / f"{base}.pkl"
+        with open(pkl, "wb") as fh:
+            pickle.dump(fig, fh)
+        saved.append(pkl.name)
+    print(f"[{ts}] {reason} -> saved {', '.join(saved)}")
+
+
+# --------------------------------------------------------------------------- #
+# Main                                                                        #
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device", default="udpin:127.0.0.1:14551",
+                    help="MAVLink connection string (default: udpin:127.0.0.1:14551, the "
+                         "mavlink-router 'plotter' UDP endpoint). For serial use e.g. /dev/ttyUSB0.")
+    ap.add_argument("--baud", type=int, default=2000000,
+                    help="Baud rate, used only for serial devices (default: 57600).")
+    ap.add_argument("--source-system", type=int, default=250,
+                    help="MAVLink source system id for this script.")
+    ap.add_argument("--trigger", choices=("arm", "start", "auto"), default="arm",
+                    help="When to refresh/save: 'arm'=while armed, save on disarm; "
+                         "'start'=from connect until link drop or Ctrl-C; "
+                         "'auto'=derive from the vehicle's SDLOG_MODE.")
+    ap.add_argument("--show-all", action="store_true",
+                    help="Create all figures even if a source message produced no data "
+                         "(default: show only figures whose messages were seen).")
+    ap.add_argument("--plots", nargs="+", choices=FIGURE_ORDER, metavar="PLOT",
+                    help="Explicitly choose which figures to show (any of: "
+                         "position velocity attitude attitude_rate). "
+                         "Overrides discovery and --show-all.")
+    args = ap.parse_args()
+
+    print(f"Opening {args.device} @ {args.baud} baud...")
+    conn = mavutil.mavlink_connection(
+        args.device, baud=args.baud, source_system=args.source_system
+    )
+    conn.wait_heartbeat()
+    print(f"Heartbeat from sys {conn.target_system} comp {conn.target_component}")
+
+    # Ask PX4 to stream what we need. The usual link here is mavlink-router over
+    # USB -> local UDP, so these rates are comfortable.
+    set_stream_rates(conn, {
+        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED:        10,
+        mavutil.mavlink.MAVLINK_MSG_ID_LOCAL_POSITION_NED_COV:     2,
+        mavutil.mavlink.MAVLINK_MSG_ID_GPS_RAW_INT:                2,
+        mavutil.mavlink.MAVLINK_MSG_ID_POSITION_TARGET_LOCAL_NED:  5,
+        mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE:                  20,
+        mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE_TARGET:          10,
+        mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION:              1,
+        mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT:                  1,
+    })
+
+    # Resolve the trigger BEFORE the reader starts: 'auto' reads SDLOG_MODE on
+    # this thread, so it must not race the reader for messages on the socket.
+    behavior = resolve_trigger(args.trigger, conn)
+
+    tel = Telemetry()
+    stop_evt = threading.Event()
+    reader = threading.Thread(target=mavlink_reader,
+                              args=(conn, tel, stop_evt), daemon=True)
+    reader.start()
+
+    # Decide which figures to open. --plots picks an explicit set; else --show-all
+    # forces all four; else listen briefly and keep only the figures whose source
+    # messages actually arrived.
+    if args.plots:
+        keys = tuple(k for k in FIGURE_ORDER if k in args.plots)
+        print(f"Showing figures (--plots): {', '.join(keys)}")
+    elif args.show_all:
+        keys = FIGURE_ORDER
+    else:
+        print(f"Discovering active messages for {DISCOVERY_SECONDS:.0f}s...")
+        time.sleep(DISCOVERY_SECONDS)
+        with tel.lock:
+            seen = dict(tel.seen)
+        keys = active_figures(seen, show_all=False)
+        if not keys:
+            print("[warn] no plottable telemetry seen; showing all figures.")
+            keys = FIGURE_ORDER
+        else:
+            print(f"Active figures: {', '.join(keys)}")
+
+    plt.ion()
+    figs = make_figures(keys)
+    plt.show(block=False)
+
+    def draw_all():
+        snap = snapshot(tel)
+        redraw(snap, figs)
+        for fig, *_ in figs.values():
+            fig.canvas.draw_idle()
+
+    if behavior == "arm":
+        print(f"Running (trigger='{args.trigger}'). Plots refresh while armed; "
+              "figures save on disarm. Ctrl-C to quit.")
+    else:
+        print(f"Running (trigger='{args.trigger}'). Plots refresh from now; "
+              "figures save on link drop. Ctrl-C to quit.")
+    print("Interact: click points to label them ('d' clears); zoom/pan holds, "
+          "'a' resumes auto-follow.")
+
+    was_active = False
+    last_refresh = 0.0
+    try:
+        while True:
+            now = time.time()
+            with tel.lock:
+                armed_now = tel.armed
+                last_hb = tel.last_heartbeat
+            link_down = (last_hb is not None) and (now - last_hb > HEARTBEAT_TIMEOUT)
+            active = armed_now if behavior == "arm" else (not link_down)
+
+            if active:
+                if now - last_refresh >= 1.0 / REFRESH_HZ:
+                    draw_all()
+                    last_refresh = now
+                was_active = True
+            else:
+                if was_active:
+                    # Active -> inactive edge: one last refresh, then save.
+                    draw_all()
+                    save_figs(figs, "disarm" if behavior == "arm" else "link drop")
+                    was_active = False
+                # Inactive: no redraw, just keep the windows responsive.
+
+            plt.pause(0.05)
+    except KeyboardInterrupt:
+        print("\nInterrupted. Saving final figures...")
+        draw_all()
+        save_figs(figs, "ctrl-c")
+    finally:
+        stop_evt.set()
+        reader.join(timeout=2.0)
+
+
+if __name__ == "__main__":
+    main()

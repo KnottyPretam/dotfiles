@@ -1,0 +1,20 @@
+# Optional config for run_sysid.sh. Usage:
+#   ./run_sysid.sh /path/to/this.yaml                  (preferred)
+#   ./run_sysid.sh /path/to/this.yaml /override.ulg    (CLI ULG wins over the one in here)
+#   ./run_sysid.sh /path/to/log.ulg                    (old form — uses run_sysid.m defaults)
+#
+# Any field omitted falls back to the hardcoded default in run_sysid.m.
+
+# The ULG to process. Can also be passed as the 2nd CLI arg to override.
+ulg_path: /home/choudhury/logs/log_4_2026-5-13-15-46-26.ulg
+
+# Auto-tune (retune step) knobs — passed to compute_attitude_control_gains.
+# These set the target crossover frequencies for pidtune.
+wc_inner_Hz:   3.0     # rate-loop target crossover (Hz)
+wc_outer_Hz:   1.0     # attitude-loop target crossover (Hz)
+PM_target_deg: 60      # phase margin target (deg) for both pidtune calls
+
+# FRF-point coherence threshold used by identify_plant.m to pick which frequency-
+# response points feed the TF fit. Raise it (e.g. 0.8) to reject noisy bins;
+# lower it to keep more points when the excitation is weak.
+coh_cutoff:    0.6

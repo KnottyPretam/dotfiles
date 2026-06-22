@@ -1,0 +1,135 @@
+function D = derive_signals(D)
+% Add VTOL-state-aware .rpy fields onto key topics, mirroring Thunderball/RunPlots.m:85-118.
+% Converts each table to a scalar struct (column vectors per field) so we can attach
+% derived arrays without table height/shape constraints.
+
+f_t = @(t_us) double(t_us) * 1e-6;
+
+D = topic_to_struct(D, 'vehicle_attitude_0');
+D = topic_to_struct(D, 'vehicle_angular_velocity_0');
+D = topic_to_struct(D, 'vehicle_rates_setpoint_0');
+D = topic_to_struct(D, 'vehicle_torque_setpoint_0');
+D = topic_to_struct(D, 'vehicle_torque_setpoint_virtual_mc_0');
+D = topic_to_struct(D, 'vehicle_torque_setpoint_virtual_fw_0');
+D = topic_to_struct(D, 'actuator_controls_0_0');
+D = topic_to_struct(D, 'vtol_vehicle_status_0');
+
+if isfield(D, 'vtol_vehicle_status_0')
+    vts_t  = f_t(D.vtol_vehicle_status_0.timestamp);
+    vts_s  = double(D.vtol_vehicle_status_0.vehicle_vtol_state);
+    has_vtol = true;
+else
+    warning('vtol_vehicle_status_0 not present; treating whole log as MC (state=3)');
+    vts_t = []; vts_s = [];
+    has_vtol = false;
+end
+
+    function s = rebase_vtol_state(t_target)
+        if ~has_vtol
+            s = 3 * ones(size(t_target));
+            return;
+        end
+        tt = vts_t; xx = vts_s;
+        bad = find(diff(tt) <= 0);
+        tt(bad) = []; xx(bad) = [];
+        s = interp1(tt, xx, t_target, 'previous', 'extrap');
+        s(~isfinite(s)) = 0;
+    end
+
+% vehicle_attitude_0
+if isfield(D, 'vehicle_attitude_0')
+    t = f_t(D.vehicle_attitude_0.timestamp);
+    q = [D.vehicle_attitude_0.q_1_, D.vehicle_attitude_0.q_2_, ...
+         D.vehicle_attitude_0.q_3_, D.vehicle_attitude_0.q_0_];
+    rpy_h = quat_to_euler(q);
+    q_pitch90 = euler_to_quat([0, pi/2, 0]);
+    q_rotated = quat_mult(q, repmat(q_pitch90, size(q,1), 1));
+    rpy_c = quat_to_euler(q_rotated);
+    vs = rebase_vtol_state(t);
+    is_h = double((vs == 3) | (vs == 1));
+    D.vehicle_attitude_0.t = t;
+    D.vehicle_attitude_0.vtol_state = vs;
+    D.vehicle_attitude_0.rpy = rpy_h .* is_h + rpy_c .* (1 - is_h);
+end
+
+% vehicle_angular_velocity_0
+if isfield(D, 'vehicle_angular_velocity_0')
+    t = f_t(D.vehicle_angular_velocity_0.timestamp);
+    x = [D.vehicle_angular_velocity_0.xyz_0_, D.vehicle_angular_velocity_0.xyz_1_, ...
+         D.vehicle_angular_velocity_0.xyz_2_];
+    rpy_h = x;
+    rpy_c = [-x(:,3), x(:,2), x(:,1)];
+    vs = rebase_vtol_state(t);
+    is_h = double((vs == 3) | (vs == 1));
+    D.vehicle_angular_velocity_0.t = t;
+    D.vehicle_angular_velocity_0.vtol_state = vs;
+    D.vehicle_angular_velocity_0.rpy = rpy_h .* is_h + rpy_c .* (1 - is_h);
+end
+
+% vehicle_rates_setpoint_0 (named fields)
+if isfield(D, 'vehicle_rates_setpoint_0')
+    t = f_t(D.vehicle_rates_setpoint_0.timestamp);
+    x = [D.vehicle_rates_setpoint_0.roll, D.vehicle_rates_setpoint_0.pitch, ...
+         D.vehicle_rates_setpoint_0.yaw];
+    rpy_h = x;
+    rpy_c = [-x(:,3), x(:,2), x(:,1)];
+    vs = rebase_vtol_state(t);
+    is_h = double((vs == 3) | (vs == 1));
+    D.vehicle_rates_setpoint_0.t = t;
+    D.vehicle_rates_setpoint_0.vtol_state = vs;
+    D.vehicle_rates_setpoint_0.rpy = rpy_h .* is_h + rpy_c .* (1 - is_h);
+end
+
+% torque setpoint: try the final (post-VTOL-select) topic first, then the per-mode virtual topics
+torque_candidates = {'vehicle_torque_setpoint_0', 'vehicle_torque_setpoint_virtual_mc_0', ...
+                     'vehicle_torque_setpoint_virtual_fw_0', 'actuator_controls_0_0'};
+for c = 1:numel(torque_candidates)
+    topic = torque_candidates{c};
+    if ~isfield(D, topic); continue; end
+    t = f_t(D.(topic).timestamp);
+    if isfield(D.(topic), 'xyz_0_')
+        x = [D.(topic).xyz_0_, D.(topic).xyz_1_, D.(topic).xyz_2_];
+    elseif isfield(D.(topic), 'control_0_')
+        x = [D.(topic).control_0_, D.(topic).control_1_, D.(topic).control_2_];
+    else
+        continue;
+    end
+    rpy_h = x;
+    rpy_c = [-x(:,3), x(:,2), x(:,1)];
+    vs = rebase_vtol_state(t);
+    is_h = double((vs == 3) | (vs == 1));
+    D.(topic).t = t;
+    D.(topic).vtol_state = vs;
+    D.(topic).rpy = rpy_h .* is_h + rpy_c .* (1 - is_h);
+end
+end
+
+function D = topic_to_struct(D, topic)
+if ~isfield(D, topic); return; end
+v = D.(topic);
+if istable(v)
+    D.(topic) = table2struct(v, 'ToScalar', true);
+end
+end
+
+function q = euler_to_quat(rpy)
+% rpy = [roll, pitch, yaw] in radians. Output scalar-last [x y z w].
+r = rpy(1); p = rpy(2); y = rpy(3);
+cr = cos(r/2); sr = sin(r/2);
+cp = cos(p/2); sp = sin(p/2);
+cy = cos(y/2); sy = sin(y/2);
+q = [sr*cp*cy - cr*sp*sy, ...
+     cr*sp*cy + sr*cp*sy, ...
+     cr*cp*sy - sr*sp*cy, ...
+     cr*cp*cy + sr*sp*sy];
+end
+
+function qc = quat_mult(qa, qb)
+% Hamilton product. qa, qb are Nx4 with scalar last [x y z w].
+ax = qa(:,1); ay = qa(:,2); az = qa(:,3); aw = qa(:,4);
+bx = qb(:,1); by = qb(:,2); bz = qb(:,3); bw = qb(:,4);
+qc = [aw.*bx + ax.*bw + ay.*bz - az.*by, ...
+      aw.*by - ax.*bz + ay.*bw + az.*bx, ...
+      aw.*bz + ax.*by - ay.*bx + az.*bw, ...
+      aw.*bw - ax.*bx - ay.*by - az.*bz];
+end

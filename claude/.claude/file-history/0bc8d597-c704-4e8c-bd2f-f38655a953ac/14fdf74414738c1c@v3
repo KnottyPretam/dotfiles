@@ -1,0 +1,137 @@
+# VotedSensorsUpdate vs EKF2Selector — Which is Used?
+
+## Context
+
+You asked which source code path is actually used: VotedSensorsUpdate (in `src/modules/sensors/`) or EKF2Selector (in `src/modules/ekf2/`). The short answer: **both are compiled and both run, but they sit at different stages of the pipeline and which one's output the flight controller actually consumes depends on the `SENS_IMU_MODE` parameter.** This is an investigation/findings document, not an implementation plan.
+
+---
+
+## Where each lives
+
+| Class | Source files |
+|---|---|
+| `VotedSensorsUpdate` | `src/modules/sensors/voted_sensors_update.{h,cpp}` |
+| `EKF2Selector` | `src/modules/ekf2/EKF2Selector.{hpp,cpp}` |
+
+Both are listed in their module `CMakeLists.txt` and are present in default SITL / px4 board configs (e.g. `boards/px4/sitl/default.px4board` line 44 enables `CONFIG_MODULES_SENSORS`; `CONFIG_EKF2_MULTI_INSTANCE` is on by default in `src/modules/ekf2/Kconfig` unless `CONSTRAINED_MEMORY`/`CONSTRAINED_FLASH`).
+
+---
+
+## What each one outputs
+
+**VotedSensorsUpdate** (instantiated unconditionally inside the `Sensors` module):
+
+- Directly publishes: `sensor_selection`, `sensors_status_imu`.
+- Populates the `sensor_combined` struct, which the parent `Sensors` module then publishes (`src/modules/sensors/sensors.cpp:615` calls `_voted_sensors_update.sensorsPoll(_sensor_combined)`, line 620 publishes it).
+- Reads `vehicle_imu[0..N]` (per-instance IMU topics from `VehicleIMU` workers) and picks the best one via voting.
+
+**EKF2Selector** (only constructed when `_multi_mode == true`; gated by `CONFIG_EKF2_MULTI_INSTANCE` at compile time and by runtime mode at `src/modules/ekf2/EKF2.cpp:2651-2663`):
+
+- Publishes the canonical "fused" flight-controller topics: `vehicle_attitude`, `vehicle_local_position`, `vehicle_global_position`, `vehicle_odometry`, `wind`, plus `estimator_selector_status` and (re-publishes) `sensor_selection`.
+- Subscribes to per-instance `estimator_attitude[i]`, `estimator_local_position[i]`, `estimator_global_position[i]`, `estimator_odometry[i]`, `estimator_wind[i]`, `estimator_status[i]` from each EKF2 replica and picks the healthiest instance by combined test ratio with 10s hysteresis.
+
+---
+
+## The mode switch: `SENS_IMU_MODE`
+
+This is the key. From `src/modules/ekf2/EKF2.cpp:453-469`:
+
+- **`SENS_IMU_MODE = 1` (default, "sensors module votes")**
+  - Single EKF2 instance runs.
+  - That EKF2 subscribes to `sensor_combined` (VotedSensorsUpdate's voted output).
+  - **EKF2Selector is NOT instantiated.** The single EKF2 publishes `vehicle_attitude` / `vehicle_local_position` / etc. directly.
+  - VotedSensorsUpdate is the *active* voter on this path.
+
+- **`SENS_IMU_MODE = 0` ("EKF2 votes")**
+  - Multiple EKF2 instances spawn (one per IMU, up to `EKF2_MULTI_IMU`).
+  - Each EKF2 instance subscribes directly to its own `vehicle_imu[i]` — bypassing `sensor_combined`.
+  - **EKF2Selector IS instantiated** and produces the canonical `vehicle_attitude` / `vehicle_local_position` / etc. by picking among instances.
+  - VotedSensorsUpdate still runs and still publishes `sensor_combined` and `sensor_selection`, but EKF2 doesn't consume `sensor_combined` here — only legacy estimators (`attitude_estimator_q`, `local_position_estimator`) and various non-EKF consumers do.
+
+So they are not competing replacements; they are **two different voting layers** at different points:
+
+```
+vehicle_imu[0..N]  ──►  VotedSensorsUpdate  ──►  sensor_combined  ──┐
+                                                                    │
+                       (SENS_IMU_MODE=1)                            ▼
+                                                          single EKF2 ──► vehicle_attitude etc.
+                                                                    │
+                                                                    ▼
+vehicle_imu[0..N]  ──►  EKF2 instance 0..N  ──►  estimator_attitude[i] etc.
+                       (SENS_IMU_MODE=0)                            │
+                                                                    ▼
+                                                            EKF2Selector ──► vehicle_attitude etc.
+```
+
+---
+
+## Verification you can run
+
+To confirm on a running system or SITL:
+
+1. Inspect parameter: `param show SENS_IMU_MODE` — 1 means VotedSensorsUpdate is the active voter feeding the (single) EKF2; 0 means EKF2Selector is the arbiter.
+2. Check uORB publishers at runtime: `uorb top vehicle_attitude` and `uorb top sensor_combined`. In `SENS_IMU_MODE=0` mode, `estimator_selector_status` will tick; in `SENS_IMU_MODE=1` it will not be published.
+3. Read `src/modules/ekf2/EKF2.cpp:2651-2663` to see the construction gate for `EKF2Selector`, and `:453-469` to see the `sensor_combined` vs `vehicle_imu` subscription split.
+
+---
+
+## Critical files referenced
+
+- `src/modules/sensors/sensors.cpp:615-620` — where `sensor_combined` is populated by VotedSensorsUpdate and published.
+- `src/modules/sensors/voted_sensors_update.{h,cpp}` — VotedSensorsUpdate itself.
+- `src/modules/ekf2/EKF2.cpp:453-469` — subscription split: `vehicle_imu` vs `sensor_combined`.
+- `src/modules/ekf2/EKF2.cpp:2651-2663` — EKF2Selector construction gate.
+- `src/modules/ekf2/EKF2Selector.{hpp,cpp}` — EKF2Selector itself.
+- `src/modules/ekf2/Kconfig` — `CONFIG_EKF2_MULTI_INSTANCE` compile-time gate.
+- `SENS_IMU_MODE` parameter — runtime mode selector.
+
+---
+
+## Implementation: export findings to the knightwerx vault
+
+Write a summary of the above findings as both a Markdown and an HTML file into the user's notes vault.
+
+**Target directory** (verified to exist, currently empty):
+`/home/choudhury/knightwerx-vault/px4-notes/`
+
+**Filenames** (date is today, 2026-05-13):
+- `SensorPolling_2026-05-13.md`
+- `SensorPolling_2026-05-13.html`
+
+**Content of both files** — a self-contained summary covering:
+
+1. **Git provenance header** (so the note can be tied to a code state later):
+   - Branch: `dev`
+   - Commit (full): `791030d72193440844b8ca8230568fc64f02e6ee`
+   - Commit (short): `791030d721`
+   - `git describe`: `ext/ODD-0.0.0-3-g791030d721-dirty`
+   - Remote: `git@gitlab.knightwerx.com:kwgit/px4/PX4-Autopilot.git`
+   - Working tree state: dirty (untracked dev scripts + modified `.gitignore`)
+   - Captured: 2026-05-13
+
+2. **Question being answered**: which voting code is used — VotedSensorsUpdate, EKF2Selector, or both?
+
+3. **Short answer**: both are built and both run, but they sit at different pipeline stages; which one's output the FC consumes is gated by `SENS_IMU_MODE`.
+
+4. **Source locations** table (VotedSensorsUpdate in `src/modules/sensors/voted_sensors_update.{h,cpp}`; EKF2Selector in `src/modules/ekf2/EKF2Selector.{hpp,cpp}`).
+
+5. **Per-class output topics** (VotedSensorsUpdate → `sensor_selection`, `sensors_status_imu`, and the parent module publishes `sensor_combined`; EKF2Selector → `vehicle_attitude`, `vehicle_local_position`, `vehicle_global_position`, `vehicle_odometry`, `wind`, `estimator_selector_status`, `sensor_selection`).
+
+6. **The `SENS_IMU_MODE` switch** explained for both values (1 = sensors votes, single EKF2 reads `sensor_combined`, selector not instantiated; 0 = multi-EKF, each EKF2 reads its own `vehicle_imu[i]`, selector arbitrates).
+
+7. **Pipeline diagram** (ASCII in MD, monospace `<pre>` in HTML).
+
+8. **Critical files with line numbers** (`src/modules/sensors/sensors.cpp:615-620`, `src/modules/ekf2/EKF2.cpp:453-469`, `src/modules/ekf2/EKF2.cpp:2651-2663`, plus the Kconfig and the `SENS_IMU_MODE` param).
+
+9. **How to verify on a running system** (`param show SENS_IMU_MODE`, `uorb top vehicle_attitude` / `sensor_combined`, presence of `estimator_selector_status` ticks).
+
+**HTML format**: a single self-contained file — minimal inline `<style>` (system fonts, readable max-width, light styling for headings, tables, code, and the `<pre>` diagram). No external CSS/JS, no emoji. Same content as the MD, just rendered as HTML.
+
+**No other files** to be created or modified. Read-only on the codebase from here.
+
+## Verification
+
+After writing:
+- `ls -la /home/choudhury/knightwerx-vault/px4-notes/` shows both files.
+- Spot-check the Git header in each file matches the values above.
+- Open the HTML in a browser (or `xdg-open`) to confirm it renders cleanly.

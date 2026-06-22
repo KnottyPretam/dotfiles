@@ -1,0 +1,108 @@
+# Plan: timing-with-dropout plots & output directory for analyze_imu_vibration.py
+
+## Context
+
+The IMU analysis script currently produces one timing figure derived from `sensor_accel` (the decimated, software-filtered topic) and dumps every PNG into the working directory. Two gaps:
+
+1. **Wrong source for timing analysis.** `sensor_accel` is downsampled; its Δt cannot reveal driver-level dropouts. The user wants timing views from two additional topics whose timestamps better reflect actual sample arrival:
+   - `vehicle_imu` (`timestamp_sample` per consolidated batch)
+   - `sensor_accel_fifo` per-sample reconstructed timestamps (the "correct" raw-rate kHz stream — already reconstructed by `fifo_to_series` at line 101).
+2. **No structured dropout view.** Δt-only plots on a log axis suggest dropouts but don't quantify them. PX4 exposes ground-truth counters (`vehicle_imu_status.{accel,gyro}_error_count`) that go unused, and the FIFO topic has no explicit counter so dropouts must be inferred from batch gaps.
+3. **Clutter.** All PNGs land next to the `.ulg`; the user wants a dedicated `imuVibe_plots/` directory.
+
+Decisions from clarifying questions:
+- Output dir: `./imuVibe_plots/` (with `--outdir` override)
+- Layout: timing + dropouts **merged per topic** (one PNG per topic)
+- FIFO dropouts: gap-based inference from `dt`/`samples`/`timestamp_sample`
+
+## File to modify
+
+- `/home/choudhury/tools/dev/imu_vibe/analyze_imu_vibration.py` (the symlink target in the working dir resolves here)
+
+## Implementation
+
+### 1. Configurable output directory
+
+- Change default at the top of the file: `OUTDIR = Path("imuVibe_plots")`.
+- Add `--outdir` CLI arg in `parse_args()` (line ~796); apply after parsing with precedence CLI > YAML > script default.
+- In `main()` (line ~881), replace `OUTDIR.mkdir(exist_ok=True)` with `OUTDIR.mkdir(parents=True, exist_ok=True)`.
+- All existing `OUTDIR / "..."` callsites continue to work unchanged. `imu_findings.txt` goes into `OUTDIR` too.
+
+### 2. Replace `plot_timing` with three per-topic timing+dropout functions
+
+Delete `plot_timing` (line ~447). Add three functions and a small shared helper.
+
+**Shared helper** `_plot_dt_with_outliers(ax, t, label, expected_dt_s=None)`:
+- Plot Δt in ms on a log axis (matches current style).
+- Compute `expected = expected_dt_s if given else median(np.diff(t))`.
+- Mark samples where Δt > 1.5 × expected with red dots; annotate max-Δt.
+- Draw a thin horizontal line at `expected × 1000` ms.
+
+**(a) `plot_timing_sensor_accel(ulog, outdir)`** → `imu_timing_sensor_accel.png`
+For each `sensor_accel` instance (3 in this log), one row with two stacked axes (sharex):
+- Top: Δt via `_plot_dt_with_outliers` over `t_seconds(d, ulog)`.
+- Bottom: cumulative `error_count` line + per-axis `clip_counter[0..2]` overlay (already published in `sensor_accel`).
+
+**(b) `plot_timing_vehicle_imu(ulog, outdir)`** → `imu_timing_vehicle_imu.png`
+For each `vehicle_imu` instance (3 in this log), one row with two stacked axes:
+- Top: Δt computed from `timestamp_sample` (publication-rate timing).
+- Bottom: matched `vehicle_imu_status` error counters (`accel_error_count`, `gyro_error_count`) on twin y-axes, matched by `multi_id` to the `vehicle_imu` instance (PX4 publishes them with the same instance index).
+
+**(c) `plot_timing_sensor_accel_fifo(ulog, outdir)`** → `imu_timing_sensor_accel_fifo.png`
+Single instance in this log. One figure with two stacked axes:
+- Top: per-sample Δt from the time array returned by `fifo_to_series(d)` (line 101 — already builds the corrected per-sample timestamps). Within a batch this is `dt`; between batches it widens on dropouts.
+- Bottom: inferred dropout stem plot. For batch `i` with `dt_us = d.data["dt"][i]` and `samples = d.data["samples"][i]`:
+  - First-sample time: `t_first[i] = timestamp_sample[i] - (samples[i]-1) * dt_us[i]`
+  - Inter-batch gap: `gap[i] = t_first[i] - timestamp_sample[i-1]`
+  - Missed samples: `missed[i] = round(gap[i] / dt_us[i]) - 1` when `gap > 1.5 × dt[i]`, else 0
+  - Plot `ax.stem(gap_times, missed)` so each event's time + magnitude is visible.
+
+### 3. Extend `write_verdict`
+
+Append a "dropout summary" block before writing the file:
+- Per `vehicle_imu_status` instance: final `accel_error_count` & `gyro_error_count`, delta over flight.
+- For `sensor_accel_fifo`: total inferred dropout events (gap > 1.5×dt), total missed samples, top-3 largest gaps as `(t=…s, missed=N)`.
+
+### 4. Update `main()`
+
+Replace the single `plot_timing(...)` call (line ~888) with:
+```
+plot_timing_sensor_accel(ulog, OUTDIR)
+plot_timing_vehicle_imu(ulog, OUTDIR)
+plot_timing_sensor_accel_fifo(ulog, OUTDIR)
+```
+
+Also update the docstring at the top (lines 8–22) to reflect the new filenames.
+
+## Title & legend convention
+
+Follow the same plain style used by `plot_fifo_magnitude_timeseries` (the function that produces `imu_accel_fifo_mag.png`):
+
+- Legend labels use the bare topic + instance name: `sensor_accel_0`, `vehicle_imu_1`, `sensor_accel_fifo_0`, `vehicle_imu_status_0` (for the error-count overlay) — no embellishments like "Δt", "errors", "EKF" prefixes.
+- `suptitle` is a short descriptive phrase only — no fs / Δf / window stats baked into the title. Examples:
+  - `"sensor_accel per-instance timing & error/clipping counters"`
+  - `"vehicle_imu per-instance timing with vehicle_imu_status error counters"`
+  - `"sensor_accel_fifo per-sample timing & inferred dropouts"`
+- y-axis labels stay short and plain: `"Δt (ms)"`, `"error_count"`, `"missed samples"`.
+- Apply the same convention when extending `write_verdict` — section headings like `"sensor_accel_fifo dropouts:"` rather than verbose prose.
+
+## Reused existing code
+
+- `fifo_to_series` (line 101) — already reconstructs per-sample FIFO timestamps; just call it in (c).
+- `all_instances` / `get_topic` / `t_seconds` (lines 81–95) — for topic lookup and shifted-time conversion.
+- `T_OFFSET` machinery (line 47, `compute_time_offset` at line 826) — works automatically since all new code goes through `t_seconds` or `fifo_to_series`.
+
+## Verification
+
+From `/home/choudhury/analysis/hil_tests/oddjob/logging_test/fifo_sandisk/b64/`:
+
+1. `python analyze_imu_vibration.py log_0_2026-5-12-08-40-04.ulg`
+2. Confirm `./imuVibe_plots/` exists and contains:
+   - `imu_timing_sensor_accel.png` (3 instance rows, error_count overlay)
+   - `imu_timing_vehicle_imu.png` (3 instance rows, status counter overlay)
+   - `imu_timing_sensor_accel_fifo.png` (single instance, stem-plot dropouts)
+   - all pre-existing PNGs still produced (`imu_vibration_metrics.png`, FFTs, etc.)
+   - `imu_findings.txt` with new dropout summary lines
+3. Visual check: the FIFO-timing bottom panel should show stems at any gap events; verify the count printed in `imu_findings.txt` matches the number of stems.
+4. `python analyze_imu_vibration.py log_0_2026-5-12-08-40-04.ulg --outdir tmp_results` → outputs land in `./tmp_results/` instead.
+5. Sanity: the working dir should be free of new `*.png` / `imu_findings.txt` after the run (everything inside `imuVibe_plots/`).

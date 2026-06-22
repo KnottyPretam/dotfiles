@@ -1,0 +1,42 @@
+---
+name: oddjob-recreate-angular-velocity
+description: Tool + method to recreate PX4 vehicle_angular_velocity from sensor_gyro_fifo and tune gyro/dgyro filters offline; the FIFO-dropout ringing gotcha
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 33e41a87-3dcc-4354-ab80-1c22d7c77f31
+---
+
+`recreate_angular_velocity.py` (+ `filter_tune.yaml`) in each `oddjob_vibeAnalysis_*` dir recreates
+PX4's `vehicle_angular_velocity` (both `xyz` gyro and `xyz_derivative` dgyro) from raw
+`sensor_gyro_fifo`, then re-filters with YAML-set `IMU_GYRO_CUTOFF / IMU_DGYRO_CUTOFF /
+IMU_GYRO_NF0/NF1_FRQ/BW` to tune offline. It reuses `analyze_imu_vibration.py`'s
+`fifo_to_series`/`direct_fft`/`save_fig` via `sys.path.insert`. Run:
+`python3 recreate_angular_velocity.py LOG.ulg --config filter_tune.yaml` → plots+metrics in
+`recreate_av_<stem>_plots/`. See [[oddjob-vibe-psd-summary]] for the PSD CSV tooling.
+
+Exact PX4 pipeline reproduced (src/modules/sensors/vehicle_angular_velocity/VehicleAngularVelocity.cpp):
+- Per-axis chain on the **full FIFO-rate** series: `scale·int16` → notch0 → notch1 → **2nd-order
+  Butterworth** (IMU_GYRO_CUTOFF). dgyro = `d/dt(filtered gyro)·fs` then a **1st-order AlphaFilter**
+  (IMU_DGYRO_CUTOFF) — the dgyro is an EMA, **NOT** a Butterworth. Coeff formulas: LowPassFilter2p.hpp,
+  NotchFilter.hpp, AlphaFilter.hpp. PX4's Butterworth matches `scipy.signal.butter` exactly.
+- Output rate ("integration rate"): publish the **last filtered sample per FIFO batch** →
+  `8000/10 = 800 Hz` (= IMU_GYRO_RATEMAX). Match by sampling the filtered series at the logged
+  `vehicle_angular_velocity.timestamp_sample` (exact µs join).
+- Calibration: `xyz = R·(filt−CAL_GYROx_OFF) − ekf_bias(t)`, `xyz_derivative = R·dgyro`, where
+  `R = Dcm(Euler(SENS_BOARD_X/Y/Z_OFF)) @ get_rot_matrix(SENS_BOARD_ROT)` (CAL_GYROx_ROT=−1 ⇒ follow
+  board). `ekf_bias` = `estimator_sensor_bias.gyro_bias` (ZOH). Coning is N/A to this topic.
+
+Non-obvious facts (verified on OD1A079_nexus_endurance.ulg):
+- Controller gyro = `sensor_selection.gyro_device_id` = **3670026** = `sensor_gyro_fifo` **multi_id=0**,
+  **8000 Hz** (dt=125 µs). This is the FIFO that feeds `vehicle_angular_velocity` — **not** 6684714
+  (the 2 kHz device the PSD CSVs analyze). Params: CUTOFF=25, DGYRO=30, NF0/NF1 disabled, DNF_EN=0
+  (dynamic notch off), SENS_BOARD_ROT=24 (=ROTATION_PITCH_90), SENS_BOARD_Y_OFF=−4°, gyro=CAL_GYRO1.
+- **FIFO logging-dropout gotcha**: the SD log drops chunks of the 8 kHz FIFO (124 dropouts, ~195k
+  samples on OD1A079). The FC had continuous data → smooth logged output; filtering across the
+  reconstructed gaps **rings**, which looks like a 4% mismatch. Excluding ±0.1 s around each gap
+  (keeps ~98%) → **gyro NRMSE ≈ 0.1%, dgyro ≈ 1%, corr 0.99999** (validated). The tool does this
+  automatically and shades dropouts on the time-series plots.
+- The **25 Hz gyro LPF crushes the ~99.4 Hz vibration** in `vehicle_angular_velocity` (~−48 dB), so
+  that line is a `sensor_gyro_fifo` phenomenon, barely present in the controller rate. Use the YAML
+  `candidate:` block to test a higher cutoff + a 99.4 Hz notch and see the spectral trade-off.

@@ -1,0 +1,16 @@
+function [t_u, x_u, dt] = resample_and_detrend(t, x, dt_target)
+% Resample x(t) onto a uniform time grid with dt = dt_target (or median(diff(t)) if missing)
+% and apply cubic detrending (nonlinear_detrend from sysID_tool/Utilities).
+
+t = t(:); x = x(:);
+
+if nargin < 3 || isempty(dt_target) || ~isfinite(dt_target) || dt_target <= 0
+    dt = median(diff(t));
+else
+    dt = dt_target;
+end
+
+t_u = (t(1):dt:t(end))';
+x_u = interp1(t, x, t_u, 'linear', 'extrap');
+x_u = nonlinear_detrend(x_u, t_u);
+end

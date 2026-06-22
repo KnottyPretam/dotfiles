@@ -1,0 +1,116 @@
+# Plan: drop Signal Processing Toolbox dependency + annotate FFT peaks
+
+## Context
+
+The angular-acceleration FFT plot I added to `run_sysid.m` uses `hann(n)` (`run_sysid.m:376`) for windowing. `hann` lives in the Signal Processing Toolbox — users without that toolbox get a license error. The user also wants the FFT plot to **call out peak amplitudes** so the spectral hotspots are readable at a glance.
+
+Confirmed by grep (recursive `\b(hann|hamming|blackman|kaiser|pwelch|cpsd|mscohere|tfestimate|findpeaks|filtfilt|freqz|spectrogram|xcorr|medfilt1|sgolay|bandpass|lowpass|highpass|butter|cheby1|cheby2|ellip|hilbert|envelope|window)\s*\(` over `/home/choudhury/tools/dev/sysID_matlab` and `/home/choudhury/repos/sysID_tool`): the **only** Signal Processing Toolbox call in the entire pipeline is that one `hann(n)`. Fixing it removes the toolbox requirement entirely.
+
+Existing code already in `run_sysid.m::make_angular_accel_fft` (~lines 358-414):
+- Reads `D.vehicle_angular_velocity_0.xyz_derivative_*`.
+- Interpolates onto a uniform `t_grid`, demeans, windows, FFTs.
+- Plots one-sided magnitude per axis (roll/pitch/yaw), 0-50 Hz linear.
+
+What needs to change is small and local — only the FFT helper.
+
+---
+
+## Files
+
+| Path | Action | Purpose |
+|---|---|---|
+| `run_sysid.m` | edit | Replace `hann(n)` with an inline Hann formula. Add a peak-finding + annotation block per axis. |
+
+No other file is touched. No new `.m` files.
+
+---
+
+## Change 1: inline Hann window
+
+Replace `run_sysid.m:376`:
+
+```matlab
+w = hann(n);
+```
+
+with the symmetric Hann formula (matches `hann(n)` to FP precision):
+
+```matlab
+% Hann window (symmetric, equivalent to hann(n); inlined to avoid the
+% Signal Processing Toolbox dependency)
+if n == 1
+    w = 1;
+else
+    w = 0.5 - 0.5*cos(2*pi*(0:n-1).'/(n-1));
+end
+```
+
+The downstream amplitude correction (`mag = abs(Y(half, :)) * (2/sum(w))`) is unchanged — `sum(w)` is identical to `sum(hann(n))`.
+
+---
+
+## Change 2: peak annotation on the FFT plot
+
+Replace the existing per-axis subplot body (currently just `plot(f(mask), mag(mask, ax), ...)` + labels) with:
+
+```matlab
+fm = f(mask);
+ym = mag(mask, ax);
+
+plot(fm, ym, 'LineWidth', 1.0); grid on; hold on;
+
+% Find peaks. islocalmax (base MATLAB, R2017b+) — no toolbox.
+% MinSeparation in Hz, prominence ~10% of axis peak filters tiny ripples.
+pk_mask = islocalmax(ym, 'MinSeparation', 1.5, 'SamplePoints', fm, ...
+                         'MinProminence', 0.1*max(ym));
+fp = fm(pk_mask); yp = ym(pk_mask);
+
+% Keep top N by amplitude
+N_show = 5;
+if numel(fp) > N_show
+    [~, ord] = sort(yp, 'descend');
+    keep = ord(1:N_show);
+    fp = fp(keep); yp = yp(keep);
+end
+
+if ~isempty(fp)
+    plot(fp, yp, 'rv', 'MarkerSize', 8, 'MarkerFaceColor', 'r');
+    for kk = 1:numel(fp)
+        text(fp(kk), yp(kk), sprintf('  %.1f Hz\n  %.3f', fp(kk), yp(kk)), ...
+             'VerticalAlignment','bottom', 'FontSize', 8, 'Color', 'r');
+    end
+end
+
+ylabel(sprintf('|FFT(%s)| (rad/s^2)', axes_names{ax}));
+% (title + xlabel lines kept as-is)
+```
+
+Why these choices:
+- **`islocalmax`** is base MATLAB (R2017b+) — no toolbox.
+- **`MinSeparation` 1.5 Hz** prevents the same physical peak from being annotated multiple times on adjacent FFT bins, which is what would happen at high `n` (frequency resolution = fs/n typically ≪ 1 Hz).
+- **`MinProminence` 10% of `max(ym)`** rejects noise-floor wiggles. Computed per axis so an axis with low overall content still gets its real peaks flagged.
+- **Top-5 cap** keeps the figure readable on dense spectra. Number is arbitrary; trivial to bump.
+- Red downward triangles at peaks + text labels showing `"f Hz / amp"` directly on the plot — no separate legend or sidebar needed.
+
+---
+
+## Reused / existing code
+
+- `make_angular_accel_fft` helper structure (around `run_sysid.m:358`) — kept; only the window construction and the per-axis plot block change.
+- `axes_names = {'roll','pitch','yaw'}` already in the helper — used for the new ylabel format string.
+
+---
+
+## Verification
+
+1. **No-toolbox check.** From a MATLAB session without Signal Processing Toolbox, run `which hann` (should report only the `hann` shipped with that toolbox — which is missing). Then run `./run_sysid.sh /path/to/log.ulg`. Expect no licensing error; the angular-accel FFT figure should appear in `figures/<mode>/`.
+
+2. **Window equivalence.** In a MATLAB session with the toolbox available, run `max(abs(hann(1024) - (0.5 - 0.5*cos(2*pi*(0:1023).'/1023))))` — should be on the order of `eps`. Confirms the inline formula matches `hann()` bit-for-bit.
+
+3. **Peak annotation present.** On a flown log with non-trivial vibration, the FFT figure should show 1-5 red triangles per axis with `<f> Hz / <amp>` labels at the dominant spectral peaks. For roll on a typical multirotor: expect a peak near the rotor blade-pass frequency (in the 30-50 Hz range typically) flagged.
+
+4. **Quiet log degrades gracefully.** On a static-bench log (very low vibration), `MinProminence = 0.1*max(ym)` keeps the threshold proportional, so a few small-but-real peaks are still annotated. If no peak meets prominence, the plot shows the curve without annotations and does not crash.
+
+5. **Existing pipeline unchanged.** `results.mat`, `plants.mat`, `margins.txt`, per-axis Bode/Nichols/step plots, retune outputs — all byte-identical to a prior run on the same log + same `run_sysid_config.yaml`. Only the FFT PNG/FIG content differs.
+
+6. **`checkcode` clean.** `matlab -batch "addpath /home/choudhury/tools/dev/sysID_matlab; disp(checkcode('run_sysid.m','-string'))"` — expect only the pre-existing `datestr`/`now` deprecation notes; no new analyzer messages.

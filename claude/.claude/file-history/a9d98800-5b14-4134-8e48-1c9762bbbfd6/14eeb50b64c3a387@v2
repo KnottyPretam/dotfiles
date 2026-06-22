@@ -1,0 +1,118 @@
+#include "ms_gimbalControl.h"
+#include "ms_messages.h"
+#include <chrono>
+#include <cstring>
+#include <thread>
+
+ms_gimbalControl::ms_gimbalControl(const std::string& componentName) : kw_component(componentName)
+{
+    std::memset(&cmd_template, 0, sizeof(cmd_template));
+    cmd_template.header1 = COLIBRI_HDR1;
+    cmd_template.header2 = COLIBRI_HDR2;
+    cmd_template.header3 = COLIBRI_HDR3_FA_AUTOROLL;  // fast protocol, 3-axis auto-roll/yaw-stab
+
+    // Rev 43 §5.5: pitch/roll MSB rate = 0x80 with LSB = 0 means zero rate command.
+    cmd_template.pitch_msb = 0x80;
+    cmd_template.roll_msb  = 0x80;
+    cmd_template.yaw_msb   = 0x80;
+}
+
+ms_gimbalControl::~ms_gimbalControl() = default;
+
+void ms_gimbalControl::createComponent(kw_observer* _manager)
+{
+    kw_component::createComponent(_manager);
+
+    vehicleData->addNighthawkObserver(mCOLIBRI_ACK_FIXED, this);
+    vehicleData->addNighthawkObserver(mCOLIBRI_ACK_FULL,  this);
+}
+
+void ms_gimbalControl::mainThread()
+{
+    while (running)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+}
+
+void ms_gimbalControl::processUpdate(const std::string& /*name*/, void* /*data*/)
+{
+    // Decoded acks land here. Cached state lives in vehicleData->nighthawk_interface;
+    // downstream consumers should fetch via get_gimbal_*_deg() / last_full_ack().
+}
+
+void ms_gimbalControl::setMode(enColibriMode mode)
+{
+    cmd_template.status = static_cast<uint8_t>((cmd_template.status & 0xE0) | (mode & 0x1F));
+    send_current_command();
+}
+
+void ms_gimbalControl::setChannel(enColibriChannel channel)
+{
+    if (channel == eCOL_CHAN_IR)
+        cmd_template.status |= 0x80;
+    else
+        cmd_template.status &= ~0x80;
+    send_current_command();
+}
+
+void ms_gimbalControl::setRate(int16_t pitch_rate, int16_t roll_rate, int16_t yaw_rate)
+{
+    // Rev 43 §3.1 bytes 14-18: 12-bit unsigned-biased values, centre 2048.
+    // Layout per axis: MSB byte holds bits [11:4]; byte 14 holds bits [3:2]; byte 18 holds bits [1:0].
+    auto encode_12 = [](int16_t signed_v, uint8_t& msb, uint8_t& mid, uint8_t& lsb) {
+        const uint16_t biased = static_cast<uint16_t>(signed_v + 2048) & 0x0FFF;
+        msb = static_cast<uint8_t>((biased >> 4) & 0xFF);
+        mid = static_cast<uint8_t>((biased >> 2) & 0x03);
+        lsb = static_cast<uint8_t>( biased       & 0x03);
+    };
+
+    uint8_t p_mid = 0, p_lsb = 0;
+    uint8_t r_mid = 0, r_lsb = 0;
+    uint8_t y_mid = 0, y_lsb = 0;
+
+    encode_12(pitch_rate, cmd_template.pitch_msb, p_mid, p_lsb);
+    encode_12(roll_rate,  cmd_template.roll_msb,  r_mid, r_lsb);
+    encode_12(yaw_rate,   cmd_template.yaw_msb,   y_mid, y_lsb);
+
+    cmd_template.b14 = static_cast<uint8_t>(
+        (cmd_template.b14 & 0xC0) |  // preserve zoom IN/OUT
+        ((p_mid & 0x03) << 4) |
+        ((r_mid & 0x03) << 2) |
+        ( y_mid & 0x03));
+
+    cmd_template.b18 = static_cast<uint8_t>(
+        ((p_lsb & 0x03) << 4) |
+        ((r_lsb & 0x03) << 2) |
+        ( y_lsb & 0x03));
+
+    setMode(eCOL_MODE_RATE);
+}
+
+void ms_gimbalControl::setFOV(uint16_t deg_x10)
+{
+    // Rev 43 §3.2 correlator 0x05: byte 9 bits [5:0] = index; bytes 10-11 = FOV (deg*10) MSB/LSB;
+    // byte 12 = 0 (momentary) / 1..255 (absolute adjust); byte 13 reserved.
+    cmd_template.correlator_index  = static_cast<uint8_t>((cmd_template.correlator_index & 0xC0) | 0x05);
+    cmd_template.correlator_byte_0 = static_cast<uint8_t>((deg_x10 >> 8) & 0xFF);
+    cmd_template.correlator_byte_1 = static_cast<uint8_t>( deg_x10       & 0xFF);
+    cmd_template.correlator_byte_2 = 0xFF;
+    cmd_template.correlator_byte_3 = 0x00;
+    send_current_command();
+}
+
+void ms_gimbalControl::fireLRF(bool fire)
+{
+    // Safety key required to arm any laser sensor (Rev 43 Appendix A §2).
+    cmd_template.safety = static_cast<uint8_t>((cmd_template.safety & 0x0F) | 0x50);
+    if (fire)
+        cmd_template.pointing |= 0x10;
+    else
+        cmd_template.pointing &= ~0x10;
+    send_current_command();
+}
+
+void ms_gimbalControl::send_current_command()
+{
+    vehicleData->nighthawk_interface.send_message(cmd_template);
+}

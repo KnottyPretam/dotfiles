@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+"""
+Run the Twin Rotor Tailsitter chirp (actuator system-ID) feature in PX4 SITL and
+capture one ulog per chirp.
+
+For each selected chirp this launches a fresh headless gazebo-classic SITL of the
+twinrotor_tailsitter, applies that chirp's parameter file over MAVLink, force-arms
+(the chirp is one-shot on arm), waits for the sweep to finish, disarms, and copies
+the resulting ulog (one per arm->disarm, since the airframe sets SDLOG_MODE=0) to
+the output directory.
+
+Must be run INSIDE the dev container (devcon) — the SITL MAVLink ports are
+container-internal. Example:
+
+    python3 Tools/chirp_sysid/run_chirp_sysid.py --chirps cyclic_pitch   # smoke test
+    python3 Tools/chirp_sysid/run_chirp_sysid.py --chirps all            # all 5
+
+The chirp is open-loop and bypasses stabilization, so the vehicle will move/tip on
+the ground during a sweep — that is expected. The useful data is the commanded
+actuator_motors / actuator_servos (plus the high-rate sysID topics the airframe logs).
+"""
+
+import argparse
+import glob
+import os
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+try:
+    from pymavlink import mavutil
+except ImportError:
+    sys.exit("pymavlink not found. Run inside the dev container (devcon), or: pip install pymavlink")
+
+CHIRPS = ["cyclic_pitch", "cyclic_yaw", "collective", "collective_roll", "rpm"]
+
+REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+BUILD_DIR = os.path.join(REPO, "build", "px4_sitl_default")
+ROOTFS_LOG = os.path.join(BUILD_DIR, "rootfs", "log")
+
+# Force-arm magic for MAV_CMD_COMPONENT_ARM_DISARM param2 (used for disarm).
+FORCE_ARM_MAGIC = 21196.0
+
+
+# --------------------------------------------------------------------------- #
+# param file parsing
+# --------------------------------------------------------------------------- #
+def parse_params_file(path):
+    """Return [(name, value_str), ...] from a PX4 'param set NAME VALUE' file."""
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 4 and parts[0] == "param" and parts[1] == "set":
+                out.append((parts[2], parts[3]))
+            elif len(parts) == 2:
+                out.append((parts[0], parts[1]))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# MAVLink helpers
+# --------------------------------------------------------------------------- #
+def _param_id(msg):
+    pid = msg.param_id
+    if isinstance(pid, bytes):
+        pid = pid.decode("ascii", "ignore")
+    return pid.split("\x00", 1)[0]
+
+
+# Params this tool sets that are INT32; everything else it sets is REAL32 (float).
+INT_PARAMS = {
+    "CA_CHIRP_MODE", "NAV_RCL_ACT", "NAV_DLL_ACT", "COM_RCL_EXCEPT", "COM_ARM_WO_GPS",
+    "CBRK_AIRSPD_CHK",
+}
+
+
+def _int_bits_as_float(i):
+    return struct.unpack("<f", struct.pack("<i", int(i)))[0]
+
+
+def _float_as_int_bits(f):
+    return struct.unpack("<i", struct.pack("<f", float(f)))[0]
+
+
+def set_param(master, name, value_str, timeout=4.0, retries=4):
+    """Set a parameter and confirm via the PARAM_VALUE echo PX4 sends after a PARAM_SET.
+
+    PX4 interprets the MAVLink param_value field BYTEWISE per param_type (not by casting), so an
+    INT32 parameter must be transmitted as the float whose raw bits equal the desired integer, and
+    the echo decoded the same way. (Sending the integer as a plain float stores its float bit
+    pattern instead, e.g. 1 -> 1065353216.)
+    """
+    is_int = name in INT_PARAMS
+    if is_int:
+        ival = int(float(value_str))
+        wire = _int_bits_as_float(ival)
+        ptype = mavutil.mavlink.MAV_PARAM_TYPE_INT32
+    else:
+        fval = float(value_str)
+        wire = fval
+        ptype = mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+
+    for _ in range(retries):
+        master.mav.param_set_send(
+            master.target_system, master.target_component,
+            name.encode("ascii"), wire, ptype)
+        end = time.time() + timeout
+        while time.time() < end:
+            msg = master.recv_match(type="PARAM_VALUE", blocking=True, timeout=max(0.1, end - time.time()))
+            if msg is None or _param_id(msg) != name:
+                continue
+            if is_int:
+                if _float_as_int_bits(msg.param_value) == ival:
+                    return True
+            elif abs(msg.param_value - fval) <= max(1e-4, abs(fval) * 1e-3):
+                return True
+    return False
+
+
+def wait_ack(master, command, timeout=5.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        ack = master.recv_match(type="COMMAND_ACK", blocking=True, timeout=max(0.1, end - time.time()))
+        if ack is not None and ack.command == command:
+            return ack.result  # 0 == MAV_RESULT_ACCEPTED
+    return None
+
+
+def set_armed(master, armed, force=False, timeout=5.0):
+    p2 = FORCE_ARM_MAGIC if force else 0.0
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0,
+        1.0 if armed else 0.0, p2, 0, 0, 0, 0, 0)
+    return wait_ack(master, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, timeout)
+
+
+# --------------------------------------------------------------------------- #
+# SITL process management
+# --------------------------------------------------------------------------- #
+XMLSTARLET_SHIM = r"""#!/bin/sh
+# Minimal xmlstarlet shim for PX4 Tools/simulation/gazebo-classic/sitl_run.sh, which only
+# calls:  xmlstarlet select -T -t -v sdf/world/spherical_coordinates/<tag> <world_file>
+# to read the home lat/lon/alt. Returns the value from the world file (PX4 SITL is otherwise
+# unusable without xmlstarlet: empty PX4_HOME_* makes px4 abort in std::stod).
+tag=""
+file=""
+for a in "$@"; do
+    case "$a" in
+        *latitude_deg*)  tag="latitude_deg" ;;
+        *longitude_deg*) tag="longitude_deg" ;;
+        *elevation*)     tag="elevation" ;;
+    esac
+    file="$a"
+done
+val=""
+if [ -n "$tag" ] && [ -f "$file" ]; then
+    val=$(grep -o "<${tag}>[^<]*</${tag}>" "$file" 2>/dev/null | head -n1 | sed "s/<[^>]*>//g")
+fi
+[ -n "$val" ] || val="0"
+echo "$val"
+"""
+
+
+def ensure_xmlstarlet_shim(out_dir):
+    """If xmlstarlet is missing, drop a shim and return its dir (to prepend to PATH); else None."""
+    if shutil.which("xmlstarlet"):
+        return None
+    shim_dir = os.path.join(out_dir, "_shim")
+    os.makedirs(shim_dir, exist_ok=True)
+    shim = os.path.join(shim_dir, "xmlstarlet")
+    with open(shim, "w") as f:
+        f.write(XMLSTARLET_SHIM)
+    os.chmod(shim, 0o755)
+    print("xmlstarlet not found; using shim at %s" % shim)
+    return shim_dir
+
+
+def launch_sitl(model, log_path, extra_path=None):
+    env = dict(os.environ)
+    env["HEADLESS"] = "1"          # no gzclient GUI
+    env["NO_PXH"] = "1"            # px4 -d : no interactive shell
+    env["PX4_NO_FOLLOW_MODE"] = "1"
+    env["DISPLAY"] = ""            # force gzserver fully headless (no X) -> no abort
+    if extra_path:
+        env["PATH"] = extra_path + os.pathsep + env.get("PATH", "")
+    logf = open(log_path, "wb")
+    proc = subprocess.Popen(
+        ["make", "px4_sitl_default", "gazebo-classic_%s" % model],
+        cwd=REPO, env=env, stdin=subprocess.DEVNULL,
+        stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+    return proc, logf
+
+
+def teardown_sitl(proc):
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            proc.wait(timeout=8)
+        except (ProcessLookupError, subprocess.TimeoutExpired):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    # safety net for anything the process group missed
+    for pat in ("gzserver", "gzclient"):
+        subprocess.run(["pkill", "-9", "-f", pat], stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-9", "-x", "px4"], stderr=subprocess.DEVNULL)
+    time.sleep(2)  # let ports / gazebo free up before the next instance
+
+
+def newest_ulog_since(t0):
+    best = None
+    for p in glob.glob(os.path.join(ROOTFS_LOG, "**", "*.ulg"), recursive=True):
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        if mt >= t0 - 1.0 and (best is None or mt > best[0]):
+            best = (mt, p)
+    return best[1] if best else None
+
+
+def tail(path, n=25):
+    try:
+        with open(path, "rb") as f:
+            return b"".join(f.readlines()[-n:]).decode("utf-8", "ignore")
+    except OSError:
+        return "(no log)"
+
+
+# --------------------------------------------------------------------------- #
+# one chirp run
+# --------------------------------------------------------------------------- #
+def run_one_chirp(name, args, common_params, shim_dir):
+    param_file = os.path.join(args.params_dir, name + ".params")
+    if not os.path.isfile(param_file):
+        print("[%s] SKIP: %s not found" % (name, param_file))
+        return None
+
+    chirp_params = parse_params_file(param_file)
+    chirp_T = float(dict(chirp_params).get("CA_CHIRP_T", 20.0))
+    sitl_log = os.path.join(args.out, name + ".sitl.log")
+
+    print("\n=== %s ===" % name)
+    print("[%s] launching headless SITL (%s) ..." % (name, args.model))
+    t0 = time.time()
+    proc, logf = launch_sitl(args.model, sitl_log, shim_dir)
+    master = None
+    ok = False
+    try:
+        master = mavutil.mavlink_connection(args.connect)
+        print("[%s] waiting for heartbeat on %s ..." % (name, args.connect))
+        if master.wait_heartbeat(timeout=args.boot_timeout) is None:
+            raise RuntimeError("no heartbeat within %ss (SITL boot failed?)" % args.boot_timeout)
+        print("[%s] connected to system %d; settling %.0fs" % (name, master.target_system, args.settle))
+        time.sleep(args.settle)
+
+        for nm, val in common_params:  # bench/failsafe params: best-effort
+            if not set_param(master, nm, val):
+                print("[%s]   WARN: could not set %s=%s (continuing)" % (name, nm, val))
+        for nm, val in chirp_params:    # CA_CHIRP_*: required
+            if not set_param(master, nm, val):
+                raise RuntimeError("failed to set %s=%s" % (nm, val))
+        print("[%s] applied chirp params (%d) + common (%d)" % (name, len(chirp_params), len(common_params)))
+        time.sleep(1.0)  # let control_allocator updateParams() pick up CA_CHIRP_*
+
+        # Arm in the default mode (the chirp overrides the controllers at the allocator, so the
+        # flight mode is irrelevant). Normal arm, retried while the EKF converges to a valid
+        # global position (commander requires it: "Global position required").
+        deadline = time.time() + args.arm_timeout
+        res = None
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            res = set_armed(master, True, force=False)
+            if res == 0:
+                break
+            if attempt == 1 or attempt % 4 == 0:
+                print("[%s] arm not accepted yet (MAV_RESULT=%s); waiting for GPS/EKF ..." % (name, res))
+            time.sleep(3.0)
+        if res != 0:
+            raise RuntimeError("arm not accepted within %.0fs (last MAV_RESULT=%s); "
+                               "see 'Preflight Fail' lines in the SITL log" % (args.arm_timeout, res))
+        print("[%s] ARMED — sweeping for %.0f + %.0fs margin" % (name, chirp_T, args.margin))
+        time.sleep(chirp_T + args.margin)
+
+        set_armed(master, False, force=True)
+        print("[%s] disarmed; flushing log %.0fs" % (name, args.flush))
+        time.sleep(args.flush)
+        ok = True
+    except Exception as exc:  # noqa: BLE001 - report and continue to next chirp
+        print("[%s] ERROR: %s" % (name, exc))
+        print("[%s] --- SITL log tail ---\n%s" % (name, tail(sitl_log)))
+    finally:
+        if master is not None:
+            master.close()
+        teardown_sitl(proc)
+        logf.close()
+
+    if not ok:
+        return None
+
+    ulg = newest_ulog_since(t0)
+    if ulg is None:
+        print("[%s] ERROR: no .ulg produced under %s" % (name, ROOTFS_LOG))
+        return None
+
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    dst = os.path.join(args.out, "%s_%s.ulg" % (name, stamp))
+    shutil.copy2(ulg, dst)
+    shutil.copy2(param_file, os.path.join(args.out, "%s_%s.params" % (name, stamp)))
+    print("[%s] saved %s" % (name, dst))
+    return dst
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="Run chirp system-ID sweeps in PX4 SITL, one ulog per chirp.")
+    ap.add_argument("--chirps", default="all",
+                    help="comma-separated subset of {%s} or 'all'" % ",".join(CHIRPS))
+    ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "logs"),
+                    help="output directory for ulogs (default: Tools/chirp_sysid/logs)")
+    ap.add_argument("--params-dir", default=os.path.join(os.path.dirname(__file__), "params"))
+    ap.add_argument("--connect", default="udpin:0.0.0.0:14540", help="pymavlink connection string")
+    ap.add_argument("--model", default="twinrotor_tailsitter", help="gazebo-classic model name")
+    ap.add_argument("--no-build", dest="build", action="store_false",
+                    help="skip the up-front 'make px4_sitl_default'")
+    ap.add_argument("--settle", type=float, default=10.0, help="seconds to settle after first heartbeat")
+    ap.add_argument("--margin", type=float, default=3.0, help="extra seconds armed after CA_CHIRP_T")
+    ap.add_argument("--flush", type=float, default=3.0, help="seconds after disarm before killing SITL")
+    ap.add_argument("--boot-timeout", type=float, default=90.0, help="seconds to wait for first heartbeat")
+    ap.add_argument("--arm-timeout", type=float, default=60.0,
+                    help="seconds to keep retrying arm while GPS/EKF converges")
+    args = ap.parse_args()
+    # Absolute paths: the shim dir is prepended to PATH and consumed by sitl_run.sh, which
+    # runs from a different cwd, so a relative entry would never resolve.
+    args.out = os.path.abspath(args.out)
+    args.params_dir = os.path.abspath(args.params_dir)
+
+    if args.chirps == "all":
+        chirps = list(CHIRPS)
+    else:
+        chirps = [c.strip() for c in args.chirps.split(",") if c.strip()]
+        bad = [c for c in chirps if c not in CHIRPS]
+        if bad:
+            sys.exit("unknown chirp(s): %s (valid: %s)" % (", ".join(bad), ", ".join(CHIRPS)))
+
+    os.makedirs(args.out, exist_ok=True)
+    shim_dir = ensure_xmlstarlet_shim(args.out)
+
+    if args.build:
+        print("Building px4_sitl_default (so SITL includes the chirp code) ...")
+        subprocess.run(["make", "px4_sitl_default"], cwd=REPO, check=True)
+
+    common_file = os.path.join(args.params_dir, "_common.params")
+    common_params = parse_params_file(common_file) if os.path.isfile(common_file) else []
+
+    results = {}
+    for name in chirps:
+        results[name] = run_one_chirp(name, args, common_params, shim_dir)
+
+    print("\n================ summary ================")
+    n_ok = 0
+    for name in chirps:
+        path = results[name]
+        if path:
+            n_ok += 1
+            print("  %-16s OK   %s" % (name, path))
+        else:
+            print("  %-16s FAIL (see %s/%s.sitl.log)" % (name, args.out, name))
+    print("%d/%d chirps produced a ulog" % (n_ok, len(chirps)))
+    sys.exit(0 if n_ok == len(chirps) else 1)
+
+
+if __name__ == "__main__":
+    main()

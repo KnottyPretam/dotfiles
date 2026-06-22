@@ -1,0 +1,37 @@
+---
+name: ekf-ned-reconstruction-tool
+description: "The ekf_ned_reconstruction.py tool (location, IMU sources incl. FIFO rebuild, key findings)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 3f439fb1-a1eb-4401-909a-0f9fd495f91a
+---
+
+`ekf_ned_reconstruction.py` reconstructs NED pos/vel via PX4 EKF2's strapdown predict step
+(`Ekf::predictState`) with NO Kalman correction, vs EKF (±3σ) and GPS. Now lives at
+**/home/choudhury/tools/dev/ekf_ned_reconstruction/** (user moved each tool into its own dir;
+`show_figure.py` → /home/choudhury/tools/dev/show_figure/). Writes per-log `<log>_<name>.{png,fig.pkl}`
+into `./ekfPosVel_figures/` (cwd): `ned_reconstruction`, `gps_drift`, and (FIFO path) `fifo_validation`.
+
+**IMU source `--imu-source {auto,vehicle_imu,fifo,sensor_combined}` (default auto).** Match by
+**device_id**, not topic index, and auto-detect the estimator instance (multi-EKF logs may only carry
+e.g. instance 1). auto: full-rate `vehicle_imu` if present, else **rebuild from raw FIFO**, else
+decimated `vehicle_imu`, else `sensor_combined` (warn — it's a different sensor-hub signal, bias
+mismatched). `sensor_combined` was the original wrong default that caused fake 89 km divergence.
+
+**FIFO→vehicle_imu rebuild** (when vehicle_imu absent/decimated) replicates the firmware EXACTLY:
+(1) per-message batch trapezoidal-MEAN of `sensor_*_fifo` (driver `updateFIFO`, board FRD — this
+low-passes the 8 kHz/4 kHz FIFO), (2) integrate over `IMU_INTEG_RATE` windows with **coning**
+(`IntegratorConing`), (3) calibrate: gyro `R·(rate−off)`, accel `R·((rate−off)·scale)`,
+`R=Dcm(Euler(SENS_BOARD_*_OFF))·get_rot_matrix(SENS_BOARD_ROT)` via the rot_lookup table.
+**Lesson:** omitting batch-mean + coning is fine on the ground but INFLATES divergence on
+vibrating airborne logs — they're essential. Always validate reconstructed≈logged `vehicle_imu`
+first; **a diverging recon is a bug signal until proven otherwise** (user directive).
+
+**Key flight findings:** (1) xtech ground survey is stationary — GPS *position* drifts ~6 m while
+Doppler + IMU say stationary (RTK position-domain drift; see `gps_drift` figure). (2) OD1A071 is an
+airborne hover with heavy motor vibration (gyro std ~0.2 rad/s); unaided gyro integration drifts
+~16°/10 s → gravity leak → km-scale position divergence = the real value of the EKF in flight
+(contrast: ground/xtech recon stays ~flat). State layout: quat=states[0:4] scalar-first, NED
+vel=4:7, pos=7:10; 3σ=3·√cov. Repo for PX4 source: /home/choudhury/repos/PX4-Autopilot (indexed in
+CodeGraphContext).

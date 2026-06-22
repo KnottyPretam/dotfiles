@@ -1,0 +1,100 @@
+# Plan: Reconstruct `vehicle_imu` from raw IMU FIFO (when vehicle_imu is absent/decimated)
+
+## Context
+
+`ekf_ned_reconstruction.py` already reconstructs NED pos/vel via PX4's strapdown predict step
+(`Ekf::predictState`) from the EKF's IMU input, overlays EKF (±3σ) and GPS, and emits two figures
+(`ned_reconstruction`, `gps_drift`) into `./ekfPosVel_figures/`. Default IMU source is `vehicle_imu`
+(verified: the multi-EKF consumes `vehicle_imu`, and its frozen bias only applies to that signal).
+
+**New need:** some logs don't log `vehicle_imu` (or log it heavily decimated, e.g. 1–2 Hz) but DO
+log the raw IMU FIFO (`sensor_gyro_fifo`/`sensor_accel_fifo`) at full rate (~8 kHz gyro / 4 kHz accel).
+When `vehicle_imu` is unusable, **recreate it from the FIFO exactly as the PX4 firmware does**
+(calibration + integration) so the strapdown gets a correct, full-rate IMU input in the EKF's body
+frame with the EKF bias applicable. Bonus: for FIFO logs this yields a *full-rate* recon even when
+the logged `vehicle_imu` is decimated.
+
+**Validation log:** `/home/choudhury/analysis/flight_tests/oddjob/oddjob_flight-test_05-23-26/OD1A071_pos_hold.ulg`
+— has `sensor_gyro_fifo`/`sensor_accel_fifo` [0,1,2] + a decimated `vehicle_imu[1]` (~2 Hz), so the
+FIFO reconstruction can be validated against the logged `vehicle_imu`.
+
+## PX4 FIFO→vehicle_imu pipeline (verified, file:line)
+
+- Driver `PX4Gyroscope/Accelerometer::updateFIFO` rotates raw samples chip→board (`rotate_3i`) and
+  publishes `sensor_*_fifo` already in **board FRD frame**. So logged FIFO = board FRD.
+- FIFO msg (`msg/SensorGyroFifo.msg`, `SensorAccelFifo.msg`): `scale` (counts→rad/s or m/s²), `dt`
+  (µs between samples, ~constant), `samples` (valid count ≤32), `x[32]/y[32]/z[32]` int16,
+  `device_id`, `timestamp_sample` (= **last** sample's time).
+- VehicleIMU integrates over `IMU_INTEG_RATE` windows (200 Hz → 5 ms), `src/modules/sensors/Integrator.hpp`:
+  - trapezoidal (accel): `delta += (val + last_val)*dt*0.5`
+  - gyro coning (`IntegratorConing`): `beta += 0.5*((last_alpha + last_delta_alpha/6) × delta_alpha)`;
+    output `delta_angle = alpha + beta`  (Integrator.hpp:176, :207)
+- Calibration applied AFTER integration (affine ⇒ equivalent), `VehicleIMU.cpp` ~544–560:
+  `rate = delta/dt; corrected = Correct(rate); delta_corrected = corrected*dt`.
+  - Gyro `Correct`: `R·(rate − thermal − offset)`  (Gyroscope.hpp:81) — no scale.
+  - Accel `Correct`: `R·((rate − thermal − offset) ⊙ scale)`  (Accelerometer.hpp:82)
+  - `R = Dcm(Euler(radians(SENS_BOARD_X/Y/Z_OFF))) · get_rot_matrix(SENS_BOARD_ROT)` for internal
+    sensors (`CAL_*_ROT=-1`)  (Gyroscope.cpp:124/173-176, Utilities.cpp:207-238).
+  - `get_rot_matrix(rot) = Dcm(Euler(radians(rot_lookup[rot].{roll,pitch,yaw})))`
+    (rotation.cpp:43); `rot_lookup` table at rotation.h:107 (idx 24 = PITCH_90 = `{0,90,0}`).
+  - Thermal comp OFF here (`TC_A_ENABLE=TC_G_ENABLE=0`) ⇒ `thermal = 0`.
+- **Everything matched by `device_id`, not topic index.** In OD1A071 the EKF instance is `[1]`
+  (gyro 6684714 / accel 6946858), but `sensor_gyro_fifo[0]` is device 3670026 — must select the
+  FIFO instance and `CAL_*n_*` params whose ID equals the EKF's IMU device.
+
+## Implementation (edit `ekf_ned_reconstruction.py`)
+
+1. **Rotation helpers** (replicate PX4 exactly): `ROT_LOOKUP` table transcribed from
+   `rotation.h:107-150` (≈40 rows of roll,pitch,yaw°); `euler_to_dcm(r,p,y)` (matrix 321 convention,
+   reuse existing scalar-first quat→dcm via Euler→quat); `rot_matrix_from_enum(rot)`;
+   `board_to_body_R(params) = euler_to_dcm(SENS_BOARD_*_OFF) @ rot_matrix_from_enum(SENS_BOARD_ROT)`.
+2. **Calibration lookup** `find_cal(params, device_id, kind)` → matching `CAL_{GYRO,ACC}n_*`
+   (offset[3], accel scale[3], rot) by `CAL_*n_ID == device_id`; build per-sensor R (board R unless
+   `CAL_*_ROT≥0`/external).
+3. **`_deltas_from_fifo(ulog, gyro_dev, accel_dev, params)`** returning `(t, dang, dvel, dt_ang, dt_vel)`:
+   - pick `sensor_gyro_fifo`/`sensor_accel_fifo` instance by device; flatten batches to per-sample
+     physical arrays `scale*raw` (board FRD) with per-sample timestamps `ts_sample-(n-1-k)*dt`
+     (reuse the reshaping pattern from `/home/choudhury/tools/dev/imu_vibe/analyze_imu_vibration.py`).
+   - integrate into `1/IMU_INTEG_RATE` (≈5 ms) windows: vectorized trapezoidal segment-sums for
+     `delta_angle_raw`/`delta_velocity_raw` + per-window `dt`; add gyro coning (vectorized cross
+     products; may be dropped if validation shows negligible contribution).
+   - apply calibration: `dang = R·(delta_angle_raw/dt − gyro_off)·dt`;
+     `dvel = R·((delta_velocity_raw/dt − acc_off)⊙acc_scale)·dt`.
+4. **Source selection** `--imu-source {auto, vehicle_imu, fifo, sensor_combined}`, default `auto`:
+   `vehicle_imu` if present at >50 Hz; **elif FIFO present (matching EKF device) → reconstruct**;
+   elif decimated `vehicle_imu` present → use it (warn); else `sensor_combined` (warn). EKF device
+   from `estimator_status[inst]`, fallback `vehicle_imu[inst]`.
+5. **FIFO validation**: when FIFO is used and a logged `vehicle_imu` for the same device exists,
+   print reconstructed-vs-logged RMS of `delta_angle/dt` and `delta_velocity/dt` at the logged
+   timestamps, and emit a `<log>_fifo_validation` figure (rates overlaid + error). `--validate-fifo`
+   forces it. (Reuses the `save_fig` helper → png + pickle, log-prefixed.)
+
+## Verification (end-to-end)
+
+**Guiding principle:** a *diverging* reconstructed position/velocity is a red flag for a BUG, not a
+true IMU characteristic — do NOT accept divergence at face value. If it diverges, stop and recheck
+each step against the source and inspect the actual plots + intermediates before concluding:
+per-sample physical units (scale), window `dt`, the `R_cal` rotation and resulting stationary
+gravity vector, calibration offsets/scale, device-id matching, and the reconstructed-vs-logged
+`vehicle_imu` overlap. Validate that **reconstructed `vehicle_imu` ≈ logged `vehicle_imu` FIRST**;
+only trust the downstream strapdown once that low-level match holds. (This is the same failure mode
+as the earlier `sensor_combined` mismatch, which looked like IMU divergence but was a wrong signal.)
+
+1. **Reconstruction matches firmware** — primary check. On OD1A071 with `--imu-source fifo`:
+   reconstructed `vehicle_imu` (device 6684714/6946858) vs logged `vehicle_imu[1]`: gyro-rate RMS
+   ≪ 1e-2 rad/s, accel RMS ≲ 0.05 m/s², near-zero mean. Inspect `fifo_validation` figure (traces overlap).
+2. **Frame/rotation correct** — with `SENS_BOARD_ROT=24` (PITCH_90) + `Y_OFF=-4°`, the reconstructed
+   stationary specific-force vector equals the logged `vehicle_imu` accel (gravity on the right axes).
+   A frame bug would be glaring at 90°.
+3. **Device matching** — confirm it selects the FIFO instances with device 6684714/6946858 and
+   `CAL_GYRO0`/`CAL_ACC0`, not index 0.
+4. **Full tool** — run OD1A071 with default `auto` (→ fifo, full rate): `ned_reconstruction` +
+   `gps_drift` figures produced and sensible; recon uses full-rate reconstructed IMU.
+5. **Regression** — xtech log (no FIFO) still works: `auto` → `vehicle_imu` (decimated note), both
+   figures unchanged.
+
+## Notes / out of scope
+- Coning is included for fidelity but contributes negligibly at low vibration; validation quantifies
+  it and it can be dropped if below tolerance.
+- External sensors (`CAL_*_ROT≥0`) use `get_rot_matrix(CAL_*_ROT)` instead of board rotation — handled
+  by `find_cal`, but this fleet is internal (`-1`).

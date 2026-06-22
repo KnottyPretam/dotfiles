@@ -1,0 +1,103 @@
+function P = identify_plant(u, y, t, fmin, fmax, np, nz, coh_cutoff)
+% Identify a transfer function from (u, y, t) via sysID_tool functions.
+% Returns struct P with fields:
+%   freq, mag_dB, phase, coh    -- frequency response (all coherence)
+%   freq_gated, mag_gated, phase_gated, coh_gated  -- after coherence > coh_cutoff
+%   num, den, tau               -- estimated TF coeffs + delay (or [] if skipped)
+%   tf                          -- tf object (or [] if skipped)
+%   ok                          -- true if TF fit succeeded
+%   reason                      -- text describing skip cause, if any
+
+P = struct('freq',[],'mag_dB',[],'phase',[],'coh',[], ...
+           'freq_gated',[],'mag_gated',[],'phase_gated',[],'coh_gated',[], ...
+           'num',[],'den',[],'tau',NaN,'tf',[],'tf_pade',[],'ok',false,'reason','');
+
+% Pre-close any stray figures so we can close the diagnostic ones cleanly after
+pre_figs = findall(0, 'Type', 'figure');
+
+% Trim inputs to a length that does not trip the off-by-one in
+% sysID_tool/estimate_freq_response's windowing (length must satisfy n >= 4*L
+% where L = round((n-1)/4) made even).
+[u, y, t] = trim_for_estimate(u, y, t);
+if numel(t) < 64
+    P.reason = sprintf('insufficient samples after safe-trim (n=%d)', numel(t));
+    return;
+end
+
+try
+    [mag_dB, phase_deg, freq_Hz, coh, ~, ~, ~, ~] = ...
+        estimate_freq_response(y, u, t, fmin, fmax);
+catch err
+    P.reason = sprintf('estimate_freq_response failed: %s', err.message);
+    cleanup_figs(pre_figs);
+    return;
+end
+
+cleanup_figs(pre_figs);
+
+P.freq   = freq_Hz(:);
+P.mag_dB = mag_dB(:);
+P.phase  = phase_deg(:);
+P.coh    = coh(:);
+
+idx = P.coh > coh_cutoff & isfinite(P.mag_dB) & isfinite(P.phase);
+if nnz(idx) < 6
+    P.reason = sprintf('only %d points above coherence %.2f', nnz(idx), coh_cutoff);
+    return;
+end
+
+P.freq_gated  = P.freq(idx);
+P.mag_gated   = P.mag_dB(idx);
+P.phase_gated = P.phase(idx);
+P.coh_gated   = P.coh(idx);
+
+% Silence fminsearch chatter from estimate_tf_from_freq_response by redirecting via evalc.
+try
+    [P.num, P.den, P.tau] = ...
+        silent_tf_fit(P.freq_gated, P.mag_gated, P.phase_gated, np, nz);
+    if any(~isfinite(P.num)) || any(~isfinite(P.den)) || ~isfinite(P.tau) || P.tau < 0
+        P.reason = 'TF fit returned non-finite or negative tau';
+        return;
+    end
+    P.tf = tf(P.num, P.den, 'InputDelay', P.tau);
+    if P.tau > 0
+        [npd, dpd] = pade(P.tau, 2);
+        P.tf_pade = tf(P.num, P.den) * tf(npd, dpd);
+    else
+        P.tf_pade = tf(P.num, P.den);
+    end
+    P.ok = true;
+catch err
+    P.reason = sprintf('estimate_tf_from_freq_response failed: %s', err.message);
+end
+end
+
+function [num, den, tau] = silent_tf_fit(f, g, p, np, nz) %#ok<INUSD>
+[~, num, den, tau] = evalc('estimate_tf_from_freq_response(f, g, p, np, nz)');
+end
+
+function cleanup_figs(pre_figs)
+post_figs = findall(0, 'Type', 'figure');
+new_figs = setdiff(post_figs, pre_figs);
+if ~isempty(new_figs)
+    close(new_figs);
+end
+end
+
+function [u, y, t] = trim_for_estimate(u, y, t)
+% Decrement n until the windowing inside estimate_freq_response/compute_psd
+% does not over-index. The function uses L = round((n-1)/4), then makes L
+% even, num_win = 7, and reads y(il:ih) with ih = 1 + round(L*6/2) + L - 1 = 4*L.
+n = numel(t);
+while n > 64
+    L = round((n-1)/4);
+    if mod(L, 2); L = L - 1; end
+    if n >= 4*L
+        break;
+    end
+    n = n - 1;
+end
+u = u(1:n);
+y = y(1:n);
+t = t(1:n);
+end

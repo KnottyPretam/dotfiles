@@ -1,0 +1,1116 @@
+#!/usr/bin/env python3
+"""
+Offline reduced PX4-style IMU/MAG EKF replay tool.
+
+This tool reads a PX4 ULog, replays the IMU and magnetometer streams offline,
+and estimates:
+ - attitude (quaternion + roll/pitch/yaw)
+ - local velocity (NED)
+ - local position (NED)
+ - IMU gyro bias
+ - IMU accel bias
+
+It is designed to be practical for log analysis from Python, not to be a
+bit-for-bit replacement for the full PX4 EKF2 C++ implementation. It uses:
+ - the PX4-style integrated IMU deltas from `vehicle_imu` when available
+   because those deltas already contain PX4's IMU preconditioning before EKF2
+ - optional reconstruction of gyro `delta_angle` from raw `sensor_gyro`,
+   including PX4-style trapezoidal integration, coning correction, and
+   static gyro calibration before the EKF replay
+ - a reduced 15-state inertial error-state EKF
+ - magnetometer updates for yaw observability
+ - gravity and static updates for tilt/bias stabilization
+ - optional baro fusion for vertical position stabilization
+
+Dependencies:
+ - numpy
+ - pyulog
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from pyulog import ULog
+import scipy.io as sio
+
+
+NED_GRAVITY = np.array([0.0, 0.0, 9.80665], dtype=float)
+PX4_MAX_SENSOR_COUNT = 4
+PX4_INTEGRATOR_DT_MIN_S = 1e-6
+PX4_INTEGRATOR_DT_MAX_S = float(np.iinfo(np.uint16).max) * 1e-6
+PX4_ROTATIONS_DEG: list[tuple[float, float, float]] = [
+    (0.0, 0.0, 0.0),
+    (0.0, 0.0, 45.0),
+    (0.0, 0.0, 90.0),
+    (0.0, 0.0, 135.0),
+    (0.0, 0.0, 180.0),
+    (0.0, 0.0, 225.0),
+    (0.0, 0.0, 270.0),
+    (0.0, 0.0, 315.0),
+    (180.0, 0.0, 0.0),
+    (180.0, 0.0, 45.0),
+    (180.0, 0.0, 90.0),
+    (180.0, 0.0, 135.0),
+    (0.0, 180.0, 0.0),
+    (180.0, 0.0, 225.0),
+    (180.0, 0.0, 270.0),
+    (180.0, 0.0, 315.0),
+    (90.0, 0.0, 0.0),
+    (90.0, 0.0, 45.0),
+    (90.0, 0.0, 90.0),
+    (90.0, 0.0, 135.0),
+    (270.0, 0.0, 0.0),
+    (270.0, 0.0, 45.0),
+    (270.0, 0.0, 90.0),
+    (270.0, 0.0, 135.0),
+    (0.0, 90.0, 0.0),
+    (0.0, 270.0, 0.0),
+    (0.0, 180.0, 90.0),
+    (0.0, 180.0, 270.0),
+    (90.0, 90.0, 0.0),
+    (180.0, 90.0, 0.0),
+    (270.0, 90.0, 0.0),
+    (90.0, 180.0, 0.0),
+    (270.0, 180.0, 0.0),
+    (90.0, 270.0, 0.0),
+    (180.0, 270.0, 0.0),
+    (270.0, 270.0, 0.0),
+    (90.0, 180.0, 90.0),
+    (90.0, 0.0, 270.0),
+    (90.0, 68.0, 293.0),
+    (0.0, 315.0, 0.0),
+    (90.0, 315.0, 0.0),
+    (0.0, 225.0, 0.0),
+    (180.0, 45.0, 0.0),
+    (0.0, 90.0, 180.0),
+]
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    return np.array([
+        [0.0, -v[2], v[1]],
+        [v[2], 0.0, -v[0]],
+        [-v[1], v[0], 0.0],
+    ], dtype=float)
+
+
+def _norm(v: np.ndarray) -> float:
+    return float(np.linalg.norm(v))
+
+
+def _normalize(v: np.ndarray, eps: float = 1e-9) -> np.ndarray:
+    n = _norm(v)
+    if n < eps:
+        return np.zeros_like(v)
+    return v / n
+
+
+def _quat_normalize(q: np.ndarray) -> np.ndarray:
+    n = np.linalg.norm(q)
+    if n <= 0.0:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+    return q / n
+
+
+def _quat_multiply(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dtype=float)
+
+
+def _quat_from_rotvec(rotvec: np.ndarray) -> np.ndarray:
+    angle = _norm(rotvec)
+
+    if angle < 1e-12:
+        half = 0.5 * rotvec
+        return _quat_normalize(np.array([1.0, half[0], half[1], half[2]], dtype=float))
+
+    axis = rotvec / angle
+    half_angle = 0.5 * angle
+    s = math.sin(half_angle)
+    return np.array([math.cos(half_angle), axis[0] * s, axis[1] * s, axis[2] * s], dtype=float)
+
+
+def _quat_to_rotmat(q: np.ndarray) -> np.ndarray:
+    q = _quat_normalize(q)
+    w, x, y, z = q
+
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+    ], dtype=float)
+
+
+def _quat_to_euler(q: np.ndarray) -> np.ndarray:
+    q = _quat_normalize(q)
+    w, x, y, z = q
+
+    roll = math.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    sinp = 2.0 * (w * y - z * x)
+    pitch = math.asin(max(-1.0, min(1.0, sinp)))
+    yaw = math.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+    return np.array([roll, pitch, yaw], dtype=float)
+
+
+def _quat_from_rotmat(R: np.ndarray) -> np.ndarray:
+    trace = float(np.trace(R))
+
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (R[2, 1] - R[1, 2]) / s
+        y = (R[0, 2] - R[2, 0]) / s
+        z = (R[1, 0] - R[0, 1]) / s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = math.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        w = (R[2, 1] - R[1, 2]) / s
+        x = 0.25 * s
+        y = (R[0, 1] + R[1, 0]) / s
+        z = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = math.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        w = (R[0, 2] - R[2, 0]) / s
+        x = (R[0, 1] + R[1, 0]) / s
+        y = 0.25 * s
+        z = (R[1, 2] + R[2, 1]) / s
+    else:
+        s = math.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+        w = (R[1, 0] - R[0, 1]) / s
+        x = (R[0, 2] + R[2, 0]) / s
+        y = (R[1, 2] + R[2, 1]) / s
+        z = 0.25 * s
+
+    return _quat_normalize(np.array([w, x, y, z], dtype=float))
+
+
+def _rotmat_from_euler(roll_rad: float, pitch_rad: float, yaw_rad: float) -> np.ndarray:
+    sr = math.sin(roll_rad)
+    cr = math.cos(roll_rad)
+    sp = math.sin(pitch_rad)
+    cp = math.cos(pitch_rad)
+    sy = math.sin(yaw_rad)
+    cy = math.cos(yaw_rad)
+
+    return np.array([
+        [cp * cy, sr * sp * cy - cr * sy, cr * sp * cy + sr * sy],
+        [cp * sy, sr * sp * sy + cr * cy, cr * sp * sy - sr * cy],
+        [-sp, sr * cp, cr * cp],
+    ], dtype=float)
+
+
+def _px4_rotation_matrix(rotation: int) -> np.ndarray:
+    if rotation < 0 or rotation >= len(PX4_ROTATIONS_DEG):
+        return np.eye(3, dtype=float)
+
+    roll_deg, pitch_deg, yaw_deg = PX4_ROTATIONS_DEG[rotation]
+    return _rotmat_from_euler(
+        math.radians(roll_deg),
+        math.radians(pitch_deg),
+        math.radians(yaw_deg),
+    )
+
+
+def _initial_attitude_from_accel_mag(accel_body: np.ndarray, mag_body: np.ndarray | None) -> np.ndarray:
+    down_b = _normalize(-accel_body)
+    if _norm(down_b) < 1e-6:
+        return np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+
+    if mag_body is None or _norm(mag_body) < 1e-6:
+        north_guess = np.array([1.0, 0.0, 0.0], dtype=float)
+
+        if abs(float(np.dot(down_b, north_guess))) > 0.95:
+            north_guess = np.array([0.0, 1.0, 0.0], dtype=float)
+
+        north_b = _normalize(north_guess - down_b * float(np.dot(down_b, north_guess)))
+
+    else:
+        mag_b = _normalize(mag_body)
+        north_b = _normalize(mag_b - down_b * float(np.dot(down_b, mag_b)))
+
+        if _norm(north_b) < 1e-6:
+            north_b = np.array([1.0, 0.0, 0.0], dtype=float)
+
+    east_b = _normalize(np.cross(down_b, north_b))
+    north_b = _normalize(np.cross(east_b, down_b))
+
+    R_bn = np.column_stack((north_b, east_b, down_b))
+    R_nb = R_bn.T
+    return _quat_from_rotmat(R_nb)
+
+
+def _get_dataset_optional(ulog: ULog, name: str, instance: int = 0) -> Any | None:
+    try:
+        return ulog.get_dataset(name, instance).data
+    except Exception:
+        return None
+
+
+def _get_dataset_by_device_id(ulog: ULog, name: str, device_id: int) -> Any | None:
+    for dataset in ulog.data_list:
+        if dataset.name != name:
+            continue
+
+        data = dataset.data
+
+        if "device_id" in data and len(data["device_id"]) > 0 and int(data["device_id"][0]) == device_id:
+            return data
+
+    return None
+
+
+def _field(data: Any, *names: str) -> np.ndarray:
+    for name in names:
+        if name in data:
+            return np.asarray(data[name], dtype=float)
+
+    raise KeyError(f"missing field; tried {names}")
+
+
+def _ulog_param_float(initial_parameters: dict[str, Any], name: str, default: float = 0.0) -> float:
+    value = initial_parameters.get(name, default)
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _ulog_param_int(initial_parameters: dict[str, Any], name: str, default: int = 0) -> int:
+    value = initial_parameters.get(name, default)
+
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _find_calibration_index(initial_parameters: dict[str, Any], sensor_type: str, device_id: int) -> int | None:
+    for index in range(PX4_MAX_SENSOR_COUNT):
+        if _ulog_param_int(initial_parameters, f"CAL_{sensor_type}{index}_ID") == device_id:
+            return index
+
+    return None
+
+
+def _board_level_adjustment_matrix(initial_parameters: dict[str, Any]) -> np.ndarray:
+    return _rotmat_from_euler(
+        math.radians(_ulog_param_float(initial_parameters, "SENS_BOARD_X_OFF")),
+        math.radians(_ulog_param_float(initial_parameters, "SENS_BOARD_Y_OFF")),
+        math.radians(_ulog_param_float(initial_parameters, "SENS_BOARD_Z_OFF")),
+    )
+
+
+@dataclass
+class PolynomialThermalCompensation3D:
+    reference_temperature_c: float
+    min_temperature_c: float
+    max_temperature_c: float
+    x0: np.ndarray
+    x1: np.ndarray
+    x2: np.ndarray
+    x3: np.ndarray
+
+    def offset(self, temperature_c: float) -> np.ndarray:
+        if not math.isfinite(temperature_c):
+            return np.zeros(3, dtype=float)
+
+        clipped_temperature = min(max(temperature_c, self.min_temperature_c), self.max_temperature_c)
+        delta_temperature = clipped_temperature - self.reference_temperature_c
+        delta_temperature_2 = delta_temperature * delta_temperature
+        delta_temperature_3 = delta_temperature_2 * delta_temperature
+
+        return (
+            self.x0
+            + self.x1 * delta_temperature
+            + self.x2 * delta_temperature_2
+            + self.x3 * delta_temperature_3
+        )
+
+
+@dataclass
+class GyroCalibration:
+    rotation: np.ndarray
+    offset: np.ndarray
+    thermal_compensation: PolynomialThermalCompensation3D | None
+
+    def correct(self, data: np.ndarray, temperature_c: float | None = None) -> np.ndarray:
+        thermal_offset = np.zeros(3, dtype=float)
+
+        if self.thermal_compensation is not None and temperature_c is not None:
+            thermal_offset = self.thermal_compensation.offset(float(temperature_c))
+
+        return self.rotation @ (data - thermal_offset - self.offset)
+
+
+class Px4ConingIntegrator:
+    def __init__(self) -> None:
+        self.alpha = np.zeros(3, dtype=float)
+        self.last_val = np.zeros(3, dtype=float)
+        self.integral_dt = 0.0
+        self.integrated_samples = 0
+        self.beta = np.zeros(3, dtype=float)
+        self.last_delta_alpha = np.zeros(3, dtype=float)
+        self.last_alpha = np.zeros(3, dtype=float)
+
+    def _integrate(self, val: np.ndarray, dt: float) -> np.ndarray:
+        self.integrated_samples += 1
+        self.integral_dt += dt
+        delta_alpha = (val + self.last_val) * dt * 0.5
+        self.last_val = val.copy()
+        return delta_alpha
+
+    def _reset_integral(self) -> None:
+        self.alpha.fill(0.0)
+        self.integral_dt = 0.0
+        self.integrated_samples = 0
+
+    def put(self, val: np.ndarray, dt: float) -> None:
+        if PX4_INTEGRATOR_DT_MIN_S < dt and self.integral_dt + dt < PX4_INTEGRATOR_DT_MAX_S:
+            delta_alpha = self._integrate(val, dt)
+            self.beta += np.cross(self.last_alpha + self.last_delta_alpha * (1.0 / 6.0), delta_alpha) * 0.5
+            self.last_delta_alpha = delta_alpha
+            self.last_alpha = self.alpha.copy()
+            self.alpha += delta_alpha
+
+        else:
+            self._reset_integral()
+            self.beta.fill(0.0)
+            self.last_alpha.fill(0.0)
+            self.last_val = val.copy()
+
+    def extract_and_reset(self) -> tuple[np.ndarray, float]:
+        if self.integrated_samples == 0:
+            return np.zeros(3, dtype=float), 0.0
+
+        integral = self.alpha.copy() + self.beta
+        integral_dt = self.integral_dt
+        self._reset_integral()
+        self.beta.fill(0.0)
+        self.last_alpha.fill(0.0)
+        return integral, integral_dt
+
+
+def _build_gyro_thermal_compensation(initial_parameters: dict[str, Any], device_id: int) -> PolynomialThermalCompensation3D | None:
+    if _ulog_param_int(initial_parameters, "TC_G_ENABLE", 0) != 1:
+        return None
+
+    for index in range(PX4_MAX_SENSOR_COUNT):
+        if _ulog_param_int(initial_parameters, f"TC_G{index}_ID", 0) != device_id:
+            continue
+
+        return PolynomialThermalCompensation3D(
+            reference_temperature_c=_ulog_param_float(initial_parameters, f"TC_G{index}_TREF", 25.0),
+            min_temperature_c=_ulog_param_float(initial_parameters, f"TC_G{index}_TMIN", 0.0),
+            max_temperature_c=_ulog_param_float(initial_parameters, f"TC_G{index}_TMAX", 100.0),
+            x0=np.array([
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X0_0", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X0_1", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X0_2", 0.0),
+            ], dtype=float),
+            x1=np.array([
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X1_0", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X1_1", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X1_2", 0.0),
+            ], dtype=float),
+            x2=np.array([
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X2_0", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X2_1", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X2_2", 0.0),
+            ], dtype=float),
+            x3=np.array([
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X3_0", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X3_1", 0.0),
+                _ulog_param_float(initial_parameters, f"TC_G{index}_X3_2", 0.0),
+            ], dtype=float),
+        )
+
+    return None
+
+
+def _build_gyro_calibration(initial_parameters: dict[str, Any], device_id: int) -> GyroCalibration:
+    calibration_index = _find_calibration_index(initial_parameters, "GYRO", device_id)
+    board_rotation = _ulog_param_int(initial_parameters, "SENS_BOARD_ROT", 0)
+    level_adjustment = _board_level_adjustment_matrix(initial_parameters)
+
+    if calibration_index is None:
+        sensor_rotation = board_rotation
+        offset = np.zeros(3, dtype=float)
+
+    else:
+        calibration_rotation = _ulog_param_int(initial_parameters, f"CAL_GYRO{calibration_index}_ROT", -1)
+        sensor_rotation = board_rotation if calibration_rotation < 0 else calibration_rotation
+        offset = np.array([
+            _ulog_param_float(initial_parameters, f"CAL_GYRO{calibration_index}_XOFF", 0.0),
+            _ulog_param_float(initial_parameters, f"CAL_GYRO{calibration_index}_YOFF", 0.0),
+            _ulog_param_float(initial_parameters, f"CAL_GYRO{calibration_index}_ZOFF", 0.0),
+        ], dtype=float)
+
+    rotation = level_adjustment @ _px4_rotation_matrix(sensor_rotation)
+
+    return GyroCalibration(
+        rotation=rotation,
+        offset=offset,
+        thermal_compensation=_build_gyro_thermal_compensation(initial_parameters, device_id),
+    )
+
+
+def _reconstruct_vehicle_imu_gyro_delta_angle(
+    ulog: ULog,
+    vehicle_imu_data: Any,
+    gyro_device_id: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    sensor_gyro = _get_dataset_by_device_id(ulog, "sensor_gyro", gyro_device_id)
+
+    if sensor_gyro is None:
+        raise RuntimeError(f"sensor_gyro for device {gyro_device_id} not found")
+
+    gyro_timestamp = _field(sensor_gyro, "timestamp_sample", "timestamp")
+    gyro_rate = np.column_stack((
+        _field(sensor_gyro, "x"),
+        _field(sensor_gyro, "y"),
+        _field(sensor_gyro, "z"),
+    ))
+    gyro_temperature = _field(sensor_gyro, "temperature") if "temperature" in sensor_gyro else np.full(len(gyro_timestamp), np.nan)
+
+    if len(gyro_timestamp) < 2:
+        raise RuntimeError("sensor_gyro stream has insufficient samples to reconstruct coning-corrected delta angle")
+
+    raw_gyro_interval_us = float(np.median(np.diff(gyro_timestamp)))
+    vehicle_imu_interval_us = float(np.median(_field(vehicle_imu_data, "delta_angle_dt")))
+
+    if raw_gyro_interval_us > vehicle_imu_interval_us * 1.5:
+        raise RuntimeError(
+            "sensor_gyro is logged too sparsely to reconstruct vehicle_imu delta_angle; "
+            "use logged vehicle_imu or log raw-rate IMU/FIFO topics"
+        )
+
+    gyro_calibration = _build_gyro_calibration(ulog.initial_parameters, gyro_device_id)
+    reference_timestamp = _field(vehicle_imu_data, "timestamp_sample", "timestamp")
+
+    delta_angle_corrected = np.zeros((len(reference_timestamp), 3), dtype=float)
+    delta_angle_dt_us = np.zeros(len(reference_timestamp), dtype=float)
+
+    integrator = Px4ConingIntegrator()
+    integrator.last_val = gyro_rate[0].copy()
+    last_timestamp = float(gyro_timestamp[0])
+    gyro_index = 0
+    last_temperature = float(gyro_temperature[0]) if len(gyro_temperature) > 0 else float("nan")
+
+    for i, window_end_timestamp in enumerate(reference_timestamp):
+        window_end_timestamp = float(window_end_timestamp)
+
+        while gyro_index + 1 < len(gyro_timestamp) and float(gyro_timestamp[gyro_index + 1]) <= window_end_timestamp:
+            gyro_index += 1
+            dt = (float(gyro_timestamp[gyro_index]) - last_timestamp) * 1e-6
+            integrator.put(gyro_rate[gyro_index], dt)
+            last_timestamp = float(gyro_timestamp[gyro_index])
+            last_temperature = float(gyro_temperature[gyro_index])
+
+        delta_angle_raw, dt_s = integrator.extract_and_reset()
+
+        if dt_s <= 0.0:
+            continue
+
+        angular_rate_raw = delta_angle_raw / dt_s
+        angular_rate_corrected = gyro_calibration.correct(angular_rate_raw, last_temperature)
+        delta_angle_corrected[i] = angular_rate_corrected * dt_s
+        delta_angle_dt_us[i] = round(dt_s * 1e6)
+
+    return delta_angle_corrected, delta_angle_dt_us
+
+
+def _apply_px4_gyro_preconditioning(
+    ulog: ULog,
+    imu: dict[str, np.ndarray],
+    gyro_preprocess_mode: str,
+) -> dict[str, np.ndarray]:
+    if gyro_preprocess_mode == "logged":
+        return imu
+
+    vehicle_imu_data = imu.get("vehicle_imu_reference")
+    gyro_device_id = imu.get("gyro_device_id")
+
+    if vehicle_imu_data is None or gyro_device_id is None:
+        if gyro_preprocess_mode == "reconstruct":
+            raise RuntimeError("gyro reconstruction requires a vehicle_imu stream with gyro_device_id metadata")
+
+        return imu
+
+    try:
+        reconstructed_delta_angle, reconstructed_dt_us = _reconstruct_vehicle_imu_gyro_delta_angle(
+            ulog=ulog,
+            vehicle_imu_data=vehicle_imu_data,
+            gyro_device_id=int(gyro_device_id),
+        )
+    except Exception:
+        if gyro_preprocess_mode == "reconstruct":
+            raise
+
+        return imu
+
+    reconstructed_mask = reconstructed_dt_us > 0.0
+
+    if not np.any(reconstructed_mask):
+        if gyro_preprocess_mode == "reconstruct":
+            raise RuntimeError("gyro reconstruction produced no valid coning-corrected windows")
+
+        return imu
+
+    updated_imu = dict(imu)
+    updated_imu["delta_angle"] = np.array(imu["delta_angle"], copy=True)
+    updated_imu["delta_angle_dt_us"] = np.array(imu["delta_angle_dt_us"], copy=True)
+    updated_imu["delta_angle"][reconstructed_mask] = reconstructed_delta_angle[reconstructed_mask]
+    updated_imu["delta_angle_dt_us"][reconstructed_mask] = reconstructed_dt_us[reconstructed_mask]
+    return updated_imu
+
+
+def _load_imu_series(ulog: ULog, instance: int = 0) -> dict[str, np.ndarray]:
+    vehicle_imu = _get_dataset_optional(ulog, "vehicle_imu", instance)
+
+    if vehicle_imu is not None:
+        delta_angle = np.column_stack((
+            _field(vehicle_imu, "delta_angle[0]"),
+            _field(vehicle_imu, "delta_angle[1]"),
+            _field(vehicle_imu, "delta_angle[2]"),
+        ))
+        delta_velocity = np.column_stack((
+            _field(vehicle_imu, "delta_velocity[0]"),
+            _field(vehicle_imu, "delta_velocity[1]"),
+            _field(vehicle_imu, "delta_velocity[2]"),
+        ))
+        return {
+            "source": np.array(["vehicle_imu"]),
+            "timestamp": _field(vehicle_imu, "timestamp_sample", "timestamp"),
+            "delta_angle": delta_angle,
+            "delta_velocity": delta_velocity,
+            "delta_angle_dt_us": _field(vehicle_imu, "delta_angle_dt"),
+            "delta_velocity_dt_us": _field(vehicle_imu, "delta_velocity_dt"),
+            "gyro_device_id": int(_field(vehicle_imu, "gyro_device_id")[0]),
+            "accel_device_id": int(_field(vehicle_imu, "accel_device_id")[0]),
+            "vehicle_imu_reference": vehicle_imu,
+        }
+
+    sensor_combined = _get_dataset_optional(ulog, "sensor_combined", instance)
+
+    if sensor_combined is None:
+        raise RuntimeError("neither vehicle_imu nor sensor_combined exists in the ULog")
+
+    gyro_dt_us = _field(sensor_combined, "gyro_integral_dt")
+    accel_dt_us = _field(sensor_combined, "accelerometer_integral_dt")
+
+    gyro = np.column_stack((
+        _field(sensor_combined, "gyro_rad[0]"),
+        _field(sensor_combined, "gyro_rad[1]"),
+        _field(sensor_combined, "gyro_rad[2]"),
+    ))
+    accel = np.column_stack((
+        _field(sensor_combined, "accelerometer_m_s2[0]"),
+        _field(sensor_combined, "accelerometer_m_s2[1]"),
+        _field(sensor_combined, "accelerometer_m_s2[2]"),
+    ))
+
+    delta_angle = gyro * (gyro_dt_us[:, None] * 1e-6)
+    delta_velocity = accel * (accel_dt_us[:, None] * 1e-6)
+
+    return {
+        "source": np.array(["sensor_combined"]),
+        "timestamp": _field(sensor_combined, "timestamp"),
+        "delta_angle": delta_angle,
+        "delta_velocity": delta_velocity,
+        "delta_angle_dt_us": gyro_dt_us,
+        "delta_velocity_dt_us": accel_dt_us,
+    }
+
+
+def _load_mag_series(ulog: ULog, instance: int = 0) -> dict[str, np.ndarray]:
+    vehicle_mag = _get_dataset_optional(ulog, "vehicle_magnetometer", instance)
+
+    if vehicle_mag is not None:
+        mag = np.column_stack((
+            _field(vehicle_mag, "magnetometer_ga[0]"),
+            _field(vehicle_mag, "magnetometer_ga[1]"),
+            _field(vehicle_mag, "magnetometer_ga[2]"),
+        ))
+        return {
+            "timestamp": _field(vehicle_mag, "timestamp_sample", "timestamp"),
+            "mag": mag,
+        }
+
+    sensor_mag = _get_dataset_optional(ulog, "sensor_mag", instance)
+    if sensor_mag is None:
+        raise RuntimeError("neither vehicle_magnetometer nor sensor_mag exists in the ULog")
+
+    mag = np.column_stack((
+        _field(sensor_mag, "x"),
+        _field(sensor_mag, "y"),
+        _field(sensor_mag, "z"),
+    ))
+    return {
+        "timestamp": _field(sensor_mag, "timestamp_sample", "timestamp"),
+        "mag": mag,
+    }
+
+
+def _load_baro_series(ulog: ULog, instance: int = 0) -> dict[str, np.ndarray] | None:
+    air_data = _get_dataset_optional(ulog, "vehicle_air_data", instance)
+
+    if air_data is None:
+        return None
+
+    return {
+        "timestamp": _field(air_data, "timestamp_sample", "timestamp"),
+        "alt": _field(air_data, "baro_alt_meter"),
+    }
+
+
+@dataclass
+class OfflineEkfConfig:
+    gravity_m_s2: float = 9.80665
+    gyro_noise_rad_s: float = 0.02
+    accel_noise_m_s2: float = 0.35
+    gyro_bias_rw_rad_s2: float = 1.0e-4
+    accel_bias_rw_m_s3: float = 2.5e-3
+    mag_noise: float = 0.08
+    gravity_dir_noise: float = 0.06
+    static_accel_noise_m_s2: float = 0.30
+    static_gyro_noise_rad_s: float = 0.02
+    zupt_noise_m_s: float = 0.05
+    baro_noise_m: float = 1.5
+    static_gyro_threshold_rad_s: float = 0.08
+    static_accel_threshold_m_s2: float = 0.75
+    gravity_update_accel_threshold_m_s2: float = 1.5
+    init_window_s: float = 0.5
+    max_propagation_dt_s: float = 0.05
+
+
+class ReducedImuMagEkf:
+    def __init__(self, config: OfflineEkfConfig) -> None:
+        self.config = config
+        self.q_nb = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        self.vel_n = np.zeros(3, dtype=float)
+        self.pos_n = np.zeros(3, dtype=float)
+        self.gyro_bias = np.zeros(3, dtype=float)
+        self.accel_bias = np.zeros(3, dtype=float)
+        self.mag_ref_n = np.array([1.0, 0.0, 0.0], dtype=float)
+        self.mag_ref_valid = False
+        self.P = np.diag([
+            0.25, 0.25, 0.25,
+            1.0, 1.0, 1.0,
+            1.0, 1.0, 1.0,
+            0.01, 0.01, 0.01,
+            0.25, 0.25, 0.25,
+        ]).astype(float)
+
+    def initialize(self, accel_body: np.ndarray, gyro_body: np.ndarray, mag_body: np.ndarray | None) -> None:
+        self.q_nb = _initial_attitude_from_accel_mag(accel_body, mag_body)
+
+        if _norm(gyro_body) < 1.0:
+            self.gyro_bias = gyro_body.copy()
+
+        R_nb = _quat_to_rotmat(self.q_nb)
+        pred_static_specific_force_b = -R_nb.T @ NED_GRAVITY
+        self.accel_bias = accel_body - pred_static_specific_force_b
+
+        if mag_body is not None and _norm(mag_body) > 1e-6:
+            self.mag_ref_n = _normalize(R_nb @ _normalize(mag_body))
+            self.mag_ref_valid = True
+
+    def _inject(self, dx: np.ndarray) -> None:
+        dq = _quat_from_rotvec(dx[0:3])
+        self.q_nb = _quat_normalize(_quat_multiply(self.q_nb, dq))
+        self.vel_n = self.vel_n + dx[3:6]
+        self.pos_n = self.pos_n + dx[6:9]
+        self.gyro_bias = self.gyro_bias + dx[9:12]
+        self.accel_bias = self.accel_bias + dx[12:15]
+
+    def _update(self, residual: np.ndarray, H: np.ndarray, R: np.ndarray) -> None:
+        S = H @ self.P @ H.T + R
+
+        try:
+            K = self.P @ H.T @ np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            return
+
+        dx = K @ residual
+        self._inject(dx)
+
+        I = np.eye(self.P.shape[0])
+        self.P = (I - K @ H) @ self.P @ (I - K @ H).T + K @ R @ K.T
+        self.P = 0.5 * (self.P + self.P.T)
+
+    def propagate(self, delta_angle: np.ndarray, delta_velocity: np.ndarray, gyro_dt_s: float, accel_dt_s: float) -> None:
+        if gyro_dt_s <= 0.0 or accel_dt_s <= 0.0:
+            return
+
+        if gyro_dt_s > self.config.max_propagation_dt_s or accel_dt_s > self.config.max_propagation_dt_s:
+            return
+
+        ang_rate_b = delta_angle / gyro_dt_s - self.gyro_bias
+        spec_force_b = delta_velocity / accel_dt_s - self.accel_bias
+
+        q_prev = self.q_nb.copy()
+        v_prev = self.vel_n.copy()
+
+        dq = _quat_from_rotvec(ang_rate_b * gyro_dt_s)
+        self.q_nb = _quat_normalize(_quat_multiply(self.q_nb, dq))
+
+        R_nb = _quat_to_rotmat(self.q_nb)
+        accel_n = R_nb @ spec_force_b + np.array([0.0, 0.0, self.config.gravity_m_s2], dtype=float)
+
+        self.vel_n = self.vel_n + accel_n * accel_dt_s
+        self.pos_n = self.pos_n + v_prev * accel_dt_s + 0.5 * accel_n * accel_dt_s * accel_dt_s
+
+        dt = max(gyro_dt_s, accel_dt_s)
+        F = np.zeros((15, 15), dtype=float)
+        F[0:3, 0:3] = -_skew(ang_rate_b)
+        F[0:3, 9:12] = -np.eye(3)
+        F[3:6, 0:3] = -R_nb @ _skew(spec_force_b)
+        F[3:6, 12:15] = -R_nb
+        F[6:9, 3:6] = np.eye(3)
+
+        Phi = np.eye(15) + F * dt
+
+        q_diag = np.array([
+            self.config.gyro_noise_rad_s ** 2,
+            self.config.gyro_noise_rad_s ** 2,
+            self.config.gyro_noise_rad_s ** 2,
+            self.config.accel_noise_m_s2 ** 2,
+            self.config.accel_noise_m_s2 ** 2,
+            self.config.accel_noise_m_s2 ** 2,
+            0.0,
+            0.0,
+            0.0,
+            self.config.gyro_bias_rw_rad_s2 ** 2,
+            self.config.gyro_bias_rw_rad_s2 ** 2,
+            self.config.gyro_bias_rw_rad_s2 ** 2,
+            self.config.accel_bias_rw_m_s3 ** 2,
+            self.config.accel_bias_rw_m_s3 ** 2,
+            self.config.accel_bias_rw_m_s3 ** 2,
+        ], dtype=float)
+        Q = np.diag(q_diag) * dt
+
+        self.P = Phi @ self.P @ Phi.T + Q
+        self.P = 0.5 * (self.P + self.P.T)
+
+        if not np.all(np.isfinite(self.P)):
+            self.P = np.eye(15, dtype=float)
+            self.q_nb = q_prev
+            self.vel_n = v_prev
+
+    def update_mag(self, mag_body: np.ndarray) -> None:
+        if not self.mag_ref_valid or _norm(mag_body) < 1e-6:
+            return
+
+        z = _normalize(mag_body)
+        z_pred = _normalize(_quat_to_rotmat(self.q_nb).T @ self.mag_ref_n)
+
+        H = np.zeros((3, 15), dtype=float)
+        H[:, 0:3] = _skew(z_pred)
+        R = np.eye(3, dtype=float) * (self.config.mag_noise ** 2)
+        self._update(z - z_pred, H, R)
+
+    def update_gravity_direction(self, accel_body: np.ndarray) -> None:
+        accel_norm = _norm(accel_body)
+        if abs(accel_norm - self.config.gravity_m_s2) > self.config.gravity_update_accel_threshold_m_s2:
+            return
+
+        z = _normalize(-accel_body)
+        z_pred = _normalize(_quat_to_rotmat(self.q_nb).T @ np.array([0.0, 0.0, 1.0], dtype=float))
+
+        H = np.zeros((3, 15), dtype=float)
+        H[:, 0:3] = _skew(z_pred)
+        R = np.eye(3, dtype=float) * (self.config.gravity_dir_noise ** 2)
+        self._update(z - z_pred, H, R)
+
+    def update_static_accel(self, accel_body: np.ndarray) -> None:
+        z_pred = -_quat_to_rotmat(self.q_nb).T @ np.array([0.0, 0.0, self.config.gravity_m_s2], dtype=float) + self.accel_bias
+        H = np.zeros((3, 15), dtype=float)
+        H[:, 0:3] = _skew(z_pred - self.accel_bias)
+        H[:, 12:15] = np.eye(3)
+        R = np.eye(3, dtype=float) * (self.config.static_accel_noise_m_s2 ** 2)
+        self._update(accel_body - z_pred, H, R)
+
+    def update_static_gyro(self, gyro_body: np.ndarray) -> None:
+        H = np.zeros((3, 15), dtype=float)
+        H[:, 9:12] = np.eye(3)
+        R = np.eye(3, dtype=float) * (self.config.static_gyro_noise_rad_s ** 2)
+        self._update(gyro_body - self.gyro_bias, H, R)
+
+    def update_zupt(self) -> None:
+        H = np.zeros((3, 15), dtype=float)
+        H[:, 3:6] = np.eye(3)
+        R = np.eye(3, dtype=float) * (self.config.zupt_noise_m_s ** 2)
+        self._update(-self.vel_n, H, R)
+
+    def update_baro(self, down_position_m: float) -> None:
+        H = np.zeros((1, 15), dtype=float)
+        H[0, 8] = 1.0
+        R = np.array([[self.config.baro_noise_m ** 2]], dtype=float)
+        residual = np.array([down_position_m - self.pos_n[2]], dtype=float)
+        self._update(residual, H, R)
+
+
+def _build_initial_conditions(
+    imu: dict[str, np.ndarray],
+    mag: dict[str, np.ndarray],
+    config: OfflineEkfConfig,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, int, int]:
+    start_ts = int(imu["timestamp"][0])
+    end_ts = start_ts + int(config.init_window_s * 1e6)
+
+    imu_mask = imu["timestamp"] <= end_ts
+    mag_mask = mag["timestamp"] <= end_ts
+
+    if not np.any(imu_mask):
+        imu_mask = np.arange(min(50, len(imu["timestamp"])))
+
+    gyro_dt_s = np.maximum(imu["delta_angle_dt_us"][imu_mask] * 1e-6, 1e-6)
+    accel_dt_s = np.maximum(imu["delta_velocity_dt_us"][imu_mask] * 1e-6, 1e-6)
+
+    gyro_body = np.mean(imu["delta_angle"][imu_mask] / gyro_dt_s[:, None], axis=0)
+    accel_body = np.mean(imu["delta_velocity"][imu_mask] / accel_dt_s[:, None], axis=0)
+
+    mag_body = None
+    if np.any(mag_mask):
+        mag_body = np.mean(mag["mag"][mag_mask], axis=0)
+    elif len(mag["timestamp"]) > 0:
+        mag_body = mag["mag"][0]
+
+    imu_start_index = int(np.count_nonzero(imu["timestamp"] <= end_ts))
+    mag_start_index = int(np.count_nonzero(mag["timestamp"] <= end_ts))
+
+    return accel_body, gyro_body, mag_body, imu_start_index, mag_start_index
+
+
+def _is_static(accel_body: np.ndarray, gyro_body: np.ndarray, config: OfflineEkfConfig) -> bool:
+    return (
+        _norm(gyro_body) < config.static_gyro_threshold_rad_s
+        and abs(_norm(accel_body) - config.gravity_m_s2) < config.static_accel_threshold_m_s2
+    )
+
+
+def _default_output_path(log_path: Path) -> Path:
+    return log_path.with_name(f"{log_path.stem}_offline_imu_mag_ekf.csv")
+
+
+def run_filter(
+    log_path: Path,
+    output_path: Path,
+    use_baro: bool,
+    baro_aid_mode: str,
+    gyro_preprocess_mode: str,
+    filter_mode: str,
+    instance: int = 0,
+) -> None:
+    ulog = ULog(str(log_path))
+
+    imu = _load_imu_series(ulog, instance)
+    imu = _apply_px4_gyro_preconditioning(ulog, imu, gyro_preprocess_mode)
+    mag = _load_mag_series(ulog, instance)
+    baro = _load_baro_series(ulog, instance) if use_baro else None
+
+    if len(imu["timestamp"]) == 0:
+        raise RuntimeError("empty IMU stream")
+
+    config = OfflineEkfConfig()
+    ekf = ReducedImuMagEkf(config)
+
+    accel0, gyro0, mag0, imu_start, mag_start = _build_initial_conditions(imu, mag, config)
+    ekf.initialize(accel0, gyro0, mag0)
+
+    baro_idx = 0
+    baro_ref_alt = None
+    if baro is not None and len(baro["timestamp"]) > 0:
+        baro_ref_alt = float(baro["alt"][0])
+
+    with output_path.open("w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=[
+            "timestamp_us",
+            "q_w", "q_x", "q_y", "q_z",
+            "roll_rad", "pitch_rad", "yaw_rad",
+            "vel_n_m_s", "vel_e_m_s", "vel_d_m_s",
+            "pos_n_m", "pos_e_m", "pos_d_m",
+            "gyro_bias_x_rad_s", "gyro_bias_y_rad_s", "gyro_bias_z_rad_s",
+            "accel_bias_x_m_s2", "accel_bias_y_m_s2", "accel_bias_z_m_s2",
+        ])
+        writer.writeheader()
+
+        mag_idx = mag_start
+
+        for i in range(max(imu_start, 1), len(imu["timestamp"])):
+            ts = int(imu["timestamp"][i])
+            gyro_dt_s = float(imu["delta_angle_dt_us"][i]) * 1e-6
+            accel_dt_s = float(imu["delta_velocity_dt_us"][i]) * 1e-6
+            delta_angle = imu["delta_angle"][i]
+            delta_velocity = imu["delta_velocity"][i]
+
+            if gyro_dt_s <= 0.0 or accel_dt_s <= 0.0:
+                continue
+
+            gyro_body = delta_angle / gyro_dt_s
+            accel_body = delta_velocity / accel_dt_s
+
+            ekf.propagate(delta_angle, delta_velocity, gyro_dt_s, accel_dt_s)
+
+            if(filter_mode == 'px4'):
+                if _is_static(accel_body, gyro_body, config):
+                    ekf.update_static_gyro(gyro_body)
+                    ekf.update_static_accel(accel_body)
+                    ekf.update_zupt()
+                else:
+                    ekf.update_gravity_direction(accel_body)
+
+                while mag_idx < len(mag["timestamp"]) and int(mag["timestamp"][mag_idx]) <= ts:
+                    ekf.update_mag(mag["mag"][mag_idx])
+                    mag_idx += 1
+
+                if baro is not None and baro_ref_alt is not None:
+                    while baro_idx < len(baro["timestamp"]) and int(baro["timestamp"][baro_idx]) <= ts:
+                        if baro_aid_mode == "always":
+                            down_position = -(float(baro["alt"][baro_idx]) - baro_ref_alt)
+                            ekf.update_baro(down_position)
+
+                        baro_idx += 1
+
+            euler = _quat_to_euler(ekf.q_nb)
+
+            writer.writerow({
+                "timestamp_us": ts,
+                "q_w": ekf.q_nb[0],
+                "q_x": ekf.q_nb[1],
+                "q_y": ekf.q_nb[2],
+                "q_z": ekf.q_nb[3],
+                "roll_rad": euler[0],
+                "pitch_rad": euler[1],
+                "yaw_rad": euler[2],
+                "vel_n_m_s": ekf.vel_n[0],
+                "vel_e_m_s": ekf.vel_n[1],
+                "vel_d_m_s": ekf.vel_n[2],
+                "pos_n_m": ekf.pos_n[0],
+                "pos_e_m": ekf.pos_n[1],
+                "pos_d_m": ekf.pos_n[2],
+                "gyro_bias_x_rad_s": ekf.gyro_bias[0],
+                "gyro_bias_y_rad_s": ekf.gyro_bias[1],
+                "gyro_bias_z_rad_s": ekf.gyro_bias[2],
+                "accel_bias_x_m_s2": ekf.accel_bias[0],
+                "accel_bias_y_m_s2": ekf.accel_bias[1],
+                "accel_bias_z_m_s2": ekf.accel_bias[2],
+            })
+
+            #ekfDict = {
+            #    "timestamp_us": ts,
+            #    "q_w": ekf.q_nb[0],
+            #    "q_x": ekf.q_nb[1],
+            #    "q_y": ekf.q_nb[2],
+            #    "q_z": ekf.q_nb[3],
+            #    "roll_rad": euler[0],
+            #    "pitch_rad": euler[1],
+            #    "yaw_rad": euler[2],
+            #    "vel_n_m_s": ekf.vel_n[0],
+            #    "vel_e_m_s": ekf.vel_n[1],
+            #    "vel_d_m_s": ekf.vel_n[2],
+            #    "pos_n_m": ekf.pos_n[0],
+            #    "pos_e_m": ekf.pos_n[1],
+            #    "pos_d_m": ekf.pos_n[2],
+            #    "gyro_bias_x_rad_s": ekf.gyro_bias[0],
+            #    "gyro_bias_y_rad_s": ekf.gyro_bias[1],
+            #    "gyro_bias_z_rad_s": ekf.gyro_bias[2],
+            #    "accel_bias_x_m_s2": ekf.accel_bias[0],
+            #    "accel_bias_y_m_s2": ekf.accel_bias[1],
+            #    "accel_bias_z_m_s2": ekf.accel_bias[2],
+            #    }
+
+            #sio.savemat("ekf_data.mat", ekfDict)
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Offline reduced PX4-style IMU/MAG EKF replay tool for ULog files."
+    )
+    parser.add_argument("logfile", type=Path, help="input PX4 ULog file")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="output CSV path; default is <logfile>_offline_imu_mag_ekf.csv",
+    )
+    parser.add_argument(
+        "--use-baro",
+        action="store_true",
+        help="also fuse vehicle_air_data.baro_alt_meter to stabilize vertical position",
+    )
+    parser.add_argument(
+        "--gyro-preprocess-mode",
+        choices=("auto", "logged", "reconstruct"),
+        default="auto",
+        help=(
+            "gyro path to feed the EKF replay: "
+            "'auto' reconstructs delta_angle from sufficiently dense raw sensor_gyro with PX4-style coning and calibration when possible, "
+            "'logged' uses the delta_angle already logged in vehicle_imu/sensor_combined, "
+            "'reconstruct' requires raw sensor_gyro reconstruction"
+        ),
+    )
+    parser.add_argument(
+        "--filter-mode",
+        choices=("px4", "inertial"),
+        default="inertial",
+        help=(
+            "states which have measurement aid "
+            "'px4' , uses gps, mag, bar, gravity "
+            "'inertial' uses the delta_angle already logged in vehicle_imu/sensor_combined, "
+        ),
+    )
+    parser.add_argument(
+        "--baro-aid-mode",
+        choices=("always",),
+        default="always",
+        help="baro fusion mode when --use-baro is enabled",
+    )
+    parser.add_argument(
+        "--instance",
+        type=int,
+        default=0,
+        help="ULog topic instance to read when applicable",
+    )
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    log_path = args.logfile.expanduser().resolve()
+
+    if not log_path.exists():
+        raise SystemExit(f"log file not found: {log_path}")
+
+    output_path = args.output.expanduser().resolve() if args.output else _default_output_path(log_path)
+
+    run_filter(
+        log_path=log_path,
+        output_path=output_path,
+        use_baro=args.use_baro,
+        baro_aid_mode=args.baro_aid_mode,
+        gyro_preprocess_mode=args.gyro_preprocess_mode,
+        filter_mode=args.filter_mode,
+        instance=args.instance,
+    )
+
+    print(f"wrote offline state estimates to {output_path}")
+
+
+if __name__ == "__main__":
+    main()

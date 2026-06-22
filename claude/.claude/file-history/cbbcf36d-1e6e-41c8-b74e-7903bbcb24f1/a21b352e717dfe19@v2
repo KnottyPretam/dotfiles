@@ -1,0 +1,197 @@
+#!/usr/bin/env python3
+"""Summarize the ~100 Hz vibration peak across the .ulg logs in this directory.
+
+For each log, emit one CSV row with the PSD magnitude (and actual frequency) of
+the spectral peak nearest 100 Hz, for two gyro signals (X/Y/Z each):
+  - vehicle_angular_velocity (filtered controller-rate gyro)
+  - sensor_gyro_fifo         (raw high-rate gyro)
+
+The FFT/PSD and peak detection are reused verbatim from
+/home/choudhury/tools/dev/imu_vibe/analyze_imu_vibration.py so the numbers match
+that script's plots exactly.
+
+Usage:
+  python vibe_psd_100hz_summary.py              # all *.ulg in this directory
+  python vibe_psd_100hz_summary.py a.ulg b.ulg  # specific logs
+"""
+
+import csv
+import datetime
+import glob
+import os
+import sys
+
+import numpy as np
+from pyulog import ULog
+from scipy.signal import find_peaks
+
+# Reuse the existing analysis module's FFT/peak/helpers (T_OFFSET stays 0.0
+# because we never call its main()).
+sys.path.insert(0, "/home/choudhury/tools/dev/imu_vibe")
+import analyze_imu_vibration as aiv  # noqa: E402
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+TARGET_HZ = 100.0          # frequency of interest
+PEAK_TOL_HZ = 15.0         # how close a detected peak must be to count as "the 100 Hz peak"
+MIN_SAMPLES = 256          # same minimum-segment guard the source script uses
+
+# Only parse what we need — some logs are ~1 GB.
+TOPIC_FILTER = [
+    "vehicle_angular_velocity",
+    "sensor_gyro_fifo",
+    "vehicle_land_detected",
+    "vehicle_status",
+]
+
+
+def inflight_window(ulog):
+    """Return (t0, t1, source) in FMU-boot seconds for the in-air / armed segment.
+
+    Preference: vehicle_land_detected (landed==0) -> vehicle_status (arming_state==2 ARMED)
+    -> (None, None, 'full') meaning 'use the whole signal'.
+    """
+    d = aiv.get_topic(ulog, "vehicle_land_detected")
+    if d is not None and "landed" in d.data:
+        t = d.data["timestamp"] / 1e6
+        air = t[d.data["landed"] == 0]
+        if air.size:
+            return float(air[0]), float(air[-1]), "land_detected"
+
+    d = aiv.get_topic(ulog, "vehicle_status")
+    if d is not None and "arming_state" in d.data:
+        t = d.data["timestamp"] / 1e6
+        armed = t[d.data["arming_state"] == 2]  # 2 == ARMING_STATE_ARMED
+        if armed.size:
+            return float(armed[0]), float(armed[-1]), "armed"
+
+    return None, None, "full"
+
+
+def peak_near(freqs, psd, target=TARGET_HZ, tol=PEAK_TOL_HZ):
+    """Detect peaks exactly as annotate_top_peaks does, then return (freq, psd)
+    of the detected peak closest to `target`. (nan, nan) if none within `tol`."""
+    if psd is None or len(psd) < 16:
+        return (np.nan, np.nan)
+    log_psd = np.log10(np.maximum(psd, 1e-30))
+    peaks, _ = find_peaks(log_psd, distance=5, prominence=0.3)
+    if len(peaks) == 0:
+        return (np.nan, np.nan)
+    fp = freqs[peaks]
+    i = int(np.argmin(np.abs(fp - target)))
+    if abs(fp[i] - target) > tol:
+        return (np.nan, np.nan)
+    return (float(fp[i]), float(psd[peaks[i]]))
+
+
+def fft_angular_velocity(ulog, t0, t1):
+    """(instance_used, [(fx,px) for X,Y,Z]) for vehicle_angular_velocity.
+    Mirrors fft_vehicle_angular_velocity()."""
+    d = aiv.get_topic(ulog, "vehicle_angular_velocity", 1)
+    inst = 1
+    if d is None:
+        d = aiv.get_topic(ulog, "vehicle_angular_velocity")
+        inst = 0 if d is not None else None
+    if d is None:
+        return (None, [(np.nan, np.nan)] * 3)
+
+    t = d.data["timestamp"] / 1e6
+    mask = (t >= t0) & (t <= t1) if t0 is not None else np.ones(t.shape, bool)
+    if mask.sum() < MIN_SAMPLES:
+        return (inst, [(np.nan, np.nan)] * 3)
+    tw = t[mask]
+    dt = float(np.median(np.diff(tw)))
+    if dt <= 0:
+        return (inst, [(np.nan, np.nan)] * 3)
+    fs = 1.0 / dt
+
+    out = []
+    for k in range(3):
+        axis = d.data[f"xyz[{k}]"][mask] * aiv.RAD_TO_DEG
+        freqs, _, psd = aiv.direct_fft(axis, fs, t=tw)
+        out.append(peak_near(freqs, psd))
+    return (inst, out)
+
+
+def fft_gyro_fifo(ulog, t0, t1):
+    """[(fx,px) for X,Y,Z] for sensor_gyro_fifo instance 1.
+    Mirrors the gyro branch of fft_around_event()."""
+    d = aiv.get_topic(ulog, "sensor_gyro_fifo", 1)
+    if d is None:
+        return [(np.nan, np.nan)] * 3
+
+    t, x, y, z = aiv.fifo_to_series(d)
+    mask = (t >= t0) & (t <= t1) if t0 is not None else np.ones(t.shape, bool)
+    if mask.sum() < MIN_SAMPLES:
+        return [(np.nan, np.nan)] * 3
+    tw = t[mask]
+    dt = float(np.median(d.data["dt"])) / 1e6
+    if dt <= 0:
+        return [(np.nan, np.nan)] * 3
+    fs = 1.0 / dt
+
+    out = []
+    for axis in (x, y, z):
+        freqs, _, psd = aiv.direct_fft(axis[mask] * aiv.RAD_TO_DEG, fs, t=tw)
+        out.append(peak_near(freqs, psd))
+    return out
+
+
+def process(path):
+    print(f"[proc] {os.path.basename(path)}")
+    ulog = ULog(path, message_name_filter_list=TOPIC_FILTER)
+    t0, t1, src = inflight_window(ulog)
+    inst, av = fft_angular_velocity(ulog, t0, t1)
+    gf = fft_gyro_fifo(ulog, t0, t1)
+    mtime = datetime.datetime.fromtimestamp(os.path.getmtime(path))
+
+    row = {
+        "log_name": os.path.basename(path),
+        "log_date": mtime.strftime("%Y-%m-%d %H:%M:%S"),
+        "window_source": src,
+        "window_start_s": "" if t0 is None else f"{t0:.3f}",
+        "window_end_s": "" if t1 is None else f"{t1:.3f}",
+        "angvel_inst": "" if inst is None else inst,
+    }
+    for name, axis_results in (("angvel", av), ("gyrofifo", gf)):
+        for axis_name, (fpk, ppk) in zip("xyz", axis_results):
+            row[f"{name}_{axis_name}_peak_hz"] = "" if np.isnan(fpk) else f"{fpk:.2f}"
+            row[f"{name}_{axis_name}_psd"] = "" if np.isnan(ppk) else f"{ppk:.6g}"
+    return row
+
+
+FIELDS = [
+    "log_name", "log_date", "window_source", "window_start_s", "window_end_s",
+    "angvel_inst",
+    "angvel_x_peak_hz", "angvel_x_psd", "angvel_y_peak_hz", "angvel_y_psd",
+    "angvel_z_peak_hz", "angvel_z_psd",
+    "gyrofifo_x_peak_hz", "gyrofifo_x_psd", "gyrofifo_y_peak_hz", "gyrofifo_y_psd",
+    "gyrofifo_z_peak_hz", "gyrofifo_z_psd",
+]
+
+
+def main():
+    args = sys.argv[1:]
+    logs = sorted(args) if args else sorted(glob.glob(os.path.join(HERE, "*.ulg")))
+    if not logs:
+        print("No .ulg logs found.")
+        return
+
+    rows = []
+    for path in logs:
+        try:
+            rows.append(process(path))
+        except Exception as e:  # keep going across the batch
+            print(f"[error] {os.path.basename(path)}: {e}")
+            rows.append({"log_name": os.path.basename(path), "log_date": "ERROR"})
+
+    out_csv = os.path.join(HERE, "vibe_psd_100hz_summary.csv")
+    with open(out_csv, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDS)
+        w.writeheader()
+        w.writerows(rows)
+    print(f"\nWrote {out_csv} ({len(rows)} rows)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,102 @@
+# SITL chirp runner — per-chirp ulogs + param files
+
+## Context
+
+The chirp injection feature is already implemented and unit-tested (in `control_allocator` /
+`ActuatorEffectivenessTwinRotorTailsitter`, params `CA_CHIRP_*`). Now we want **tooling** to
+exercise it in **SITL** and capture data: a Python script that, for each of the five chirps,
+runs PX4 SITL on the Twin Rotor Tailsitter, drives the one-shot sweep, and produces **one ulog
+per chirp**, plus a **parameter file per chirp** (editable artifacts that define each run).
+
+This is test/automation only — **no changes to the flight code**.
+
+Key facts confirmed during exploration:
+- A SITL airframe already exists: `ROMFS/.../init.d-posix/airframes/1069_gazebo-classic_twinrotor_tailsitter`
+  (sources hardware `13269_twinrotor_tailsitter`), setting `CA_AIRFRAME 11`, `MAV_TYPE 19`
+  (VTOL tailsitter), **`SDLOG_MODE 0`** (log on arm→disarm), **`SDLOG_PROFILE 2065`** (default +
+  high-rate sysID, logs `actuator_motors/servos` + `vehicle_torque/thrust_setpoint`), and
+  `CBRK_SUPPLY_CHK` (power check bypassed). So logging needs no extra setup — each arm→disarm = one ulog.
+- `twinrotor_tailsitter` is a valid gazebo-classic run target (`sitl_targets_gazebo-classic.cmake:102`).
+- `CA_CHIRP_*` are live params (read in `updateParams()` on `parameter_update`) — set at runtime, no reboot.
+- Container has `pymavlink 2.4.49`, `pyulog`, `gzserver`. SITL MAVLink offboard port is `udp:127.0.0.1:14540` (container-internal — the script runs **inside** the devcon container).
+- ulogs land in `build/px4_sitl_default/rootfs/log/<YYYY-MM-DD>/*.ulg`.
+
+**Decisions:** fresh SITL instance per chirp (clean state, one clean ulog each); standard-sweep defaults.
+
+## What gets created — all under `Tools/chirp_sysid/`
+
+### 1. `params/*.params` (5 files) — one per chirp
+PX4 `param set` syntax (human-editable, also parseable by the script). Common sweep:
+`CA_CHIRP_F0 0.5`, `CA_CHIRP_F1 15`, `CA_CHIRP_T 20`, `CA_CHIRP_ORD 1`, `CA_CHIRP_RPM 0.60`.
+
+| File | `CA_CHIRP_MODE` | `CA_CHIRP_AMP` | notes |
+|------|------|------|------|
+| `cyclic_pitch.params`   | 1 | 0.20 | torque-axis units |
+| `cyclic_yaw.params`     | 2 | 0.20 | torque-axis units |
+| `collective.params`     | 3 | 0.20 | collective-pitch units |
+| `collective_roll.params`| 4 | 0.20 | torque-axis units |
+| `rpm.params`            | 5 | 0.10 | motor-command units (swept around `CA_CHIRP_RPM`) |
+
+`CA_AIRFRAME 11` is left to the airframe (not re-set at runtime). Each file has a header comment
+explaining the chirp and that `CA_CHIRP_RPM` is the user's ~6000 rpm normalized motor command.
+
+### 2. `run_chirp_sysid.py` — the driver
+CLI: `--chirps {all|cyclic_pitch,…}` (default `all`), `--out DIR` (default `Tools/chirp_sysid/logs`),
+`--build/--no-build`, `--connect udp:127.0.0.1:14540`, `--settle`, `--margin`, `--params-dir`.
+
+Up-front (once): `make px4_sitl_default` so the SITL binary includes the chirp code (skippable with `--no-build`).
+
+For each selected chirp (**fresh SITL each time**, in `try/finally` so teardown always runs):
+1. **Launch** headless SITL in a new process session (`subprocess.Popen(..., start_new_session=True)`),
+   stdout/stderr to a per-run log:
+   `env HEADLESS=1 NO_PXH=1 make px4_sitl_default gazebo-classic_twinrotor_tailsitter`.
+2. **Connect** `pymavlink.mavutil.mavlink_connection(--connect)`, `wait_heartbeat()` (timeout), then a
+   readiness settle (wait for steady heartbeats).
+3. **Apply params** — parse the chirp's `.params` file, `param_set` each, read back to confirm; short
+   settle so the allocator's `updateParams()` picks them up.
+4. **Mode + force-arm** — set a manual mode, then `MAV_CMD_COMPONENT_ARM_DISARM` `param1=1, param2=21196`
+   (force-arm); confirm `COMMAND_ACK`. Logging auto-starts on arm; the one-shot chirp starts at t=0.
+5. **Wait** `CA_CHIRP_T + --margin` (sweep runs, then returns to baseline).
+6. **Disarm** (`param1=0`) → logger closes the ulog.
+7. **Teardown** — `os.killpg(SIGINT)` then `SIGKILL`; safety `pkill -f 'gzserver|gzclient|px4'`.
+8. **Collect** — find the newest `.ulg` under `build/px4_sitl_default/rootfs/log/<date>/` created since
+   step 1; copy to `--out/<chirp>_<UTC-timestamp>.ulg` and copy the applied `.params` beside it.
+9. Record pass/fail (+ tail of the SITL log on failure) and continue.
+
+End: print a summary table (chirp → ulog path, duration). Optional lightweight `pyulog` check that
+`actuator_motors`/`actuator_servos` are present.
+
+### 3. `README.md`
+Short usage (run via `devcon`), what it produces, how to edit the `.params`, and the caveat that the
+chirp is **open-loop / bypasses stabilization**, so the vehicle tips on the ground — the ulog still
+captures the commanded `actuator_*` (primary artifact) plus whatever sim response occurs.
+
+## Reused paths / mechanisms (no reinvention)
+- Build + run targets: top-level `Makefile` → `Tools/simulation/gazebo-classic/sitl_run.sh` (via `make … gazebo-classic_twinrotor_tailsitter`).
+- ulog dir convention: `build/px4_sitl_default/rootfs/log/<YYYY-MM-DD>/logNNN.ulg`.
+- `pymavlink.mavutil` for connect/param/arm; `pyulog` for the optional sanity check.
+- Airframe `1069_gazebo-classic_twinrotor_tailsitter` already supplies `CA_AIRFRAME 11`, logging, and `CBRK_SUPPLY_CHK`.
+
+## Verification
+Run **inside** the container (`devcon`):
+```bash
+# quick single-chirp smoke test (~1 gazebo boot)
+python3 Tools/chirp_sysid/run_chirp_sysid.py --chirps cyclic_pitch
+# full set -> 5 ulogs
+python3 Tools/chirp_sysid/run_chirp_sysid.py --chirps all
+ls Tools/chirp_sysid/logs/                      # cyclic_pitch_*.ulg, cyclic_yaw_*.ulg, …
+```
+Inspect a result with pyulog and confirm the chirp shape:
+```bash
+ulog_info Tools/chirp_sysid/logs/cyclic_pitch_*.ulg          # topics + duration (~20 s)
+# swashplate servos in actuator_servos sweep with rising frequency;
+# actuator_motors held ~0.60 for cyclic/collective, swept for the rpm chirp.
+```
+Cross-check: the already-passing unit tests (`functional-ActuatorEffectivenessTwinRotorTailsitter`)
+prove the per-axis routing the ulogs should exhibit.
+
+## Notes / caveats
+- Script + SITL both run inside the devcon container (MAVLink ports are container-internal).
+- Open-loop sweep ⇒ ground tip-over is expected; relevant data is the commanded `actuator_*`.
+- `--out` logs are run artifacts (suggest gitignoring `Tools/chirp_sysid/logs/`).
+- `CA_CHIRP_RPM 0.60` is a starting point — edit the `.params` to your true ~6000 rpm motor command.

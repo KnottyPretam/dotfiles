@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+#
+docker compose -f ${HOME}/tools/dev/docker_runner/docker-compose.dev.yaml exec px4_dev bash

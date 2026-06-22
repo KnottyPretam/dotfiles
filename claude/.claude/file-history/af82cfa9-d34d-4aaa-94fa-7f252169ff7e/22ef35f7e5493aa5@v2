@@ -1,0 +1,101 @@
+# Plan: plot all `vehicle_angular_velocity` instances + resolve device names
+
+## Context
+`analyze_imu_vibration.py` produces vibration/failure-mode plots from a PX4 ULog.
+Two of its plots cover `vehicle_angular_velocity` (the filtered angular rate the
+rate controller runs on). The airframe in question publishes **3**
+`vehicle_angular_velocity` instances (one per IMU — a custom build; stock PX4
+publishes only the single selected gyro), but both functions currently call
+`get_topic(ulog, "vehicle_angular_velocity")`, which returns only instance 0. So
+two of the three gyros' filtered rates are never plotted.
+
+Additionally, the user wants each instance labeled with the **device name** of its
+gyro. The `vehicle_angular_velocity` topic carries no `device_id` field (only
+`timestamp`, `timestamp_sample`, `xyz[]`, `xyz_derivative[]` — confirmed against a
+real log), so device identity must be resolved indirectly.
+
+Outcome: both plots cover all instances, each labeled with its decoded gyro chip
+name (e.g. `ICM20602`).
+
+## Affected functions (all in `analyze_imu_vibration.py`)
+- `plot_vehicle_angular_velocity_timeseries` (line 455) — time-series, currently first instance only
+- `fft_vehicle_angular_velocity` (line 486) — FFT PSD, currently first instance only
+
+## Changes
+
+### 1. Device-name decoder helper (add near other helpers, ~line 90)
+The decode is verified: device_id `0x380A0A` → devtype `0x38` = `ICM20602`,
+matching the Control Zero chips already in `HW_REFERENCES`. devtype is the
+top byte of the PX4 device_id; table copied from
+`/home/choudhury/repos/PX4-Autopilot/src/drivers/drv_sensor.h`.
+
+```python
+# devtype = top byte of a PX4 device_id; names from src/drivers/drv_sensor.h
+DEVTYPE_NAMES = {0x21:"MPU6000", 0x24:"MPU9250", 0x25:"ICM20649", 0x26:"ICM42688P",
+    0x27:"ICM40609D", 0x28:"ICM20948", 0x29:"ICM42605", 0x2A:"ICM42670P", 0x2B:"IIM42652",
+    0x2C:"IAM20680HP", 0x2D:"ICM42686P", 0x2E:"IIM42653", 0x34:"ICM45686", 0x36:"MPU6500",
+    0x37:"BMI270", 0x38:"ICM20602", 0x3A:"ICM20608G", 0x3C:"ICM20689", 0x42:"BMI055",
+    0x66:"BMI088", 0x6D:"BMI085", 0x86:"UAVCAN"}
+
+def decode_device_id(devid):
+    """PX4 device_id -> 'CHIP (bus N, addr 0xNN)'. devtype is the top byte."""
+    devid = int(devid)
+    devtype = (devid >> 16) & 0xFF
+    bus     = (devid >> 3) & 0x1F
+    addr    = (devid >> 8) & 0xFF
+    name = DEVTYPE_NAMES.get(devtype, f"devtype 0x{devtype:02X}")
+    return f"{name} (bus {bus}, addr 0x{addr:02X})"
+```
+
+### 2. Per-instance device resolver (add next to the decoder)
+Layered for robustness: use a direct id field if the build added one, else map by
+`multi_id` to the same-index `vehicle_imu_status`. Reuses existing `get_topic`.
+
+```python
+def angular_velocity_device(ulog, d):
+    """Device name for a vehicle_angular_velocity instance. Prefers a device_id
+    field if the build added one; else maps by multi_id to the gyro of the
+    same-index vehicle_imu_status."""
+    for key in ("gyro_device_id", "device_id"):
+        if key in d.data and len(d.data[key]):
+            return decode_device_id(d.data[key][0])
+    s = get_topic(ulog, "vehicle_imu_status", instance=d.multi_id)
+    if s is not None and "gyro_device_id" in s.data and len(s.data["gyro_device_id"]):
+        return decode_device_id(s.data["gyro_device_id"][0])
+    return None
+```
+
+### 3. Rewrite `plot_vehicle_angular_velocity_timeseries`
+Overlay **all** instances on the shared 3-axis figure — mirrors the existing
+`plot_vehicle_imu_magnitude_timeseries` (line 406): loop
+`all_instances(ulog, "vehicle_angular_velocity")`, one color per instance from the
+prop cycle, legend label `vehicle_angular_velocity_{i} — {device}`. Stays one file
+(`imu_gyro_vehicle_angular_velocity_mag.png`); suptitle notes instance count.
+
+### 4. Rewrite `fft_vehicle_angular_velocity`
+Loop all instances, write **one FFT file per instance**
+`imu_fft_gyro_vehicle_angular_velocity_{i}.png` — matches the per-instance
+convention of `fft_around_event`/`fft_vehicle_imu`. Per-instance `fs` from sample
+spacing; device name in each suptitle. Keep the existing `direct_fft` /
+`annotate_top_peaks` / `add_lpf_lines` calls and skip-if-<256-samples guard.
+
+### 5. Update module docstring (lines 12–13)
+Note the time-series overlays all instances, and the FFT filename is now
+`imu_fft_gyro_vehicle_angular_velocity_<N>.png` (per instance).
+
+## Verification
+Run `python analyze_imu_vibration.py <OD1A076 log>` and confirm:
+- `imu_gyro_vehicle_angular_velocity_mag.png` shows 3 overlaid traces, legend
+  carries device names.
+- 3 files `imu_fft_gyro_vehicle_angular_velocity_{0,1,2}.png` are written with
+  chip names in their titles.
+- stdout `[ang_vel_ts]` / `[fft_ang_vel]` lines report 3 instances.
+
+## Assumptions
+- The OD1A076 `.ulg` is not on disk, so the design is generic — works for 1 or 3
+  instances regardless.
+- Device mapping assumes `vehicle_angular_velocity` instance *i* ↔ the *i*-th gyro
+  (`vehicle_imu_status[i].gyro_device_id`). The resolver auto-uses a direct
+  `device_id`/`gyro_device_id` field first if the custom build added one. If the
+  build's instance ordering differs, the mapping needs adjusting once the real log
+  is available.

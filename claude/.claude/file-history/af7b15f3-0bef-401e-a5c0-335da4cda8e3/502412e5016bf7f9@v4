@@ -1,0 +1,170 @@
+# Chirp system-ID: SITL runner + log verifier
+
+Drives the Twin Rotor Tailsitter **chirp** actuator system-ID feature in PX4 SITL and verifies it
+from the resulting ulogs. The chirp is **gated**: it injects an open-loop frequency sweep into one
+actuator axis only when `CA_CHIRP_MODE != 0` **AND** `CA_CHIRP_EN == 1` **AND** the vehicle is
+**ARMED**, and it is **one-shot on the `CA_CHIRP_EN` 0→1 edge while already armed** (arming with EN
+preset to 1 does NOT fire it). Two tools:
+
+- [`run_chirp_sysid.py`](run_chirp_sysid.py) — launches fresh headless gazebo-classic SITL per
+  **scenario**, drives the params/arm/EN timeline over MAVLink, and saves one ulog + a
+  `*.scenario.json` sidecar each. Covers the positive sweeps (one per mode), the negative gate
+  cases, and timing cases. (Manual `pxh>` run: set `CA_CHIRP_MODE` + amp/freqs, arm, then
+  `param set CA_CHIRP_EN 1` to fire.)
+- [`verify_chirp.py`](verify_chirp.py) — post-processes each ulog and emits **PASS/FAIL**: the chirp
+  ran when (and only when) the gate allowed, starting at the EN edge.
+
+Related: the feature itself lives in `src/modules/control_allocator` (`ActuatorEffectivenessTwinRotorTailsitter`,
+params `CA_CHIRP_*`) and is unit-tested by `functional-ActuatorEffectivenessTwinRotorTailsitter`
+(chirp math, per-mode routing, and the static gate). The runtime EN-edge firing — which the unit
+harness can't deliver — is what this SITL suite exercises end-to-end.
+
+## Requirements
+
+Run **inside the dev container** (`devcon`) — the SITL MAVLink ports are container-internal.
+Needs `pymavlink` to run scenarios and `pyulog` + `numpy` to verify (`matplotlib` for `--plot`).
+
+## Usage
+
+```bash
+# from the repo root, inside the container
+
+# one command: run every scenario then verify (≈10 gazebo boots, several minutes)
+python3 Testing/chirp_sysid/run_chirp_sysid.py --scenarios all --verify
+
+# a subset of scenarios (quick iteration), skipping the up-front build
+python3 Testing/chirp_sysid/run_chirp_sysid.py --scenarios pos_cyclic_pitch,neg_armed_disabled --no-build
+
+# legacy positive-only mode: one positive sweep per chirp
+python3 Testing/chirp_sysid/run_chirp_sysid.py --chirps cyclic_pitch
+python3 Testing/chirp_sysid/run_chirp_sysid.py --chirps all
+```
+
+Results land in `Testing/chirp_sysid/logs/` (gitignored):
+
+```
+logs/<scenario>_<UTC>.ulg            # the flight log for that scenario
+logs/<scenario>_<UTC>.scenario.json  # the runner's intended timeline + expected outcome (provenance)
+logs/<scenario>_<UTC>.params         # the exact params applied
+logs/<scenario>.sitl.log             # SITL stdout/stderr for that run (debugging)
+```
+
+Useful flags: `--no-build`, `--out DIR`, `--connect udpin:0.0.0.0:14540`, `--settle`, `--pre-en`,
+`--margin`, `--boot-timeout`, `--arm-timeout`. See `--help`.
+
+## Scenarios
+
+`--scenarios all` runs these (order chosen so `neg_unarmed_enabled`, which toggles `SDLOG_MODE`,
+runs last):
+
+| Scenario | Flow | Expected |
+|------|------|------|
+| `pos_cyclic_pitch` / `pos_cyclic_yaw` / `pos_collective` / `pos_collective_roll` / `pos_rpm` | arm → hold `--pre-en` → `CA_CHIRP_EN` 0→1 → sweep `CA_CHIRP_T` → EN 0 → disarm | **chirp present**, onset ≈ arm+pre_en |
+| `neg_armed_disabled` | arm with `CA_CHIRP_EN`=0, hold > `CA_CHIRP_T`, **never toggle EN**, disarm | **no chirp** |
+| `neg_unarmed_enabled` | log from boot, set `CA_CHIRP_EN`=1 **while DISARMED**, hold > `CA_CHIRP_T`, **never arm** | **no chirp** |
+| `timing_pre2` / `timing_pre5` / `timing_pre10` | `pos_cyclic_pitch` with `pre_en` = 2 / 5 / 10 s | **chirp present**, onset ≈ that pre_en |
+
+`neg_unarmed_enabled` needs the disarmed period in the log, but the airframe's `SDLOG_MODE 0` only
+logs while armed. Since `SDLOG_MODE` is `@reboot_required` and SITL can't reboot in place, the runner
+does a **two-launch prime-then-run**: a prime launch sets+saves `SDLOG_MODE 2` (log from boot, which
+persists in `parameters.bson`), then the run launch boots logging-from-boot, toggles EN while
+disarmed, and resets `SDLOG_MODE 0` at the end so later scenarios log from arm again.
+
+## The chirps / parameter files
+
+One file per chirp under `params/`, in PX4 `param set` syntax (edit freely):
+
+| File | `CA_CHIRP_MODE` | sweeps |
+|------|------|------|
+| `cyclic_pitch.params`    | 1 | body PITCH → symmetric cyclic |
+| `cyclic_yaw.params`      | 2 | body YAW → differential cyclic |
+| `collective.params`      | 3 | symmetric collective pitch |
+| `collective_roll.params` | 4 | body ROLL → differential collective |
+| `rpm.params`             | 5 | rotor motor command (around `CA_CHIRP_RPM`) |
+
+`_common.params` is applied before every chirp (keeps the vehicle armed without RC/GPS).
+Default sweep: `0.5 → 15 Hz` over `20 s`, linear (`CA_CHIRP_ORD 1`), rotors held at
+`CA_CHIRP_RPM 0.60`.
+
+> **Edit `CA_CHIRP_RPM`** to the normalized motor command that equals ~6000 rpm on your
+> hardware/model — `0.60` is just a starting point.
+
+## Verifying a result (`verify_chirp.py`)
+
+```bash
+python3 Testing/chirp_sysid/verify_chirp.py --batch logs/                  # PASS/FAIL matrix (nonzero exit on any fail)
+python3 Testing/chirp_sysid/verify_chirp.py --batch logs/ --plot-dir figures/   # + one figure per ulog into figures/
+python3 Testing/chirp_sysid/verify_chirp.py --ulog logs/pos_cyclic_pitch_<UTC>.ulg
+python3 Testing/chirp_sysid/verify_chirp.py --ulog logs/pos_cyclic_pitch_<UTC>.ulg --plot pitch.png
+```
+
+How it decides:
+
+- It reconstructs the exact `Chirp::update()` waveform from the logged `CA_CHIRP_*` params and
+  **correlates** it against every `actuator_outputs` channel over a fine sliding start time — a
+  matched filter, **not** an energy threshold. (An armed vehicle on the ground produces large
+  attitude-controller motion, so raw signal energy is actually *higher* outside the sweep window;
+  only correlation discriminates. Validated: the swept channel locks at |corr| ≈ 0.9, controller-only
+  motion stays < 0.15.) The lock threshold is **0.70** (override with `--threshold`).
+- **`chirp_present`**: a sweep locks, AND its onset matches the `CA_CHIRP_EN` 0→1 edge (within
+  `--onset-tol`, default 1.5 s), AND that edge is inside an armed interval. Timing scenarios also
+  check the onset ≈ the sidecar's `pre_en`.
+- **`no_chirp`**: no sweep locks anywhere.
+- Expected outcome comes from each ulog's `*.scenario.json` sidecar; with no sidecar it is **derived
+  from the log itself** (armed interval + an EN 0→1 edge inside it ⇒ expect a chirp — i.e. the gate),
+  so the verifier also works on ad-hoc/flight logs.
+- Plots: `--plot PATH` (single `--ulog`) or `--plot-dir DIR` (with `--batch`, one figure per ulog
+  named after the log) each write a diagnostic PNG **and** a re-openable `*.pkl.gz` beside it
+  (actuator channel, armed shading, EN markers, expected window, reconstructed-sweep overlay). Reopen
+  and annotate with [`show_figure.py`](show_figure.py): `python3 show_figure.py figures/<name>.png.pkl.gz`.
+- `--show-control` adds two panels: `vehicle_attitude_setpoint` and the allocator-input
+  `vehicle_torque_setpoint`. During a sweep these stay **flat** (the legend prints their std in the
+  sweep window, ~0.00x) while the actuator sweeps (~14) — visual proof the chirp is **open-loop**:
+  `applyChirp()` zeroes the controller setpoint at the allocator, so the attitude/rate controllers
+  are not commanding the output. Example:
+  `verify_chirp.py --batch logs/ --plot-dir figures/ --show-control`.
+
+`run_chirp_sysid.py --verify` runs this `--batch` pass automatically after the scenarios.
+
+## Inspecting a result
+
+```bash
+ulog_info Testing/chirp_sysid/logs/*.ulg     # topics + duration (~20 s)
+```
+Expect (matching the unit tests' routing):
+- `actuator_servos` — the swashplate/elevon servos oscillate with **rising frequency**.
+- `actuator_motors` — held ~`CA_CHIRP_RPM` for cyclic/collective chirps; swept for the `rpm` chirp.
+- high-rate `vehicle_angular_velocity` / IMU (the `1069` airframe logs `SDLOG_PROFILE 2065`).
+
+## Matching flight-test outputs (`actuator_outputs_2`)
+
+Flight logs expose the actuators via per-bus `actuator_outputs_1/_2` (e.g. UAVCAN ESC / servo
+buses); SITL has only `actuator_outputs_0` (one sim driver). To line the two up **by function**, use
+[`output_map.py`](output_map.py) and see [`OUTPUTS.md`](OUTPUTS.md) for the architecture + the
+validated mapping (`actuator_outputs_2` = the swashplate/elevon servos):
+
+```bash
+python3 Testing/chirp_sysid/output_map.py --ulog <flight_or_sitl>.ulg                 # what each instance/channel carries
+python3 Testing/chirp_sysid/output_map.py --compare <sitl>.ulg <flight>.ulg --function Servo3 --plot cmp.png
+```
+
+## Caveats
+
+- The chirp is **open-loop and bypasses stabilization**, so the vehicle moves/tips on the
+  ground during a sweep. That is expected — the useful data is the commanded `actuator_*`.
+  For clean *response* data you'd run on a constrained test stand or in flight.
+- One fresh SITL per scenario ⇒ ~11 gazebo boots for `--scenarios all` (`neg_unarmed_enabled` does
+  two: a prime launch + the run). A few minutes; use a scenario subset for quick iteration.
+- `CA_CHIRP_*` are live params; logging is configured by the `1069_gazebo-classic_twinrotor_tailsitter`
+  airframe (`SDLOG_MODE 0` ⇒ one ulog per arm→disarm, `SDLOG_PROFILE 2065`).
+- To let the SITL VTOL arm on the bench, `_common.params` disables the airspeed preflight check
+  (`CBRK_AIRSPD_CHK`) and auto-disarm (`COM_DISARM_*`); the runner arms in the default mode and
+  retries while the EKF converges to a global position.
+- **Which topic to analyze:** all actuator outputs are logged at full rate in `actuator_outputs`
+  (~235 Hz, all 16 channels — `output[0-7]` = servos, `output[8-9]` = motors per the airframe's
+  `PWM_MAIN_FUNC` map), so the 0.5→15 Hz sweep is fully resolved. The normalized allocator
+  setpoints `actuator_servos` (8 ch) and `actuator_motors` (2 ch) are only ~10 Hz — use those for
+  routing checks, but use `actuator_outputs` for frequency-domain analysis. The response
+  (`sensor_gyro` / `vehicle_angular_velocity`) is logged at high rate via `SDLOG_PROFILE 2065`.
+- The driver sets PX4 INT32 params via the MAVLink bytewise convention (the float field carries the
+  integer's bit pattern) — see `set_param()` if you add more integer params.

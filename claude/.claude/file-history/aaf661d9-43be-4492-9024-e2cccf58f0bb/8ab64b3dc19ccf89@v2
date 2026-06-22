@@ -1,0 +1,329 @@
+#!/usr/bin/env python3
+"""
+Plot RTK log: LLA -> local NED position, and NED velocity from CSV.
+
+Reads the CSV produced by ntrip_bridge.py and creates two figures:
+  Figure 1: 3x1 subplots of N, E, D position (relative to first valid row)
+  Figure 2: 3x1 subplots of Vn, Ve, Vd velocity
+
+Usage:
+    python/plot_rtk.py rtk_log_20260527_092345.csv
+    python/plot_rtk.py 'rtk_log_*.csv'        # picks most recently modified
+    python/plot_rtk.py rtk.csv --save plots/   # save PNGs instead of showing
+"""
+import argparse
+import glob
+import pickle
+import sys
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --- WGS84 ellipsoid constants ---
+WGS84_A  = 6378137.0
+WGS84_F  = 1.0 / 298.257223563
+WGS84_E2 = WGS84_F * (2.0 - WGS84_F)
+
+
+def lla_to_ecef(lat_deg, lon_deg, h):
+    """Vectorized LLA -> ECEF (m). Accepts numpy arrays."""
+    lat = np.deg2rad(lat_deg)
+    lon = np.deg2rad(lon_deg)
+    s = np.sin(lat);  c = np.cos(lat)
+    N = WGS84_A / np.sqrt(1.0 - WGS84_E2 * s * s)
+    x = (N + h) * c * np.cos(lon)
+    y = (N + h) * c * np.sin(lon)
+    z = (N * (1.0 - WGS84_E2) + h) * s
+    return x, y, z
+
+
+def lla_to_ned(lat, lon, h, lat0, lon0, h0):
+    """Convert arrays of LLA to local NED relative to (lat0, lon0, h0).
+    Uses the standard ECEF -> NED rotation:
+
+        R^n_e = [ -sin(lat)cos(lon), -sin(lat)sin(lon),  cos(lat);
+                  -sin(lon),           cos(lon),          0;
+                  -cos(lat)cos(lon), -cos(lat)sin(lon), -sin(lat) ]
+
+    Inputs in degrees and meters. Returns (n, e, d) arrays in meters.
+    """
+    x,  y,  z  = lla_to_ecef(lat,  lon,  h)
+    x0, y0, z0 = lla_to_ecef(lat0, lon0, h0)
+    dx, dy, dz = x - x0, y - y0, z - z0
+
+    sl = np.sin(np.deg2rad(lat0));  cl = np.cos(np.deg2rad(lat0))
+    so = np.sin(np.deg2rad(lon0));  co = np.cos(np.deg2rad(lon0))
+
+    n = -sl * co * dx - sl * so * dy + cl * dz
+    e =      -so * dx +      co * dy
+    d = -cl * co * dx - cl * so * dy - sl * dz
+    return n, e, d
+
+
+def quality_color(q):
+    """Map GGA quality indicator -> plot color."""
+    try:
+        q = int(q)
+    except (ValueError, TypeError):
+        return '#888888'
+    return {
+        1: '#d62728',   # single-point fix      (red)
+        2: '#9467bd',   # DGPS                  (purple)
+        4: '#2ca02c',   # RTK fixed             (green)
+        5: '#1f77b4',   # RTK float             (blue)
+    }.get(q, '#888888')
+
+
+def load_csv(path):
+    """Load the RTK log CSV. Returns DataFrame with parsed times and numerics."""
+    df = pd.read_csv(path)
+    df['utc']      = pd.to_datetime(df['utc_iso'],      errors='coerce', utc=True)
+    df['sys_time'] = pd.to_datetime(df['sys_time_iso'], errors='coerce', utc=True)
+    for col in ('lat_deg', 'lon_deg', 'hgt_m',
+                'vn_mps', 've_mps', 'vd_mps',
+                'fix_quality', 'sats', 'hdop'):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    df = df.dropna(subset=['lat_deg', 'lon_deg', 'hgt_m']).reset_index(drop=True)
+    if df.empty:
+        sys.exit("CSV has no rows with valid position")
+    return df
+
+
+def plot_triple(t, series, ylabels, colors, title, sigma_bands=None,
+                legend_handles=None):
+    """Generic 3x1 plot helper. series is a list of 3 arrays.
+
+    sigma_bands : optional list of 3 floats (the 3-sigma value per subplot).
+                  Draws a +/-3-sigma band centered on zero on each subplot.
+    legend_handles : optional list of Line2D legend entries. Defaults to the
+                     fix-quality legend used by the unprocessed plots.
+    """
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    fig.suptitle(title)
+    for i, (ax, y, lbl) in enumerate(zip(axes, series, ylabels)):
+        # Light line for continuity, colored scatter on top for per-sample quality
+        ax.plot(t, y, color='#cccccc', lw=0.5, zorder=0)
+        ax.scatter(t, y, c=colors, s=4, alpha=0.7, zorder=1)
+        ax.set_ylabel(lbl)
+        ax.grid(True, alpha=0.3)
+        ax.axhline(0, color='k', lw=0.4, alpha=0.4)
+        if sigma_bands is not None:
+            s3 = sigma_bands[i]
+            ax.axhspan(-s3, s3, color='#2ca02c', alpha=0.12, zorder=0)
+            ax.axhline( s3, color='#2ca02c', lw=0.9, ls='--', alpha=0.8, zorder=2)
+            ax.axhline(-s3, color='#2ca02c', lw=0.9, ls='--', alpha=0.8, zorder=2)
+            ax.text(0.01, 0.97, f"3σ = {s3:.4f}", transform=ax.transAxes,
+                    va='top', ha='left', fontsize=7, color='#2ca02c')
+    axes[-1].set_xlabel("Time since start [s]")
+    if legend_handles is None:
+        legend_handles = [
+            plt.Line2D([0],[0], marker='o', ls='', color='#2ca02c', label='RTK fixed', ms=6),
+            plt.Line2D([0],[0], marker='o', ls='', color='#1f77b4', label='RTK float', ms=6),
+            plt.Line2D([0],[0], marker='o', ls='', color='#9467bd', label='DGPS',      ms=6),
+            plt.Line2D([0],[0], marker='o', ls='', color='#d62728', label='Single',    ms=6),
+        ]
+    axes[0].legend(handles=legend_handles, loc='upper right', fontsize=8, ncol=2)
+    fig.tight_layout()
+    return fig
+
+
+def add_click_annotations(fig, axes, t, series):
+    """Click near a point to label it with (t, value); click it again to remove.
+
+    Annotations toggle on/off per point. Only active in interactive windows
+    (has no effect on saved PNG/PKL output).
+    """
+    annotations = {}  # (axis_index, point_index) -> annotation artist
+
+    def on_click(event):
+        if event.inaxes not in axes or event.x is None:
+            return
+        ai = axes.index(event.inaxes)
+        ax = event.inaxes
+        y = np.asarray(series[ai], dtype=float)
+        disp = ax.transData.transform(np.column_stack([t, y]))
+        dist = np.hypot(disp[:, 0] - event.x, disp[:, 1] - event.y)
+        if np.all(np.isnan(dist)):
+            return
+        idx = int(np.nanargmin(dist))
+        if dist[idx] > 15:          # pixel threshold: ignore clicks far from any point
+            return
+        key = (ai, idx)
+        if key in annotations:                      # toggle off
+            annotations.pop(key).remove()
+        else:                                       # toggle on
+            annotations[key] = ax.annotate(
+                f"t={t[idx]:.2f}s\n{y[idx]:.4f}",
+                xy=(t[idx], y[idx]), xytext=(8, 8), textcoords='offset points',
+                fontsize=7, zorder=5,
+                bbox=dict(boxstyle='round,pad=0.3', fc='#ffffcc', ec='#666', alpha=0.9),
+                arrowprops=dict(arrowstyle='->', color='#333'))
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect('button_press_event', on_click)
+    fig._click_handler = on_click  # keep a reference alive
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('csv', help="CSV path or glob pattern")
+    ap.add_argument('--save', metavar='DIR',
+                    help="Save PNGs to DIR instead of opening interactive windows")
+    args = ap.parse_args()
+
+    paths = sorted(glob.glob(args.csv), key=lambda p: Path(p).stat().st_mtime)
+    if not paths:
+        sys.exit(f"No files match: {args.csv}")
+    path = paths[-1]
+
+    df = load_csv(path)
+    print(f"Loaded {path}  ({len(df)} rows)")
+    print(f"  time span: {df['utc'].iloc[0]}  ->  {df['utc'].iloc[-1]}")
+
+    # NED origin = first row
+    lat0 = df['lat_deg'].iloc[0]
+    lon0 = df['lon_deg'].iloc[0]
+    h0   = df['hgt_m'].iloc[0]
+    print(f"  NED origin: lat={lat0:.7f}  lon={lon0:.7f}  h={h0:.3f} m")
+
+    n, e, d = lla_to_ned(df['lat_deg'].values,
+                         df['lon_deg'].values,
+                         df['hgt_m'].values,
+                         lat0, lon0, h0)
+    df['n_m'] = n;  df['e_m'] = e;  df['d_m'] = d
+
+    # Time axis: seconds since first sample (using GNSS UTC)
+    t = (df['utc'] - df['utc'].iloc[0]).dt.total_seconds().values
+
+    colors = df['fix_quality'].apply(quality_color).values
+
+    # --- Figure 1: unprocessed position (all fix qualities) ---
+    fig1 = plot_triple(
+        t,
+        [n, e, d],
+        ['North [m]', 'East [m]', 'Down [m]'],
+        colors,
+        f"Unprocessed Position (NED, ref = first sample)  —  {Path(path).name}",
+    )
+
+    # --- Figure 2: unprocessed velocity (all fix qualities) ---
+    fig2 = plot_triple(
+        t,
+        [df['vn_mps'].values, df['ve_mps'].values, df['vd_mps'].values],
+        ['Vn [m/s]', 'Ve [m/s]', 'Vd [m/s]'],
+        colors,
+        f"Unprocessed Velocity (NED, from Doppler via KSXT)  —  {Path(path).name}",
+    )
+
+    # --- RTK fixed only (fix_quality == 4) ---
+    rtk = df[df['fix_quality'] == 4].reset_index(drop=True)
+    rtk_figs = []
+    if len(rtk) < 2:
+        print("\n[!] Fewer than 2 RTK-fixed samples; skipping RTK-corrected plots.")
+    else:
+        # NED origin = first RTK fixed sample
+        rlat0 = rtk['lat_deg'].iloc[0]
+        rlon0 = rtk['lon_deg'].iloc[0]
+        rh0   = rtk['hgt_m'].iloc[0]
+        rn, re, rd = lla_to_ned(rtk['lat_deg'].values,
+                                rtk['lon_deg'].values,
+                                rtk['hgt_m'].values,
+                                rlat0, rlon0, rh0)
+        rt = (rtk['utc'] - rtk['utc'].iloc[0]).dt.total_seconds().values
+        rvn, rve, rvd = (rtk['vn_mps'].values,
+                         rtk['ve_mps'].values,
+                         rtk['vd_mps'].values)
+
+        # 3-sigma values (centered on zero/origin) for RTK-fixed data only
+        pos_3sig = [3.0 * np.nanstd(a) for a in (rn, re, rd)]
+        vel_3sig = [3.0 * np.nanstd(a) for a in (rvn, rve, rvd)]
+
+        legend_rtk = [
+            plt.Line2D([0],[0], marker='o', ls='', color='#2ca02c', label='RTK fixed', ms=6),
+            plt.Line2D([0],[0], ls='--', color='#2ca02c', label='±3σ band'),
+        ]
+
+        # --- Figure 3: RTK corrected position ---
+        fig3 = plot_triple(
+            rt,
+            [rn, re, rd],
+            ['North [m]', 'East [m]', 'Down [m]'],
+            '#2ca02c',
+            f"RTK Corrected Position (NED)\n"
+            f"Ref LLA: lat={rlat0:.7f}°  lon={rlon0:.7f}°  h={rh0:.3f} m"
+            f"  —  {Path(path).name}",
+            sigma_bands=pos_3sig,
+            legend_handles=legend_rtk,
+        )
+
+        # --- Figure 4: RTK corrected velocity ---
+        fig4 = plot_triple(
+            rt,
+            [rvn, rve, rvd],
+            ['Vn [m/s]', 'Ve [m/s]', 'Vd [m/s]'],
+            '#2ca02c',
+            f"RTK Corrected Velocity (NED)  —  {Path(path).name}",
+            sigma_bands=vel_3sig,
+            legend_handles=legend_rtk,
+        )
+
+        rtk_figs = [('pos_rtk', fig3, rt, [rn, re, rd]),
+                    ('vel_rtk', fig4, rt, [rvn, rve, rvd])]
+
+        print(f"\nRTK-fixed-only ({len(rtk)} samples) 3σ values:")
+        for name, s3 in zip(('N', 'E', 'D'), pos_3sig):
+            print(f"  pos {name}: 3σ={s3:10.5f} m")
+        for name, s3 in zip(('Vn', 'Ve', 'Vd'), vel_3sig):
+            print(f"  vel {name}: 3σ={s3:10.6f} m/s")
+
+    # --- Summary stats ---
+    print("\nPosition relative to start [m]:")
+    for name, arr in [('N', n), ('E', e), ('D', d)]:
+        print(f"  {name}: mean={arr.mean():+10.4f}  std={arr.std():9.4f}  "
+              f"min={arr.min():+10.4f}  max={arr.max():+10.4f}")
+
+    print("\nVelocity [m/s]:")
+    for name, arr in [('Vn', df['vn_mps'].values),
+                      ('Ve', df['ve_mps'].values),
+                      ('Vd', df['vd_mps'].values)]:
+        arr = arr[~np.isnan(arr)]
+        if len(arr):
+            print(f"  {name}: mean={arr.mean():+10.5f}  std={arr.std():9.5f}  "
+                  f"min={arr.min():+10.5f}  max={arr.max():+10.5f}")
+
+    print("\nFix quality breakdown:")
+    qmap = {0: 'no fix', 1: 'single', 2: 'DGPS', 4: 'RTK fixed', 5: 'RTK float'}
+    counts = df['fix_quality'].dropna().astype(int).value_counts().sort_index()
+    total = counts.sum()
+    for q, n_rows in counts.items():
+        print(f"  {qmap.get(q, f'q={q}'):11s}: {n_rows:6d}  ({100*n_rows/total:5.1f}%)")
+
+    all_figs = [
+        ('pos_unprocessed', fig1, t, [n, e, d]),
+        ('vel_unprocessed', fig2, t, [df['vn_mps'].values,
+                                      df['ve_mps'].values,
+                                      df['vd_mps'].values]),
+    ] + rtk_figs
+
+    if args.save:
+        outdir = Path(args.save)
+        outdir.mkdir(parents=True, exist_ok=True)
+        stem = Path(path).stem
+        for name, fig, _, _ in all_figs:
+            fig.savefig(outdir / f"{stem}_{name}.png", dpi=150, bbox_inches='tight')
+            with open(outdir / f"{stem}_{name}.pkl", 'wb') as f:
+                pickle.dump(fig, f)
+        print(f"\nSaved {len(all_figs)} plots (PNG + PKL) to {outdir}/")
+    else:
+        # Enable click-to-label (toggle on/off) only for interactive windows
+        for _, fig, ft, fseries in all_figs:
+            add_click_annotations(fig, list(fig.axes), ft, fseries)
+        plt.show()
+
+
+if __name__ == '__main__':
+    main()

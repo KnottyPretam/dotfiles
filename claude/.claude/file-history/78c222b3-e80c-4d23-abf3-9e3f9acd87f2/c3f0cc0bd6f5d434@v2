@@ -1,0 +1,99 @@
+function [C_rate, C_att, info] = build_controller_tf(params, mode, axis)
+% Build rate and attitude controller transfer functions from logged PX4 gains.
+% mode  : 'mc' or 'fw'
+% axis  : 'roll' | 'pitch' | 'yaw'
+% Returns C_rate and C_att as MATLAB tf objects (or [] if any required gain is missing),
+% plus an info struct listing the values used and any missing params.
+
+info = struct('mode', mode, 'axis', axis, 'gains', struct(), ...
+              'missing', {{}}, 'used_defaults', false);
+
+s = tf('s');
+
+switch lower(mode)
+case 'mc'
+    switch lower(axis)
+        case 'roll',  ax_rate = 'ROLL';  ax_att = 'ROLL';
+        case 'pitch', ax_rate = 'PITCH'; ax_att = 'PITCH';
+        case 'yaw',   ax_rate = 'YAW';   ax_att = 'YAW';
+        otherwise, error('unknown axis: %s', axis);
+    end
+    [K,  info] = getp(params, sprintf('MC_%sRATE_K', ax_rate), 1.0, info);
+    [Kp, info] = getp(params, sprintf('MC_%sRATE_P', ax_rate), NaN, info);
+    [Ki, info] = getp(params, sprintf('MC_%sRATE_I', ax_rate), NaN, info);
+    [Kd, info] = getp(params, sprintf('MC_%sRATE_D', ax_rate), NaN, info);
+    [Kp_att, info] = getp(params, sprintf('MC_%s_P', ax_att), NaN, info);
+
+    [f_d, info] = getp(params, 'IMU_DGYRO_CUTOFF', 30, info);
+    if ~isfinite(f_d) || f_d <= 0; f_d = 30; end
+    tau_d = 1/(2*pi*f_d);
+
+    if all(isfinite([K, Kp, Ki, Kd]))
+        C_rate = K * (Kp + Ki/s + Kd*s/(tau_d*s + 1));
+    else
+        C_rate = [];
+    end
+    if isfinite(Kp_att)
+        C_att = tf(Kp_att, 1);
+    else
+        C_att = [];
+    end
+    info.gains.K  = K;  info.gains.Kp = Kp; info.gains.Ki = Ki; info.gains.Kd = Kd;
+    info.gains.Kp_att = Kp_att;
+    info.gains.dterm_cutoff_Hz = f_d;
+
+case 'fw'
+    switch lower(axis)
+        case 'roll',  ax_rate = 'RR'; ax_att_tc = 'FW_R_TC'; ax_att_p = 'FW_R_P';
+        case 'pitch', ax_rate = 'PR'; ax_att_tc = 'FW_P_TC'; ax_att_p = 'FW_P_P';
+        case 'yaw',   ax_rate = 'YR'; ax_att_tc = 'FW_Y_TC'; ax_att_p = 'FW_Y_P';
+        otherwise, error('unknown axis: %s', axis);
+    end
+    [Kp, info] = getp(params, sprintf('FW_%s_P', ax_rate), NaN, info);
+    [Ki, info] = getp(params, sprintf('FW_%s_I', ax_rate), NaN, info);
+    [Kd, info] = getp(params, sprintf('FW_%s_D', ax_rate), 0,   info);
+
+    Kp_att = NaN;
+    if isKey(params, ax_att_tc)
+        tc = params(ax_att_tc);
+        if isfinite(tc) && tc > 0
+            Kp_att = 1.0 / tc;
+        end
+    end
+    if ~isfinite(Kp_att)
+        [Kp_att, info] = getp(params, ax_att_p, NaN, info);
+    end
+
+    [f_d, info] = getp(params, 'IMU_DGYRO_CUTOFF', 30, info);
+    if ~isfinite(f_d) || f_d <= 0; f_d = 30; end
+    tau_d = 1/(2*pi*f_d);
+
+    if all(isfinite([Kp, Ki, Kd]))
+        C_rate = Kp + Ki/s + Kd*s/(tau_d*s + 1);
+    else
+        C_rate = [];
+    end
+    if isfinite(Kp_att)
+        C_att = tf(Kp_att, 1);
+    else
+        C_att = [];
+    end
+    info.gains.Kp = Kp; info.gains.Ki = Ki; info.gains.Kd = Kd;
+    info.gains.Kp_att = Kp_att;
+    info.gains.dterm_cutoff_Hz = f_d;
+
+otherwise
+    error('unknown mode: %s', mode);
+end
+end
+
+function [v, info] = getp(params, key, default, info)
+if isKey(params, key)
+    v = params(key);
+else
+    v = default;
+    warning('param %s missing; using %g', key, default);
+    info.missing{end+1} = key;
+    info.used_defaults = true;
+end
+end

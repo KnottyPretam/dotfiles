@@ -1,0 +1,149 @@
+# SysID Chirp — SITL scenarios + log verifier
+
+## Context
+
+The `act_sysID` branch added a system-identification **chirp** to the Twin Rotor Tailsitter
+control allocator (`ActuatorEffectivenessTwinRotorTailsitter`, commit `bf933f2c0b`). The chirp is
+**gated**: it injects an open-loop frequency sweep into one actuator axis only when
+`CA_CHIRP_MODE != 0` **AND** `CA_CHIRP_EN == 1` **AND** the vehicle is **ARMED**, and it is
+**one-shot on the `CA_CHIRP_EN` 0→1 edge while already armed** (arming with EN preset to 1 does NOT
+fire it — the enable is consumed at the arm edge).
+
+Today this is exercised by `Testing/chirp_sysid/run_chirp_sysid.py`, which runs one positive sweep
+per mode and saves a ulog, plus C++ unit tests for the chirp math, per-mode routing, and the
+*static* gate (`ChirpArmedButDisabledDoesNotInject`, `ChirpDoesNotStartOnArm`). What's missing, and
+what this change adds:
+
+1. **Run each chirp** as part of a labelled, repeatable scenario set.
+2. **Negative gate tests** the unit harness can't cover (it can't deliver the runtime
+   `parameter_update`): *armed but EN never enabled → no chirp*, and *disarmed but EN on → no chirp*.
+3. **Timing tests**: trigger `CA_CHIRP_EN` at different times after arming and confirm the chirp
+   starts when the enable is triggered.
+4. **A Python post-processor** that reads each ulog and emits PASS/FAIL, verifying both that the
+   chirps run correctly *and* that the enable gating behaves (chirp present iff it should be).
+
+### Empirically validated during planning (against a real cyclic_pitch ulog)
+- `ulog.changed_parameters` records the runtime `CA_CHIRP_EN` 0→1 / 1→0 edges **with timestamps**;
+  `ulog.initial_parameters` holds all `CA_CHIRP_*`.
+- `actuator_outputs` (multi_id 0) is logged at **225 Hz** (resolves the 0.5→15 Hz sweep);
+  `actuator_motors`/`actuator_servos` are only ~10 Hz; `vehicle_status.arming_state` ~2 Hz.
+- With the airframe default `SDLOG_MODE 0` the **log starts at the arm event** (no pre-arm data).
+- **Detection works by matched filter**: reconstructing the sweep from the logged params and
+  correlating against each `actuator_outputs` channel over the EN window gives **|corr| = 0.905**
+  on the swashplate channels (0,2,4,6; L/R sign flips → use `abs`). **Raw signal energy is *higher*
+  outside the window** (an armed grounded vehicle makes large attitude-controller motion), so the
+  verifier MUST use correlation, **not** an energy/std threshold.
+
+## Approach
+
+Extend the existing pymavlink SITL runner (the project's established e2e path — the unit tests
+themselves point to it) rather than build a parallel MAVSDK C++ harness. Add a scenario registry, a
+JSON sidecar per run, and a **new** `verify_chirp.py` matched-filter verifier. Reuse
+`output_map.py`'s coarse-grid `corr()` and `_series()` and its pyulog access patterns. All work is
+confined to `Testing/chirp_sysid/`.
+
+### Scenarios (10; each → one ulog + `*.scenario.json` sidecar)
+| Scenario | Flow | Expected |
+|---|---|---|
+| `pos_cyclic_pitch/_yaw/_collective/_collective_roll/_rpm` (5) | arm → pre_en → EN 0→1 → sweep T → EN 0 → disarm | chirp present, onset ≈ arm+pre_en |
+| `neg_armed_disabled` | mode set, arm, hold > T, **EN never toggled**, disarm | **no chirp** |
+| `neg_unarmed_enabled` | continuous logging, **EN=1 while DISARMED**, hold > T, **never arm** | **no chirp** |
+| `timing_pre2 / pre5 / pre10` (3) | cyclic_pitch, `pre_en ∈ {2,5,10}s` | chirp present, onset ≈ arm+pre_en |
+
+## Files
+
+### 1. `Testing/chirp_sysid/run_chirp_sysid.py` (MODIFY)
+- Add a `SCENARIOS` registry (small namedtuple `Scenario(params, expect, flow, pre_en=None)`); keep
+  the existing `--chirps` path working (emit it as `pos_<chirp>` scenarios). Add `--scenarios`
+  (comma list / `all`) and `--verify`.
+- Refactor the body of `run_one_chirp` → `run_scenario(name, scn, args, common, shim)`, reusing
+  every existing helper (`launch_sitl`, `set_param`, `set_armed`, `parse_params_file`,
+  `newest_ulog_since`, `teardown_sitl`, `ensure_xmlstarlet_shim`, `tail`). Flow branches:
+  - `positive` — current behaviour, with `pre_en = scn.pre_en or args.pre_en`.
+  - `armed_no_en` — apply params, **explicitly `set_param CA_CHIRP_EN 0`**, arm, hold
+    `pre_en + chirp_T + margin` (armed span must exceed T), force-disarm; never touch EN.
+  - `unarmed_en` — **faithful disarmed capture** (chosen): set `SDLOG_MODE 2`, force a param save,
+    `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN` (id 246, param1=1), `wait_heartbeat`, re-apply chirp params,
+    set `CA_CHIRP_EN 1` **while disarmed**, hold `chirp_T + margin`, **never arm**, set EN 0, shut
+    down. Set the ulog-pickup `t0` before the reboot. (`MAV_CMD_LOGGING_START` is *not* used — in PX4
+    it streams ulog over MAVLink rather than guaranteeing an on-disk `.ulg`.)
+- New helper `write_sidecar(ulog_dst, timeline)` → `<ulog>.scenario.json` capturing:
+  `scenario, expected_outcome, mode, pre_en, chirp_T, margin, arm/en_on/en_off/disarm walltimes,
+  params{CA_CHIRP_*}`. Wall-times are provenance only — verification is **log-relative** (log starts
+  at arm). Add `import json`.
+- When `--verify`, shell out to `verify_chirp.py --batch <out>` and fold its exit code in.
+
+### 2. `Testing/chirp_sysid/verify_chirp.py` (NEW)
+Header/deps style mirrors `output_map.py`. Reuse `corr`, `_series`, `INVALID`, `DISARMED` by
+importing from the co-located `output_map`.
+- `read_timeline(path)` → armed intervals from `vehicle_status.arming_state==2`; `CA_CHIRP_EN`/`MODE`
+  edges from `changed_parameters` (abs ts − `start_timestamp`); `CA_CHIRP_*` from
+  `initial_parameters`; log duration. Helper `_state_intervals()` for contiguous armed runs.
+- `reconstruct_template(params, t)` → vectorized mirror of `Chirp::update`:
+  `beta=(f1-f0)/T^ord; phase=2π(beta/(ord+1)·tc^(ord+1)+f0·tc); y=amp·sin(phase)`, `tc=clip(t,0,T)`,
+  `y[t>T]=0` (matches `Chirp::finished`).
+- `detect_chirp(path, timeline)` → **sliding matched filter**: for candidate start times on a 0.5 s
+  grid inside each sufficiently-long armed interval, build the shifted template on the 225 Hz
+  `actuator_outputs` timestamps and `abs(corr(channel, template))` against every non-trivial channel
+  (`std>1e-6`, magics dropped by `_series`). Return best `(found, channel, t_start, corr)`.
+  `CORR_THRESHOLD=0.70` (well below the validated 0.905, above incidental controller correlation),
+  `CORR_MARGIN=0.15` best-vs-second guard, `ONSET_TOL_S=1.5`. Fast path: when the timeline has an EN
+  edge, restrict candidates to ±3 s around it. No armed window long enough → `found=False` (the
+  `unarmed_en` case passes correctly because the gate requires armed).
+- `verify(path, expected, timeline)` → PASS/FAIL + reasons:
+  - `chirp_present`: detected AND onset within `ONSET_TOL_S` of the EN 0→1 edge AND that edge is
+    inside an armed interval. Detected-but-no-logged-EN-edge → FAIL (contradicts the gate).
+    Timing scenarios additionally assert `onset ≈ en_on ≈ pre_en` when the sidecar provides `pre_en`.
+  - `no_chirp`: nothing detected anywhere.
+- `--batch DIR` → verify all `*.ulg`; read `*.scenario.json` for `expected_outcome`, else **derive**
+  it from the log (armed-interval AND EN 0→1 edge ⇒ present, else no_chirp — exactly the runtime
+  gate). Print a PASS/FAIL matrix; `sys.exit(1)` if any fail.
+- `--plot` → **interactive picklable figures** (chosen output): scaffold via the **picklable-plots**
+  skill (gzipped `.pkl.gz` + `.png` + the generic `show_figure.py` viewer). Per log: detected
+  actuator channel vs log-relative time, armed-interval shading, EN on/off lines, expected
+  `[en_on, en_on+T]` span, and the normalized reconstructed sweep overlaid at `t_start`.
+- `main()` dispatch mirrors `output_map.main()`: `--ulog [--expected]`, `--batch`, `--plot`,
+  `--channel`, `--threshold`, `--onset-tol`.
+
+### 3. `Testing/chirp_sysid/params/neg_unarmed_enabled.params` (NEW)
+`cyclic_pitch.params` content (MODE 1, 0.5→15 Hz / 20 s) **plus `param set SDLOG_MODE 2`** so the
+disarmed period is logged (consumed by the reboot step in the runner). The 5 positive param files,
+`_common.params`, and `cyclic_pitch.params` (reused by `neg_armed_disabled` and the timing
+scenarios) are unchanged.
+
+### 4. `Testing/chirp_sysid/README.md` (MODIFY)
+Add a **Scenarios** table, a **Verification** section (`verify_chirp.py` usage, the 0.70 threshold
+rationale, matched-filter-not-energy note, sidecar + fallback behaviour, the `SDLOG_MODE 2`+reboot
+caveat for `neg_unarmed_enabled`), and the one-command path.
+
+## Reused existing code
+- `Testing/chirp_sysid/output_map.py`: `corr()` (coarse-grid resample + `corrcoef`), `_series()`
+  (drops non-finite / disabled / disarmed magics), pyulog access patterns.
+- `Testing/chirp_sysid/run_chirp_sysid.py`: all SITL/MAVLink helpers listed above.
+- `Testing/chirp_sysid/params/*.params`, `_common.params`: scenario param sources.
+- Skill `picklable-plots`: re-openable figure scaffolding + `show_figure.py` viewer.
+
+## Verification (how to test end-to-end)
+Run inside the dev container (`devcon`), from repo root:
+1. `python3 Testing/chirp_sysid/run_chirp_sysid.py --scenarios all --verify`
+   — builds SITL, runs all 10 scenarios (≈10 gazebo boots, several minutes), writes
+   `logs/<scenario>_<UTC>.ulg` + `.scenario.json`, then runs the verifier batch and exits nonzero
+   if any scenario fails.
+2. Expected verifier matrix: 5 positives + 3 timing = `chirp_present` PASS (corr ≳ 0.8, onset within
+   1.5 s of the EN edge; timing onsets ≈ 2/5/10 s); `neg_armed_disabled` + `neg_unarmed_enabled` =
+   `no_chirp` PASS.
+3. Spot-check a plot: `python3 Testing/chirp_sysid/verify_chirp.py --ulog logs/pos_cyclic_pitch_*.ulg --plot out.png`
+   then reopen with the picklable viewer; the sweep overlay should sit on the EN window and the
+   shaded armed interval.
+4. Sanity baseline (no SITL needed): the verifier already passes on the existing
+   `logs/cyclic_pitch_20260603T164203Z.ulg` (validated: |corr|=0.905, EN edge at 2.90 s).
+
+## Risks / notes
+- **`rpm` mode (5)** injects into the motor channel, not the swashplate; the all-channel scan covers
+  it but the 0.905 figure was on servos — the motor-channel corr is unvalidated and may sit lower.
+  First live run may justify a per-mode threshold; `--threshold` is exposed.
+- **Reboot persistence**: `SDLOG_MODE 2` must persist across the reboot — rely on param autosave /
+  force a save before `MAV_CMD_PREFLIGHT_REBOOT_SHUTDOWN`; confirm the post-reboot ulog contains the
+  disarmed window on the first run.
+- **Runtime**: `--scenarios all` is ~10 boots; `--scenarios pos_cyclic_pitch,neg_armed_disabled`
+  etc. remain available for quick iteration.

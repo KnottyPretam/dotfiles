@@ -1,0 +1,17 @@
+"""Offline PX4 EKF2 reconstruction & tuning.
+
+Re-runs the EKF2 estimator from a ULG flight log using tuning parameters
+supplied in a YAML file, reproducing the NED position/velocity estimates and
+their covariance so tuning changes can be compared against the actual flight.
+
+See the package modules:
+  log_io     ULog access helpers, EKF-instance / IMU-device resolution
+  quat       quaternion / DCM / Euler math (scalar-first Hamilton)
+  geo        NED map projection, GPS/baro/mag readers
+  imu_recon  rebuild the EKF IMU input (delta-angle/velocity) from raw FIFO
+  params     YAML tuning-parameter schema + dump-from-log
+  derivation SymPy-built covariance Jacobians (A, G) and yaw measurement H
+  height     scalar baro height-bias estimator
+  filter     the 24-state EKF (predict, fuse, covariance conditioning)
+  plots      position/velocity reconstruction and variance-comparison figures
+"""

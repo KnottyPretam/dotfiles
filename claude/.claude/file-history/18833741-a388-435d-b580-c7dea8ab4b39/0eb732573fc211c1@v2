@@ -1,0 +1,430 @@
+"""The 24-state EKF2 filter core -- a faithful float64 reimplementation of the
+PX4 ECL EKF predict/fuse/condition steps for the active fusions in this flight
+(GPS hpos + 3D vel, GPS height [reference], baro height [bias estimator],
+mag-heading). Covariance Jacobians come from ekf2.derivation (SymPy).
+
+Cross-references to the PX4 source (this fork) are noted per method.
+"""
+
+import numpy as np
+
+from . import derivation
+from .height import BiasEstimator
+from .quat import (axis_angle_to_quat, getEulerYaw, quat_mult, quat_to_dcm,
+                   qnorm, shouldUse321RotationSequence, updateYawInRotMat, wrap_pi)
+
+CONST_G = 9.80665                  # CONSTANTS_ONE_G
+EARTH_SPIN = 7.2921e-5             # CONSTANTS_EARTH_SPIN_RATE [rad/s]
+INITIAL_WIND_UNCERTAINTY = 1.0     # _params.initial_wind_uncertainty
+MAG_NOISE = 0.05                   # EKF2_MAG_NOISE default (mag states inert for heading-only)
+
+
+def sq(x):
+    return x * x
+
+
+class Ekf:
+    def __init__(self, params, lat_rad):
+        self.p = params
+        self.dt_ekf_avg = params.predict_period_s     # _dt_ekf_avg, tracked below
+        self.x = np.zeros(24)
+        self.x[0] = 1.0
+        self.P = np.zeros((24, 24))
+        self.R_to_earth = np.eye(3)
+        self.earth_rate_ned = EARTH_SPIN * np.array([np.cos(lat_rad), 0.0, -np.sin(lat_rad)])
+        self.ang_rate_raw = np.zeros(3)                # _ang_rate_delayed_raw (lever arm)
+        self.baro_b_est = BiasEstimator()
+        # active fusion modes for this flight
+        self.mag_3D = False
+        self.wind = False
+        # last-computed innovations / variances, for comparison with the log
+        self.aid = {}
+        # cached gps sample (vel/pos lever-arm corrected) for the height fusion
+        self._gps_sample = None
+        # fusion-timeout reset bookkeeping (PX4 resets state to GPS when fusion
+        # is rejected for too long -- prevents a gating cascade from running away)
+        self.t_now = 0.0
+        self.reset_timeout_s = 0.5
+        self.t_last_vel_fuse = -1e9
+        self.t_last_pos_fuse = -1e9
+        self.n_vel_resets = 0
+        self.n_pos_resets = 0
+
+    # ------------------------------------------------------------------ #
+    # seeding
+    # ------------------------------------------------------------------ #
+    def set_state(self, x):
+        self.x = np.asarray(x, dtype=np.float64).copy()
+        self.x[0:4] = qnorm(self.x[0:4])
+        self.R_to_earth = quat_to_dcm(self.x[0:4])
+
+    def seed_covariance_diag(self, cov_diag):
+        """Seed P from the logged covariance diagonal (off-diagonals unknown ->
+        zero); off-diagonals rebuild during the burn-in window."""
+        self.P = np.diag(np.clip(np.asarray(cov_diag, dtype=np.float64), 0.0, None))
+
+    def seed_baro_bias(self, bias, bias_var):
+        self.baro_b_est.set_bias(float(bias))
+        self.baro_b_est._state_var = float(bias_var)
+        self.baro_b_est.set_max_state_noise(np.sqrt(sq(self.p.baro_noise)))
+
+    # ------------------------------------------------------------------ #
+    # covariance initialisation (covariance.cpp:53-100, ekf_helper.cpp quat block)
+    # ------------------------------------------------------------------ #
+    def _uncorrelate(self, start, n, var):
+        self.P[start:start + n, :] = 0.0
+        self.P[:, start:start + n] = 0.0
+        for i in range(start, start + n):
+            self.P[i, i] = var
+
+    def initialise_covariance(self):
+        p, dt = self.p, self.dt_ekf_avg
+        self.P = np.zeros((24, 24))
+        self._reset_quat_cov()
+        self.P[4, 4] = sq(max(p.gps_vel_noise, 0.01)); self.P[5, 5] = self.P[4, 4]
+        self.P[6, 6] = sq(1.5) * self.P[4, 4]
+        self.P[7, 7] = sq(max(p.gps_pos_noise, 0.01)); self.P[8, 8] = self.P[7, 7]
+        self.P[9, 9] = (sq(max(1.5 * p.gps_pos_noise, 0.01)) if p.height_ref == "gps"
+                        else sq(max(p.baro_noise, 0.01)))
+        for i in (10, 11, 12):
+            self.P[i, i] = sq(p.gyro_bias_init * dt)
+        for i in (13, 14, 15):
+            self.P[i, i] = sq(p.accel_bias_init * dt)
+        for i in (16, 17, 18, 19, 20, 21):
+            self.P[i, i] = sq(MAG_NOISE)
+        self.P[22, 22] = sq(INITIAL_WIND_UNCERTAINTY); self.P[23, 23] = self.P[22, 22]
+
+    def _reset_quat_cov(self):
+        self._uncorrelate(0, 4, 0.0)
+        rot_vec_var = np.full(3, sq(self.p.angle_err_init))
+        self._initialise_quat_covariances(rot_vec_var)
+        # mag heading tuning param used (mag_fusion_type <= MAG_3D)
+        self._increase_quat_yaw_err_variance(sq(max(self.p.mag_heading_noise, 1.0e-2)))
+
+    def _initialise_quat_covariances(self, rot_vec_var):
+        """matlab-autocoded mapping of a rotation-vector variance into the
+        quaternion covariance block (ekf_helper.cpp:926)."""
+        q = self.x[0:4]
+        if q[0] >= 0.0:
+            q0, q1, q2, q3 = q
+        else:
+            q0, q1, q2, q3 = -q[0], -q[1], -q[2], -q[3]
+        delta = 2.0 * np.arccos(np.clip(q0, -1.0, 1.0))
+        scaler = (delta / np.sin(delta * 0.5)) if abs(np.sin(delta * 0.5)) > 1e-9 else 2.0
+        rotX, rotY, rotZ = scaler * q1, scaler * q2, scaler * q3
+        rvv = rot_vec_var
+        t2 = rotX * rotX; t4 = rotY * rotY; t5 = rotZ * rotZ
+        t6 = t2 + t4 + t5
+        P = self.P
+        if t6 > 1e-9:
+            t7 = np.sqrt(t6); t8 = t7 * 0.5; t3 = np.sin(t8); t9 = t3 * t3
+            t10 = 1.0 / t6; t11 = 1.0 / np.sqrt(t6); t12 = np.cos(t8)
+            t13 = 1.0 / t6 ** 1.5; t14 = t3 * t11
+            t15 = rotX * rotY * t3 * t13; t16 = rotX * rotZ * t3 * t13
+            t17 = rotY * rotZ * t3 * t13
+            t18 = t2 * t10 * t12 * 0.5; t27 = t2 * t3 * t13; t19 = t14 + t18 - t27
+            t23 = rotX * rotY * t10 * t12 * 0.5; t28 = t15 - t23
+            t20 = rotY * rvv[1] * t3 * t11 * t28 * 0.5
+            t25 = rotX * rotZ * t10 * t12 * 0.5; t31 = t16 - t25
+            t21 = rotZ * rvv[2] * t3 * t11 * t31 * 0.5
+            t22 = t20 + t21 - rotX * rvv[0] * t3 * t11 * t19 * 0.5
+            t29 = t4 * t10 * t12 * 0.5; t34 = t3 * t4 * t13; t30 = t14 + t29 - t34
+            t32 = t5 * t10 * t12 * 0.5; t40 = t3 * t5 * t13; t33 = t14 + t32 - t40
+            t36 = rotY * rotZ * t10 * t12 * 0.5; t39 = t17 - t36
+            t35 = rotZ * rvv[2] * t3 * t11 * t39 * 0.5
+            t37 = t15 - t23; t38 = t17 - t36
+            t43 = t16 - t25; t44 = t17 - t36
+            t41 = rvv[0] * (t15 - t23) * (t16 - t25)
+            t42 = t41 - rvv[1] * t30 * t39 - rvv[2] * t33 * t39
+            self._uncorrelate(0, 4, 0.0)
+            P[0, 0] = rvv[0] * t2 * t9 * t10 * 0.25 + rvv[1] * t4 * t9 * t10 * 0.25 + rvv[2] * t5 * t9 * t10 * 0.25
+            P[0, 1] = t22
+            P[0, 2] = t35 + rotX * rvv[0] * t3 * t11 * (t15 - rotX * rotY * t10 * t12 * 0.5) * 0.5 - rotY * rvv[1] * t3 * t11 * t30 * 0.5
+            P[0, 3] = rotX * rvv[0] * t3 * t11 * (t16 - rotX * rotZ * t10 * t12 * 0.5) * 0.5 + rotY * rvv[1] * t3 * t11 * (t17 - rotY * rotZ * t10 * t12 * 0.5) * 0.5 - rotZ * rvv[2] * t3 * t11 * t33 * 0.5
+            P[1, 0] = t22
+            P[1, 1] = rvv[0] * (t19 * t19) + rvv[1] * (t28 * t28) + rvv[2] * (t31 * t31)
+            P[1, 2] = rvv[2] * (t16 - t25) * (t17 - rotY * rotZ * t10 * t12 * 0.5) - rvv[0] * t19 * t28 - rvv[1] * t28 * t30
+            P[1, 3] = rvv[1] * (t15 - t23) * (t17 - rotY * rotZ * t10 * t12 * 0.5) - rvv[0] * t19 * t31 - rvv[2] * t31 * t33
+            P[2, 0] = t35 - rotY * rvv[1] * t3 * t11 * t30 * 0.5 + rotX * rvv[0] * t3 * t11 * (t15 - t23) * 0.5
+            P[2, 1] = rvv[2] * (t16 - t25) * (t17 - t36) - rvv[0] * t19 * t28 - rvv[1] * t28 * t30
+            P[2, 2] = rvv[1] * (t30 * t30) + rvv[0] * (t37 * t37) + rvv[2] * (t38 * t38)
+            P[2, 3] = t42
+            P[3, 0] = -rotZ * rvv[2] * t3 * t11 * t33 * 0.5 + rotX * rvv[0] * t3 * t11 * (t16 - t25) * 0.5 + rotY * rvv[1] * t3 * t11 * (t17 - t36) * 0.5
+            P[3, 1] = rvv[1] * (t15 - t23) * (t17 - t36) - rvv[0] * t19 * t31 - rvv[2] * t31 * t33
+            P[3, 2] = t42
+            P[3, 3] = rvv[2] * (t33 * t33) + rvv[0] * (t43 * t43) + rvv[1] * (t44 * t44)
+        else:
+            self._uncorrelate(0, 1, 0.0)
+            self._uncorrelate(1, 3, 0.25 * rot_vec_var[0])
+
+    def _increase_quat_yaw_err_variance(self, yaw_variance):
+        """ekf_helper.cpp:1046 -- add uncorrelated yaw uncertainty to the quat block."""
+        q = self.x[0:4]
+        SG = [sq(q[0]) - sq(q[1]) - sq(q[2]) + sq(q[3]),
+              2 * q[0] * q[2] - 2 * q[1] * q[3],
+              2 * q[0] * q[1] + 2 * q[2] * q[3]]
+        SQ = [0.5 * (q[1] * SG[0] - q[0] * SG[2] + q[3] * SG[1]),
+              0.5 * (q[0] * SG[1] - q[2] * SG[0] + q[3] * SG[2]),
+              0.5 * (q[3] * SG[0] - q[1] * SG[1] + q[2] * SG[2]),
+              0.5 * (q[0] * SG[0] + q[1] * SG[2] + q[2] * SG[1])]
+        yv = min(yaw_variance, 1.0e-2)
+        P = self.P
+        P[0, 0] += yv * sq(SQ[2]); P[0, 1] += yv * SQ[1] * SQ[2]; P[1, 1] += yv * sq(SQ[1])
+        P[0, 2] += yv * SQ[0] * SQ[2]; P[1, 2] += yv * SQ[0] * SQ[1]; P[2, 2] += yv * sq(SQ[0])
+        P[0, 3] -= yv * SQ[2] * SQ[3]; P[1, 3] -= yv * SQ[1] * SQ[3]; P[2, 3] -= yv * SQ[0] * SQ[3]
+        P[3, 3] += yv * sq(SQ[3])
+        P[1, 0] += yv * SQ[1] * SQ[2]; P[2, 0] += yv * SQ[0] * SQ[2]; P[2, 1] += yv * SQ[0] * SQ[1]
+        P[3, 0] -= yv * SQ[2] * SQ[3]; P[3, 1] -= yv * SQ[1] * SQ[3]; P[3, 2] -= yv * SQ[0] * SQ[3]
+
+    # ------------------------------------------------------------------ #
+    # prediction (covariance.cpp:102, ekf.cpp:253)
+    # ------------------------------------------------------------------ #
+    def predict_covariance(self, delta_ang, delta_vel):
+        p, dt = self.p, self.dt_ekf_avg
+        A, G = derivation.jacobians(self.x, delta_vel, delta_ang, dt)
+        d_ang_var = sq(dt * np.clip(p.gyro_noise, 0.0, 1.0))
+        d_vel_var = sq(dt * np.clip(p.accel_noise, 0.0, 1.0))
+        var_u = np.diag([d_vel_var, d_vel_var, d_vel_var, d_ang_var, d_ang_var, d_ang_var])
+        nextP = A @ self.P @ A.T + G @ var_u @ G.T
+
+        d_ang_bias_sig = dt * dt * np.clip(p.gyro_bias_noise, 0.0, 1.0)
+        d_vel_bias_sig = dt * dt * np.clip(p.accel_bias_noise, 0.0, 1.0)
+        for i in (10, 11, 12):
+            nextP[i, i] += sq(d_ang_bias_sig)
+        for i in (13, 14, 15):
+            nextP[i, i] += sq(d_vel_bias_sig)
+        # mag/wind additive process noise is zero for this configuration
+
+        self.P = nextP
+        self.fix_covariance_errors(force_symmetry=False)
+        self.P = 0.5 * (self.P + self.P.T)
+
+    def predict_state(self, delta_ang, delta_vel, dt_ang, dt_vel):
+        x = self.x
+        gyro_bias = x[10:13] / self.dt_ekf_avg          # getGyroBias()
+        accel_bias = x[13:16] / self.dt_ekf_avg         # getAccelBias()
+        corrected_dang = delta_ang - gyro_bias * dt_ang
+        corrected_dang -= self.R_to_earth.T @ self.earth_rate_ned * dt_ang
+        dq = axis_angle_to_quat(corrected_dang)
+        x[0:4] = qnorm(quat_mult(x[0:4], dq))
+        self.R_to_earth = quat_to_dcm(x[0:4])
+        corrected_dvel = delta_vel - accel_bias * dt_vel
+        dvel_ef = self.R_to_earth @ corrected_dvel
+        vel_last = x[4:7].copy()
+        x[4:7] += dvel_ef
+        x[6] += CONST_G * dt_vel
+        x[7:10] += 0.5 * (vel_last + x[4:7]) * dt_vel
+
+        # average filter update interval (scales all process noise)
+        inp = 0.5 * (dt_vel + dt_ang)
+        fu = self.p.predict_period_s
+        inp = np.clip(inp, 0.5 * fu, 2.0 * fu)
+        self.dt_ekf_avg = 0.99 * self.dt_ekf_avg + 0.01 * inp
+        if dt_ang > 0.25 * self.dt_ekf_avg:
+            self.ang_rate_raw = delta_ang / dt_ang
+
+    # ------------------------------------------------------------------ #
+    # covariance conditioning (covariance.cpp:351, 544)
+    # ------------------------------------------------------------------ #
+    def fix_covariance_errors(self, force_symmetry):
+        P = self.P
+        for i in range(0, 4):
+            P[i, i] = np.clip(P[i, i], 0.0, 1.0)
+        for i in range(4, 10):
+            P[i, i] = np.clip(P[i, i], 1e-6, 1e6)
+        for i in range(10, 13):
+            P[i, i] = np.clip(P[i, i], 0.0, 1.0)
+        # accelerometer bias states: ratio limiter + 0.1g cap (not inhibited)
+        max_state_var = max(1e-9, P[13, 13], P[14, 14], P[15, 15])
+        min_allowed = max(0.01 * max_state_var, 5e-8)
+        cap = sq(0.1 * CONST_G * self.dt_ekf_avg)
+        for i in (13, 14, 15):
+            P[i, i] = np.clip(P[i, i], min_allowed, cap)
+        # magnetic field states inert (mag_3D off) -> keep at zero
+        if not self.mag_3D:
+            self._uncorrelate(16, 3, 0.0)
+            self._uncorrelate(19, 3, 0.0)
+        # wind states inert -> keep at zero
+        if not self.wind:
+            self._uncorrelate(22, 2, 0.0)
+        if force_symmetry:
+            self.P = 0.5 * (P + P.T)
+
+    def _check_and_fix_cov_update(self, KHP):
+        healthy = True
+        for i in range(24):
+            if self.P[i, i] < KHP[i, i]:
+                self._uncorrelate(i, 1, 0.0)
+                healthy = False
+        return healthy
+
+    def _clear_inhibited_gains(self, K):
+        # gyro/accel bias are not inhibited in this flight; mag & wind are
+        if not self.mag_3D:
+            K[16:22] = 0.0
+        if not self.wind:
+            K[22:24] = 0.0
+
+    def _fuse(self, K, innovation):
+        self.x -= K * innovation
+        self.x[0:4] = qnorm(self.x[0:4])
+        self.R_to_earth = quat_to_dcm(self.x[0:4])
+
+    def _measurement_update(self, K, innov_var, innovation):
+        """Generic scalar update (ekf.h:944), used by mag-yaw. KHP = (K*S) outer K."""
+        self._clear_inhibited_gains(K)
+        KHP = np.outer(K * innov_var, K)
+        if self._check_and_fix_cov_update(KHP):
+            self.P -= KHP
+            self.fix_covariance_errors(force_symmetry=True)
+            self._fuse(K, innovation)
+            return True
+        return False
+
+    def _fuse_vel_pos_height(self, innov, innov_var, obs_index):
+        """Direct single-state fusion (vel_pos_fusion.cpp:193). KHP = K outer P[s,:]."""
+        s = obs_index + 4
+        K = self.P[:, s] / innov_var
+        self._clear_inhibited_gains(K)
+        KHP = np.outer(K, self.P[s, :])
+        if self._check_and_fix_cov_update(KHP):
+            self.P -= KHP
+            self.fix_covariance_errors(force_symmetry=True)
+            self._fuse(K, innov)
+            return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    # state resets to GPS (ekf_helper.cpp resetVelocityTo / resetHorizontalPositionTo)
+    # ------------------------------------------------------------------ #
+    def _reset_velocity_to_gps(self, vel, vel_obs_var):
+        self.x[4:7] = vel
+        for j in range(3):
+            self._uncorrelate(4 + j, 1, max(sq(0.01), vel_obs_var[j]))
+        self.t_last_vel_fuse = self.t_now
+        self.n_vel_resets += 1
+
+    def _reset_horizontal_position_to_gps(self, pos, pos_obs_var):
+        self.x[7:9] = pos
+        for j in range(2):
+            self._uncorrelate(7 + j, 1, max(sq(0.01), pos_obs_var[j]))
+        self.t_last_pos_fuse = self.t_now
+        self.n_pos_resets += 1
+
+    # ------------------------------------------------------------------ #
+    # GPS velocity + horizontal position (gps_control.cpp:89-120)
+    # ------------------------------------------------------------------ #
+    def fuse_gps(self, sample):
+        """sample: dict with vel(3 NED), pos(2 NE), alt(scalar AMSL), sacc, hacc, vacc.
+        Applies the lever-arm correction and fuses velocity + horizontal position;
+        caches the (corrected) sample for the GNSS-height fusion."""
+        p = self.p
+        vel = np.asarray(sample["vel"], dtype=np.float64).copy()
+        pos = np.asarray(sample["pos"], dtype=np.float64).copy()
+        alt = float(sample["alt"])
+        # lever-arm: correct for GPS antenna offset relative to the IMU
+        lever = p.gps_lever_body
+        if np.any(lever):
+            vel_off_body = np.cross(self.ang_rate_raw, lever)
+            vel -= self.R_to_earth @ vel_off_body
+            pos_off_earth = self.R_to_earth @ lever
+            pos = pos - pos_off_earth[0:2]
+            alt += pos_off_earth[2]
+        self._gps_sample = dict(alt=alt, vacc=sample.get("vacc"))
+
+        # velocity (3D)
+        vel_var = sq(max(sample.get("sacc", 0.0), p.gps_vel_noise))
+        obs_var = np.array([vel_var, vel_var, vel_var * sq(1.5)])
+        gate = max(p.gps_vel_gate, 1.0)
+        innov = self.x[4:7] - vel
+        ivar = self.P[[4, 5, 6], [4, 5, 6]] + np.maximum(sq(0.01), obs_var)
+        tr = innov ** 2 / (sq(gate) * ivar)
+        self.aid["gps_hvel"] = (innov[0:2].copy(), ivar[0:2].copy())
+        self.aid["gps_vvel"] = (innov[2], ivar[2])
+        if not np.any(tr > 1.0):
+            (self._fuse_vel_pos_height(innov[0], ivar[0], 0)
+             and self._fuse_vel_pos_height(innov[1], ivar[1], 1)
+             and self._fuse_vel_pos_height(innov[2], ivar[2], 2))
+            self.t_last_vel_fuse = self.t_now
+        elif self.t_now - self.t_last_vel_fuse > self.reset_timeout_s:
+            self._reset_velocity_to_gps(vel, obs_var)
+
+        # horizontal position (2D)
+        pos_noise = max(sample.get("hacc", 0.0), p.gps_pos_noise)
+        # GPS is the sole horizontal aiding source -> cap observation noise
+        pos_noise = min(pos_noise, p.pos_noaid_noise)
+        pvar = sq(pos_noise)
+        gate = max(p.gps_pos_gate, 1.0)
+        innovp = self.x[7:9] - pos
+        ivarp = self.P[[7, 8], [7, 8]] + max(sq(0.01), pvar)
+        trp = innovp ** 2 / (sq(gate) * ivarp)
+        self.aid["gps_hpos"] = (innovp.copy(), ivarp.copy())
+        if not np.any(trp > 1.0):
+            (self._fuse_vel_pos_height(innovp[0], ivarp[0], 3)
+             and self._fuse_vel_pos_height(innovp[1], ivarp[1], 4))
+            self.t_last_pos_fuse = self.t_now
+        elif self.t_now - self.t_last_pos_fuse > self.reset_timeout_s:
+            self._reset_horizontal_position_to_gps(pos, np.array([pvar, pvar]))
+
+    # ------------------------------------------------------------------ #
+    # height fusion (baro_height_control.cpp / gnss_height_control.cpp)
+    # ------------------------------------------------------------------ #
+    def predict_baro_bias(self):
+        self.baro_b_est.predict(self.dt_ekf_avg)
+
+    def fuse_baro_height(self, baro_hgt):
+        p = self.p
+        meas = baro_hgt
+        meas_var = sq(p.baro_noise)
+        bias = self.baro_b_est.get_bias()
+        obs = -(meas - bias)                                   # baro has opposite sign to NED-down
+        obs_var = meas_var + self.baro_b_est.get_bias_var()
+        gate = max(p.baro_gate, 1.0)
+        innov = self.x[9] - obs
+        ivar = self.P[9, 9] + max(sq(0.01), obs_var)
+        self.aid["baro_vpos"] = (innov, ivar)
+        # update the bias estimator (after using its state for the innovation)
+        self.baro_b_est.set_max_state_noise(np.sqrt(meas_var))
+        self.baro_b_est.set_process_noise_spectral_density(p.baro_bias_nsd)
+        self.baro_b_est.fuse_bias(meas - (-self.x[9]), meas_var + self.P[9, 9])
+        if innov ** 2 / (sq(gate) * ivar) <= 1.0:
+            self._fuse_vel_pos_height(innov, ivar, 5)
+
+    def fuse_gnss_height(self, origin_alt):
+        """GNSS height fusion. GPS is the height reference so its bias is 0."""
+        if self._gps_sample is None:
+            return
+        p = self.p
+        vacc = self._gps_sample.get("vacc")
+        noise = max(vacc if vacc is not None else 0.0, 1.5 * p.gps_pos_noise)
+        noise = min(noise, p.pos_noaid_noise)                  # baro also active -> cap applies
+        meas = self._gps_sample["alt"] - origin_alt
+        meas_var = sq(noise)
+        obs = -meas                                            # reference bias is 0
+        gate = max(p.gps_pos_gate, 1.0)
+        innov = self.x[9] - obs
+        ivar = self.P[9, 9] + max(sq(0.01), meas_var)
+        self.aid["gps_vpos"] = (innov, ivar)
+        if innov ** 2 / (sq(gate) * ivar) <= 1.0:
+            self._fuse_vel_pos_height(innov, ivar, 5)
+
+    # ------------------------------------------------------------------ #
+    # magnetometer heading (mag_control.cpp:427 + mag_fusion.cpp:235)
+    # ------------------------------------------------------------------ #
+    def fuse_mag_heading(self, mag, declination_rad):
+        p = self.p
+        R0z = updateYawInRotMat(0.0, self.R_to_earth)
+        mag_earth = R0z @ (np.asarray(mag, dtype=np.float64) - self.x[19:22])
+        measured_hdg = -np.arctan2(mag_earth[1], mag_earth[0]) + declination_rad
+        innov = wrap_pi(getEulerYaw(self.R_to_earth) - measured_hdg)
+        obs_var = max(sq(p.mag_heading_noise), 1.0e-4)
+        use_321 = shouldUse321RotationSequence(self.R_to_earth)
+        H = derivation.yaw_H(self.x, use_321)
+        innov_var = float(H @ self.P @ H + obs_var)
+        self.aid["heading"] = (innov, innov_var)
+        if innov_var < obs_var:                                # badly conditioned -> abort
+            return
+        K = (self.P @ H) / innov_var
+        gate = max(p.heading_gate, 1.0)
+        if innov ** 2 / (sq(gate) * innov_var) <= 1.0:
+            self._measurement_update(K, innov_var, innov)

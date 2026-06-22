@@ -1,0 +1,153 @@
+# Plan: Per-log 100 Hz vibration PSD summary CSV
+
+## Context
+
+The directory `/home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26`
+holds 9 PX4 `.ulg` flight logs (`OD1A056_…ulg` … `OD1A079_…ulg`). We want a single CSV,
+one row per log, capturing the strength of the ~100 Hz vibration peak in two gyro signals so
+the logs can be compared at a glance. For each log we record:
+
+- log filename
+- the log's date (file modification time)
+- the PSD magnitude of the spectral peak nearest 100 Hz for **`vehicle_angular_velocity`**
+  (filtered controller-rate gyro), X/Y/Z
+- the PSD magnitude of the spectral peak nearest 100 Hz for **`sensor_gyro_fifo`** (raw
+  high-rate gyro), X/Y/Z
+
+The FFT/PSD must be computed **exactly** as in
+`/home/choudhury/tools/dev/imu_vibe/analyze_imu_vibration.py`, by reusing that script's
+functions rather than reimplementing them.
+
+### Decisions (confirmed with user)
+- **Signal 1 = `vehicle_angular_velocity`** (the topic the script actually FFTs in
+  `fft_vehicle_angular_velocity`, line 486). The earlier "angular_acceleration" wording was a slip.
+- **"100 Hz peak" = nearest detected peak to 100 Hz.** Run the script's exact peak detector
+  (`find_peaks(log10(psd), distance=5, prominence=0.3)`), pick the detected peak whose frequency
+  is closest to 100 Hz within a tolerance band; report its PSD magnitude **and** its actual
+  frequency. `NaN` if no peak falls in the band.
+- **FFT window = armed / in-flight segment only**, not the whole log.
+- **Date = `.ulg` file modification time.**
+
+## Reuse (no reimplementation of the FFT)
+
+New standalone script imports the existing module and calls its functions:
+
+```python
+import sys
+sys.path.insert(0, "/home/choudhury/tools/dev/imu_vibe")
+import analyze_imu_vibration as aiv   # T_OFFSET stays 0.0 (main() not called)
+```
+
+Functions/constants reused verbatim:
+- `aiv.fifo_to_series(d)` — expand `sensor_gyro_fifo` batches to per-sample (t, x, y, z) in physical units
+  (`analyze_imu_vibration.py:114`)
+- `aiv.direct_fft(x, fs, t=tw)` — flat-top windowed rfft → `(freq, amp, psd)`; resamples on `t` and
+  detrends, identical to the script (`:144`)
+- `aiv.get_topic` / `aiv.all_instances` (`:94`, `:100`)
+- `aiv.RAD_TO_DEG` for the deg/s scaling (`:59`)
+
+Because `T_OFFSET == 0.0` at import time, all timestamps stay in raw FMU-boot seconds and are
+mutually consistent across topics — no special handling needed.
+
+## New file
+
+`/home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26/vibe_psd_100hz_summary.py`
+
+Output: `vibe_psd_100hz_summary.csv` in the same directory.
+
+### Logic per log
+
+1. **Load only the needed topics** for speed/memory (logs reach ~1 GB):
+   ```python
+   from pyulog import ULog
+   ulog = ULog(path, message_name_filter_list=[
+       "vehicle_angular_velocity", "sensor_gyro_fifo",
+       "vehicle_land_detected", "vehicle_status"])
+   ```
+   (The reused helpers operate on this `ulog` object exactly as they would on `aiv.load(path)`.)
+
+2. **Determine the in-flight window `[t0, t1]`** (boot seconds):
+   - Preferred: `vehicle_land_detected` → in-air = samples where `landed == 0`;
+     `t0,t1 = first,last` such timestamp.
+   - Fallback: `vehicle_status.arming_state == 2` (ARMED) → first/last armed timestamp.
+   - Final fallback: full extent of the signal being analyzed.
+   Record which source was used in a `window_source` column.
+
+3. **`vehicle_angular_velocity` (instance 1, fallback instance 0)** — mirror
+   `fft_vehicle_angular_velocity` (`:486`):
+   ```python
+   d = aiv.get_topic(ulog, "vehicle_angular_velocity", 1) or aiv.get_topic(ulog, "vehicle_angular_velocity")
+   t = d.data["timestamp"] / 1e6
+   mask = (t >= t0) & (t <= t1)
+   fs = 1.0 / np.median(np.diff(t[mask]))
+   for k in 0,1,2:
+       axis = d.data[f"xyz[{k}]"][mask] * aiv.RAD_TO_DEG
+       freqs, _, psd = aiv.direct_fft(axis, fs, t=t[mask])
+       fpk, ppk = peak_near(freqs, psd, 100.0)
+   ```
+   Note: `vehicle_angular_velocity` is usually single-instance; the instance-1→0 fallback is logged
+   per row so it's visible when instance 1 is absent.
+
+4. **`sensor_gyro_fifo` (instance 1)** — mirror the gyro branch of `fft_around_event` (`:261`):
+   ```python
+   d = aiv.get_topic(ulog, "sensor_gyro_fifo", 1)
+   t, x, y, z = aiv.fifo_to_series(d)
+   mask = (t >= t0) & (t <= t1)
+   fs = 1.0 / (np.median(d.data["dt"]) / 1e6)
+   for axis in (x,y,z):
+       freqs, _, psd = aiv.direct_fft(axis[mask] * aiv.RAD_TO_DEG, fs, t=t[mask])
+       fpk, ppk = peak_near(freqs, psd, 100.0)
+   ```
+
+5. **`peak_near(freqs, psd, target=100.0, tol=15.0)`** — the script's exact detector, then nearest pick:
+   ```python
+   log_psd = np.log10(np.maximum(psd, 1e-30))
+   peaks, _ = find_peaks(log_psd, distance=5, prominence=0.3)  # same params as annotate_top_peaks :187
+   if len(peaks) == 0: return (nan, nan)
+   fp = freqs[peaks]
+   i = np.argmin(np.abs(fp - target))
+   if abs(fp[i] - target) > tol: return (nan, nan)
+   return (fp[i], psd[peaks[i]])
+   ```
+   `tol = ±15 Hz` (tunable constant at top of script).
+
+6. **Skip guards** matching the script: need `mask.sum() >= 256` samples; otherwise emit `NaN`s and
+   a note. Missing topics → `NaN`s, never a crash.
+
+### CSV columns
+
+```
+log_name, log_date, window_source, window_start_s, window_end_s,
+angvel_inst,
+angvel_x_peak_hz, angvel_x_psd, angvel_y_peak_hz, angvel_y_psd, angvel_z_peak_hz, angvel_z_psd,
+gyrofifo_x_peak_hz, gyrofifo_x_psd, gyrofifo_y_peak_hz, gyrofifo_y_psd, gyrofifo_z_peak_hz, gyrofifo_z_psd
+```
+- `log_date` = file mtime, ISO `YYYY-MM-DD HH:MM:SS`.
+- PSD units: `vehicle_angular_velocity` and `sensor_gyro_fifo` are both scaled by `RAD_TO_DEG`, so PSD is `(deg/s)²/Hz` — identical to the script's plots.
+- `*_peak_hz` columns expose the actual matched peak frequency (since "nearest peak" may not sit exactly on 100 Hz).
+
+Written with Python's `csv` module.
+
+## Verification
+
+1. Run on one mid-size log first and eyeball the output:
+   ```bash
+   python vibe_psd_100hz_summary.py OD1A060_rpyChirp.ulg
+   ```
+   (Script accepts optional log args; with none, it globs all `*.ulg` in its directory.)
+2. **Cross-check against the source script's plot** for that same log: run
+   `python /home/choudhury/tools/dev/imu_vibe/analyze_imu_vibration.py OD1A060_rpyChirp.ulg`
+   and confirm the `~100 Hz` peak PSD value in `imu_fft_gyro_vehicle_angular_velocity.png` and the
+   `sensor_gyro_fifo` FFT plot matches the CSV magnitude (orders of magnitude / same value).
+   This proves the FFT was reproduced "exactly the same way." (Note the script FFTs over its own
+   event window, so use a window that overlaps; values should agree closely where windows match.)
+3. Run across all 9 logs → confirm `vibe_psd_100hz_summary.csv` has 9 data rows, sane numbers,
+   and `NaN` only where a topic/peak is genuinely absent.
+4. Confirm the large logs (`OD1A070`, `OD1A079`) complete without OOM thanks to
+   `message_name_filter_list`.
+
+## Open notes (non-blocking, surfaced for review)
+- In-flight window prefers `vehicle_land_detected` (true in-air) over arming; both fall back to full
+  log. If you'd rather use armed-state strictly, that's a one-line change.
+- `vehicle_angular_velocity` instance 1 may not exist (usually only instance 0); the row's
+  `angvel_inst` column records which instance was actually used.

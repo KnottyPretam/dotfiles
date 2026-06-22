@@ -1,0 +1,54 @@
+\documentclass[border=8pt]{standalone}
+\usepackage{tikz}
+\usetikzlibrary{positioning, arrows.meta, calc, fit}
+\begin{document}
+\begin{tikzpicture}[
+  >={Latex[length=2.6mm,width=2.2mm]},
+  thick,
+  font=\sffamily,
+  block/.style={draw, rectangle, rounded corners=2pt, minimum height=12mm, minimum width=22mm, align=center, fill=white, font=\small\sffamily},
+  sum/.style={draw, circle, inner sep=0pt, minimum size=6mm, font=\footnotesize},
+  sensor/.style={draw, rectangle, minimum height=10mm, minimum width=24mm, align=center, fill=blue!10, font=\small\sffamily},
+  sig/.style={font=\footnotesize\itshape},
+  prim/.style={->, very thick},
+  fb/.style={->, very thick, color=red!75!black}
+]
+\node[block, fill=gray!15] (sticks) {Pilot\\sticks};
+\node[block, right=12mm of sticks] (gen) {Attitude\\setpoint gen};
+\node[sum, right=16mm of gen] (so) {};
+\node[block, right=16mm of so] (att) {Attitude\\controller\\(P + D)};
+\node[sum, right=16mm of att] (si) {};
+\node[block, right=16mm of si] (rate) {Rate\\controller\\(PID)};
+\node[block, right=12mm of rate] (alloc) {Allocator};
+\node[block, right=12mm of alloc] (motors) {Motors\\+ ESCs};
+\node[block, right=12mm of motors, fill=gray!15] (plant) {Airframe};
+% sensors
+\node[sensor, below=32mm of att] (ekf) {EKF2};
+\node[sensor, below=32mm of si] (vav) {VehAngVelocity};
+\node[sensor, below=32mm of plant] (imu) {IMU};
+% forward arrows
+\draw[prim] (sticks) -- (gen);
+\draw[prim] (gen) -- node[sig,above]{$q_d,\,\dot\psi_{FF}$} (so);
+\draw[prim] (so) -- (att);
+\draw[prim] (att) -- node[sig,above]{$\omega_{sp}$} (si);
+\draw[prim] (si) -- (rate);
+\draw[prim] (rate) -- node[sig,above]{$\tau$} (alloc);
+\draw[prim] (alloc) -- (motors);
+\draw[prim] (motors) -- (plant);
+% sensor chain
+\draw[prim] (plant.south) |- (imu.east);
+\draw[prim] (imu.west) -- (vav.east);
+\draw[prim] (vav.west) -- (ekf.east);
+% summing-junction signs: + on west input, − on south input
+\node[font=\scriptsize, anchor=west, inner sep=1pt] at (so.west) {$+$};
+\node[font=\scriptsize, anchor=south, inner sep=1pt] at (so.south) {$-$};
+\node[font=\scriptsize, anchor=west, inner sep=1pt] at (si.west) {$+$};
+\node[font=\scriptsize, anchor=south, inner sep=1pt] at (si.south) {$-$};
+% primary feedback paths (only)
+\draw[fb] (ekf.north) -- node[sig,left]{$q$} (so.south);
+\draw[fb] (vav.north) -- node[sig,left]{$\omega$} (si.south);
+% loop labels
+\node[draw, dashed, rounded corners=3pt, fit=(so) (att) (si), inner sep=8mm, label={[font=\footnotesize\bfseries, yshift=-2pt]above:OUTER LOOP\,---\,attitude}] {};
+\node[draw, dashed, rounded corners=3pt, fit=(si) (rate), inner sep=4mm, label={[font=\footnotesize\bfseries, yshift=-2pt]above:INNER LOOP\,---\,rate}] {};
+\end{tikzpicture}
+\end{document}

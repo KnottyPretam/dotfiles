@@ -1,0 +1,87 @@
+# Add vehicle_angular_velocity time-series + FFT plots
+
+## Context
+`analyze_imu_vibration.py` already characterizes the gyro at two levels: the raw
+high-rate `sensor_gyro_fifo` stream and the EKF-side `vehicle_imu`. It does **not**
+plot `vehicle_angular_velocity` — the *filtered* angular rate the rate controller
+actually runs on (post software LPF/notch). That signal is exactly what matters for
+diagnosing whether vibration is leaking into the control loop, so we want the same
+time-series + spectrum views for it.
+
+Verified in the log (`log_1_2026-4-29-13-48-36.ulg`):
+- Topic `vehicle_angular_velocity`, single instance (`multi_id=0`), 26711 rows.
+- Fields: `xyz[0..2]` (rad/s, filtered rate), `xyz_derivative[0..2]` (we use only `xyz`).
+- `timestamp_sample` Δt ≈ 1.497 ms → fs ≈ 668 Hz (plenty for an FFT).
+
+User decision: produce **two separate PNGs**, exactly mirroring the gyro FIFO plots
+(not a combined figure):
+- `imu_gyro_vehicle_angular_velocity_mag.png` — X/Y/Z time series.
+- `imu_fft_gyro_vehicle_angular_velocity.png` — X/Y/Z FFT PSD.
+
+## Changes — `analyze_imu_vibration.py`
+
+### 1. New function: time series (mirrors `plot_fifo_magnitude_timeseries`, gyro branch)
+Add near the other magnitude-timeseries functions (after `plot_vehicle_imu_magnitude_timeseries`, ~line 423).
+
+- Get topic via `get_topic(ulog, "vehicle_angular_velocity")`; if `None`, print skip and return.
+- `t = t_seconds(d, ulog)`, `scale = RAD_TO_DEG`.
+- `fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)`.
+- For `k` in 0..2 plot `d.data[f"xyz[{k}]"] * scale` with the **identical style**:
+  `color="steelblue", label="vehicle_angular_velocity", linewidth=0.4, alpha=0.6`.
+- Per-axis: `ax.set_ylabel(f"gyro {axis_name} (deg/s)")`, `legend(loc="upper right", fontsize=8)`, `grid(True, alpha=0.3)`.
+- `axes[-1].set_xlabel("time (s)")`, `suptitle("vehicle_angular_velocity per-axis time series")`, `tight_layout()`.
+- Save to `outdir / "imu_gyro_vehicle_angular_velocity_mag.png"`, dpi=120, `plt.close(fig)`, print confirmation.
+
+### 2. New function: FFT PSD (mirrors `fft_around_event` gyro branch)
+Add after the new time-series function.
+
+- Get topic; if `None`, skip/return.
+- `t = t_seconds(d, ulog)`, `scale = RAD_TO_DEG`, `mask = (t >= t0) & (t <= t1)`.
+- If `mask.sum() < 256`: print skip and return (same threshold as `fft_around_event`).
+- `fs` from the window: `dt_pub = float(np.median(np.diff(t[mask])))` (vehicle_angular_velocity
+  has no `dt` field, so derive it from sample spacing like `fft_vehicle_imu` does, line 350);
+  guard `dt_pub <= 0`; `fs = 1.0 / dt_pub`.
+- Per-axis data: `d.data[f"xyz[{k}]"][mask] * scale`.
+- `fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)`; for each axis:
+  - `freqs, _, psd = direct_fft(axis_data, fs)` (reuse existing helper, line 132).
+  - `ax.plot(freqs, psd, color="steelblue", linewidth=0.8)`.
+  - `annotate_top_peaks(ax, freqs, psd, n_peaks=6)` (line 159).
+  - `ax.set_ylabel(f"{axis_name} PSD (deg/s)²/Hz")` (matches `fft_around_event` gyro ylabel).
+  - `ax.grid(True, which="both", alpha=0.3)`, `ax.set_xlim(0, fs / 2)`.
+  - `if show_lpf: add_lpf_lines(ax, "gyro", fs)` (line 177 — draws IMU_GYRO_CUTOFF/IMU_DGYRO_CUTOFF + Nyquist).
+  - `ax.legend(loc="upper right", fontsize=7)`.
+- `axes[-1].set_xlabel("Frequency (Hz)")`,
+  `suptitle(f"FFT PSD (flat-top) of vehicle_angular_velocity gyro, fs={fs:.0f} Hz")`, `tight_layout()`.
+- Save to `outdir / "imu_fft_gyro_vehicle_angular_velocity.png"`, dpi=120, `plt.close(fig)`, print confirmation.
+
+### 3. Wire into `main()`
+After the `fft_vehicle_imu(...)` call (line 1055) add:
+```python
+plot_vehicle_angular_velocity_timeseries(ulog, OUTDIR)
+fft_vehicle_angular_velocity(ulog, OUTDIR, t0, t1, show_lpf=True)
+```
+
+### 4. Update module docstring
+Add two lines to the Outputs list (after the `imu_fft_*vehicle_imu*` entries, ~line 11):
+- `imu_gyro_vehicle_angular_velocity_mag.png : filtered controller rate, per-axis time series`
+- `imu_fft_gyro_vehicle_angular_velocity.png : filtered controller rate FFT PSD`
+
+## Reused, not reinvented
+- `get_topic` (l.82), `t_seconds` (l.91), `direct_fft` (l.132), `annotate_top_peaks` (l.159),
+  `add_lpf_lines` (l.177), and the `RAD_TO_DEG` scale + `"gyro"` LPF config — all already present.
+- Styling constants copied verbatim from `plot_fifo_magnitude_timeseries` (l.277) and
+  `fft_around_event` (l.229) so the new plots are visually identical to the gyro FIFO ones.
+
+## Verification
+Run end-to-end against the real log:
+```
+cd /home/choudhury/tools/dev/imu_vibe
+python3 analyze_imu_vibration.py \
+  /home/choudhury/analysis/flight_tests/oddjob/firstHover/UNORGANIZED/first_tunes/log_1_2026-4-29-13-48-36.ulg
+```
+Confirm:
+1. Console prints `[ang_vel_ts] wrote ...` and `[fft_ang_vel] wrote ...`.
+2. Both PNGs exist in `imuVibe_log_1_2026-4-29-13-48-36_plots/`.
+3. Visually compare against `imu_gyro_fifo_mag.png` and `imu_fft_gyro_0.png` —
+   same 3-row X/Y/Z layout, steelblue traces, deg/s units, peak annotations,
+   and green/purple/red LPF/Nyquist lines on the FFT.

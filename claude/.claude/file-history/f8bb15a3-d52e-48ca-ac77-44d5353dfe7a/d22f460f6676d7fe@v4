@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Launch the MATLAB sysID pipeline on a ULG file, in the background, headless.
+# Usage:
+#   ./run_sysid.sh /path/to/log.ulg                  (defaults from run_sysid.m)
+#   ./run_sysid.sh /path/to/config.yaml              (ULG + cfg overrides from YAML)
+#   ./run_sysid.sh /path/to/config.yaml /override.ulg  (CLI ULG overrides yaml.ulg_path)
+
+set -euo pipefail
+
+arg1="${1:?usage: run_sysid.sh <path.ulg|path.yaml> [override.ulg]}"
+if [[ ! -r "$arg1" ]]; then
+    echo "not readable: $arg1" >&2
+    exit 1
+fi
+arg1_abs="$(readlink -f "$arg1")"
+
+ts="$(date +%Y%m%d_%H%M%S)"
+here="$(cd "$(dirname "$0")" && pwd)"
+cwd="$(pwd)"                                          # user's invocation directory
+
+json_tmp=""
+if [[ "$arg1_abs" == *.yaml ]]; then
+    # YAML drives the run. Extract ulg_path + write JSON sidecar of cfg overrides.
+    read -r ulg_abs json_tmp < <(python3 - "$arg1_abs" "${2:-}" <<'PY'
+import sys, yaml, json, tempfile, os
+yaml_path = sys.argv[1]
+ulg_override = sys.argv[2] if len(sys.argv) > 2 else ''
+d = yaml.safe_load(open(yaml_path)) or {}
+ulg = ulg_override if ulg_override else d.get('ulg_path', '')
+if not ulg:
+    print("ERROR: ulg_path missing in YAML and no override given", file=sys.stderr)
+    sys.exit(2)
+overrides = {k: d[k] for k in ('wc_inner_Hz','wc_outer_Hz','PM_target_deg','coh_cutoff',
+                               'np','nz','fmin_Hz','fmax_Hz') if k in d}
+fd, path = tempfile.mkstemp(suffix='.json', prefix='run_sysid_cfg_')
+os.close(fd)
+with open(path, 'w') as f:
+    json.dump(overrides, f)
+print(os.path.realpath(ulg), path)
+PY
+)
+elif [[ "$arg1_abs" == *.ulg ]]; then
+    ulg_abs="$arg1_abs"
+else
+    echo "arg must be .ulg or .yaml: $arg1" >&2
+    exit 1
+fi
+
+if [[ ! -r "$ulg_abs" ]]; then
+    echo "not a readable .ulg: $ulg_abs" >&2
+    exit 1
+fi
+
+base="$(basename "$ulg_abs" .ulg)"
+outdir="${cwd}/output/${base}_${ts}"
+mkdir -p "$outdir"
+log="${outdir}/run.log"
+
+cd "$here"                                            # so matlab -batch finds the .m files
+if [[ -n "$json_tmp" ]]; then
+    cp "$arg1_abs" "$outdir/run_sysid_config.yaml"
+    nohup matlab -batch "run_sysid('${ulg_abs}','${outdir}','${json_tmp}')" > "$log" 2>&1 &
+else
+    nohup matlab -batch "run_sysid('${ulg_abs}','${outdir}')" > "$log" 2>&1 &
+fi
+pid=$!
+echo "PID=$pid"
+echo "log=$log"
+echo "outdir=$outdir"

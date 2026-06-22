@@ -1,0 +1,328 @@
+function replay_margins(json_path, run_dir, out_dir)
+% Replay linear analysis on a saved plant (plants.mat from run_sysid) with
+% user-supplied gains. Emits Bode, Nichols, step plots and a margins.txt
+% containing GM / PM / VM per (mode, axis, loop).
+%
+% Usage (from replay_margins.sh):
+%   replay_margins('/tmp/gains_xxx.json', '/path/to/sysid_out', '/path/to/replay_out')
+
+here = fileparts(mfilename('fullpath'));
+addpath(here);
+addpath(fullfile(here, 'utils'));
+
+set(0, 'DefaultFigureVisible', 'off');
+
+fprintf('[replay_margins] json=%s\n[replay_margins] run=%s\n[replay_margins] out=%s\n', ...
+        json_path, run_dir, out_dir);
+
+spec   = jsondecode(fileread(json_path));
+S      = load(fullfile(run_dir, 'plants.mat'));
+plants = S.plants;
+fmin   = plants.cfg.fmin_Hz;
+fmax   = plants.cfg.fmax_Hz;
+
+axes_filter  = pick(spec, 'axes',  {'roll','pitch','yaw'});
+loops_filter = pick(spec, 'loops', {'rate','attitude'});
+
+if ~isfolder(out_dir); mkdir(out_dir); end
+
+rows = {};
+for mc_or_fw = {'mc','fw'}
+    m = mc_or_fw{1};
+    if ~isfield(plants, m) || ~isfield(spec, m); continue; end
+    fig_dir = fullfile(out_dir, 'figures', m);
+    if ~isfolder(fig_dir); mkdir(fig_dir); end
+
+    for axc = 1:numel(axes_filter)
+        a = axes_filter{axc};
+        if ~isfield(plants.(m), a)
+            rows{end+1} = make_skip_row(m, a, 'rate',     'plant missing in plants.mat'); %#ok<AGROW>
+            rows{end+1} = make_skip_row(m, a, 'attitude', 'plant missing in plants.mat'); %#ok<AGROW>
+            continue;
+        end
+        if ~isfield(spec.(m), a)
+            rows{end+1} = make_skip_row(m, a, 'rate',     'gains not in YAML'); %#ok<AGROW>
+            rows{end+1} = make_skip_row(m, a, 'attitude', 'gains not in YAML'); %#ok<AGROW>
+            continue;
+        end
+
+        pr     = plants.(m).(a).rate;
+        gains  = spec.(m).(a);
+        [C_rate, C_att, gain_err] = build_C_from_gains(m, gains);
+
+        do_rate = any(strcmp(loops_filter, 'rate'));
+        do_att  = any(strcmp(loops_filter, 'attitude'));
+
+        % --- Rate loop ---
+        if do_rate
+            if ~pr.ok
+                rows{end+1} = make_skip_row(m, a, 'rate', ['plant: ' pr.reason]); %#ok<AGROW>
+            elseif isempty(C_rate)
+                rows{end+1} = make_skip_row(m, a, 'rate', ['C_rate: ' gain_err]); %#ok<AGROW>
+            else
+                L = analyze_loop(pr.tf_pade, C_rate, fmin, fmax);
+                if L.ok
+                    replay_plot(L, fig_dir, m, a, 'rate');
+                    rows{end+1} = make_row(m, a, 'rate', L); %#ok<AGROW>
+                else
+                    rows{end+1} = make_skip_row(m, a, 'rate', L.reason); %#ok<AGROW>
+                end
+            end
+        end
+
+        % --- Attitude loop (constructed as T_rate * 1/s like run_sysid does) ---
+        if do_att
+            if ~pr.ok
+                rows{end+1} = make_skip_row(m, a, 'attitude', ['plant: ' pr.reason]); %#ok<AGROW>
+            elseif isempty(C_rate)
+                rows{end+1} = make_skip_row(m, a, 'attitude', ['C_rate: ' gain_err]); %#ok<AGROW>
+            elseif isempty(C_att)
+                rows{end+1} = make_skip_row(m, a, 'attitude', 'C_att: Kp_att missing or non-finite'); %#ok<AGROW>
+            else
+                T_rate  = feedback(series(C_rate, pr.tf_pade), 1);
+                G_outer = T_rate * tf(1, [1 0]);
+                L = analyze_loop(G_outer, C_att, fmin, fmax);
+                if L.ok
+                    replay_plot(L, fig_dir, m, a, 'attitude');
+                    rows{end+1} = make_row(m, a, 'attitude', L); %#ok<AGROW>
+                else
+                    rows{end+1} = make_skip_row(m, a, 'attitude', L.reason); %#ok<AGROW>
+                end
+            end
+        end
+
+        close(findall(0, 'Type', 'figure'));
+    end
+end
+
+write_replay_margins(fullfile(out_dir, 'margins.txt'), rows, run_dir, spec, fmin, fmax);
+fprintf('[replay_margins] done. outdir=%s\n', out_dir);
+end
+
+
+% ====================== helpers ======================
+
+function [C_rate, C_att, err] = build_C_from_gains(mode, g)
+% Reconstruct rate / attitude controllers from a YAML gains struct.
+% Formulas mirror build_controller_tf.m (mc: lines 31-40, fw: lines 71-80).
+%   mc rate:  C_rate = K*(Kp + Ki/s + Kd*s/(tau_d*s+1))
+%   fw rate:  C_rate =     Kp + Ki/s + Kd*s/(tau_d*s+1)
+%   both:     C_att  = tf(Kp_att, 1)
+%   tau_d   = 1/(2*pi*dterm_cutoff_Hz)
+
+s = tf('s');
+err = '';
+Kd_att     = 0;     % mc-only; defaulted for fw branch
+yaw_weight = 1.0;   % recorded only; cancels in linearized model
+okKd_att   = false;
+
+[fd, ok_fd] = field_or_default(g, 'dterm_cutoff_Hz', 30);
+if ~isfinite(fd) || fd <= 0; fd = 30; ok_fd = false; end %#ok<NASGU>
+tau_d = 1/(2*pi*fd);
+
+switch lower(mode)
+case 'mc'
+    [K,      okK]   = field_or_default(g, 'K',      NaN);
+    [Kp,     okKp]  = field_or_default(g, 'Kp',     NaN);
+    [Ki,     okKi]  = field_or_default(g, 'Ki',     NaN);
+    [Kd,     okKd]  = field_or_default(g, 'Kd',     NaN);
+    [Kp_att, okKpa] = field_or_default(g, 'Kp_att', NaN);
+    [Kd_att, okKd_att]     = field_or_default(g, 'Kd_att',     0);
+    [yaw_weight, ~]        = field_or_default(g, 'yaw_weight', 1.0); %#ok<NASGU>
+    if all(isfinite([K, Kp, Ki, Kd])) && okK && okKp && okKi && okKd
+        C_rate = K * (Kp + Ki/s + Kd*s/(tau_d*s + 1));
+    else
+        C_rate = [];
+        err = 'missing/non-finite K/Kp/Ki/Kd';
+    end
+case 'fw'
+    [Kp,     okKp]  = field_or_default(g, 'Kp',     NaN);
+    [Ki,     okKi]  = field_or_default(g, 'Ki',     NaN);
+    [Kd,     okKd]  = field_or_default(g, 'Kd',     0);
+    [Kp_att, okKpa] = field_or_default(g, 'Kp_att', NaN);
+    if all(isfinite([Kp, Ki, Kd])) && okKp && okKi
+        C_rate = Kp + Ki/s + Kd*s/(tau_d*s + 1);
+    else
+        C_rate = [];
+        err = 'missing/non-finite Kp/Ki/Kd';
+    end
+otherwise
+    error('unknown mode: %s', mode);
+end
+
+% Attitude controller: PD with the same tau_d as the rate D term when Kd_att != 0
+% (mc only). See build_controller_tf.m for the PX4 derivation and yaw_weight note.
+if isfinite(Kp_att) && okKpa
+    if strcmpi(mode, 'mc') && okKd_att && isfinite(Kd_att) && Kd_att ~= 0
+        C_att = Kp_att + Kd_att*s/(tau_d*s + 1);
+    else
+        C_att = tf(Kp_att, 1);
+    end
+else
+    C_att = [];
+end
+end
+
+
+function [v, ok] = field_or_default(g, key, default)
+if isstruct(g) && isfield(g, key)
+    v = g.(key);
+    ok = true;
+else
+    v = default;
+    ok = false;
+end
+end
+
+
+function replay_plot(L, fig_dir, mode, axis_name, loop_name)
+tag     = sprintf('%s_%s_%s', lower(mode), lower(axis_name), lower(loop_name));
+title_t = sprintf('%s / %s / %s', upper(mode), axis_name, loop_name);
+
+% --- Bode of open-loop L ---
+fig = new_fig(['Bode-' tag]);
+if ~isempty(L.L_response)
+    w = L.w_grid; f = w/(2*pi);
+    subplot(2,1,1);
+    semilogx(f, 20*log10(abs(L.L_response)), 'LineWidth', 1.5); grid on;
+    ylabel('|L| (dB)'); title(['Open-loop L Bode — ' title_t]);
+
+    subplot(2,1,2);
+    semilogx(f, unwrap(angle(L.L_response))*180/pi, 'LineWidth', 1.5); grid on;
+    ylabel('\angle L (deg)'); xlabel('Frequency (Hz)');
+end
+save_fig(fig, fig_dir, [tag '_bode']);
+
+% --- Nichols ---
+fig = new_fig(['Nichols-' tag]);
+if ~isempty(L.L)
+    nichols(L.L); ngrid;
+    title(['Nichols — ' title_t]);
+end
+save_fig(fig, fig_dir, [tag '_nichols']);
+
+% --- Closed-loop step response ---
+fig = new_fig(['Step-' tag]);
+if ~isempty(L.T)
+    try
+        t_end = 5;
+        if ~isnan(L.wc_Hz) && L.wc_Hz > 0
+            t_end = max(t_end, 10/L.wc_Hz);
+        end
+        [y, t] = step(L.T, t_end);
+        plot(t, y, 'b', 'LineWidth', 1.5); grid on; hold on;
+        plot([t(1) t(end)], [1 1], 'k--');
+        ylabel('y(t)'); xlabel('Time (s)');
+        title(['Closed-loop step — ' title_t]);
+    catch err
+        text(0.1, 0.5, sprintf('step() failed: %s', err.message), 'Units', 'normalized');
+    end
+end
+save_fig(fig, fig_dir, [tag '_step']);
+end
+
+
+function fig = new_fig(name)
+fig = figure('Name', name, 'Visible', 'off', 'Color', 'w', ...
+             'Position', [100 100 900 700]);
+end
+
+
+function save_fig(fig, fig_dir, basename)
+try
+    exportgraphics(fig, fullfile(fig_dir, [basename '.png']), 'Resolution', 200);
+catch err
+    warning('PNG save failed for %s: %s', basename, err.message);
+end
+try
+    savefig(fig, fullfile(fig_dir, [basename '.fig']));
+catch err
+    warning('FIG save failed for %s: %s', basename, err.message);
+end
+close(fig);
+end
+
+
+function r = make_row(mode, axis_name, loop_name, L)
+r = struct('mode', mode, 'axis', axis_name, 'loop', loop_name, ...
+           'GM_dB', L.GM_dB, 'PM_deg', L.PM_deg, 'VM', L.VM, ...
+           'ok', true, 'reason', '');
+end
+
+
+function r = make_skip_row(mode, axis_name, loop_name, reason)
+r = struct('mode', mode, 'axis', axis_name, 'loop', loop_name, ...
+           'GM_dB', NaN, 'PM_deg', NaN, 'VM', NaN, ...
+           'ok', false, 'reason', reason);
+end
+
+
+function out = pick(s, key, default)
+% Read a list field from the JSON-decoded spec, normalize to a cellstr of names.
+if ~isfield(s, key)
+    out = default;
+    return;
+end
+v = s.(key);
+if iscell(v)
+    out = cellfun(@char, v(:)', 'UniformOutput', false);
+elseif ischar(v)
+    out = {v};
+elseif isstring(v)
+    out = cellstr(v(:)');
+else
+    out = default;
+end
+end
+
+
+function write_replay_margins(report_path, rows, run_dir, spec, fmin, fmax)
+fid = fopen(report_path, 'w');
+cleanup = onCleanup(@() fclose(fid)); %#ok<NASGU>
+
+fprintf(fid, 'Replay margins\n');
+fprintf(fid, 'Run dir: %s\n', run_dir);
+fprintf(fid, 'Replayed: %s\n', datestr(now, 'yyyy-mm-dd HH:MM:SS'));
+fprintf(fid, 'Frequency band: %.3f–%.3f Hz (from plants.cfg)\n', fmin, fmax);
+
+ax_filter = pick(spec, 'axes',  {'roll','pitch','yaw'});
+lp_filter = pick(spec, 'loops', {'rate','attitude'});
+fprintf(fid, 'Axes filter:  %s\n', strjoin(ax_filter, ','));
+fprintf(fid, 'Loops filter: %s\n', strjoin(lp_filter, ','));
+fprintf(fid, '\n');
+
+header_fmt = '%-5s %-7s %-9s %9s %9s %9s\n';
+row_fmt    = '%-5s %-7s %-9s %9.2f %9.1f %9.3f\n';
+skip_fmt   = '%-5s %-7s %-9s %s\n';
+
+fprintf(fid, header_fmt, 'Mode', 'Axis', 'Loop', 'GM_dB', 'PM_deg', 'VM');
+fprintf(fid, '%s\n', repmat('-', 1, 56));
+for k = 1:numel(rows)
+    r = rows{k};
+    if r.ok
+        fprintf(fid, row_fmt, r.mode, r.axis, r.loop, r.GM_dB, r.PM_deg, r.VM);
+    else
+        fprintf(fid, skip_fmt, r.mode, r.axis, r.loop, ['SKIPPED: ' r.reason]);
+    end
+end
+fprintf(fid, '\n');
+
+% Echo gains used per (mode, axis)
+fprintf(fid, 'Gains used:\n');
+for mc_or_fw = {'mc','fw'}
+    m = mc_or_fw{1};
+    if ~isfield(spec, m); continue; end
+    fns = fieldnames(spec.(m));
+    for ii = 1:numel(fns)
+        a = fns{ii};
+        g = spec.(m).(a);
+        if ~isstruct(g); continue; end
+        gns = fieldnames(g);
+        parts = cell(1, numel(gns));
+        for jj = 1:numel(gns)
+            parts{jj} = sprintf('%s=%g', gns{jj}, g.(gns{jj}));
+        end
+        fprintf(fid, '  %s/%s  %s\n', m, a, strjoin(parts, '  '));
+    end
+end
+end

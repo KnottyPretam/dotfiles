@@ -1,0 +1,119 @@
+"""Scalar height-bias Kalman filter, a faithful port of PX4
+src/modules/ekf2/EKF/bias_estimator.{hpp,cpp}.
+
+A non-reference height source (here the barometer, since EKF2_HGT_REF=GPS) is
+fused into the vertical position state through an estimated bias. This 1-state
+KF tracks that bias; it is what populates the estimator_baro_bias topic.
+"""
+
+import numpy as np
+
+FLT_EPSILON = 1.1920929e-7
+
+
+def sq(x):
+    return x * x
+
+
+class AlphaFilter:
+    """First-order LPF, matching PX4 AlphaFilter<float> (alpha = dt/(tau+dt))."""
+
+    def __init__(self):
+        self._alpha = 0.0
+        self._state = 0.0
+
+    def set_parameters(self, dt, tau):
+        denom = tau + dt
+        if denom > FLT_EPSILON:
+            self._alpha = dt / denom
+
+    def update(self, sample):
+        self._state += self._alpha * (sample - self._state)
+        return self._state
+
+    def reset(self, value):
+        self._state = value
+
+    @property
+    def state(self):
+        return self._state
+
+
+class BiasEstimator:
+    _innov_seq_tau = 10.0          # _innov_sequence_monitnoring_time_constant [s]
+    _process_var_boost_gain = 1.0e3
+
+    def __init__(self, state_init=0.0, state_var_init=0.1):
+        self._state = state_init
+        self._state_var = state_var_init
+        self._dt = 0.01
+        self._gate_size = 3.0
+        self._process_psd = 1.25e-6
+        self._state_var_max = 2.0
+        self._lpf = AlphaFilter()
+        self._t_since_last_neg = 0.0
+        self._t_since_last_pos = 0.0
+        # last computed status (for comparison with estimator_baro_bias)
+        self.innov = 0.0
+        self.innov_var = 0.0
+        self.innov_test_ratio = np.inf
+
+    # ---- setters mirroring the C++ API ----
+    def set_bias(self, bias):
+        self._state = bias
+
+    def set_process_noise_spectral_density(self, nsd):
+        self._process_psd = nsd * nsd
+
+    def set_bias_std_dev(self, state_noise):
+        self._state_var = state_noise * state_noise
+
+    def set_max_state_noise(self, max_noise):
+        self._state_var_max = max(sq(0.01), max_noise * max_noise)
+
+    def get_bias(self):
+        return self._state
+
+    def get_bias_var(self):
+        return self._state_var
+
+    # ---- filter ----
+    def _constrain_state_var(self):
+        self._state_var = float(np.clip(self._state_var, 1e-8, self._state_var_max))
+
+    def predict(self, dt):
+        delta_state_var = self._process_psd * dt
+        if self._is_offset_detected():
+            delta_state_var *= self._process_var_boost_gain
+        self._state_var += delta_state_var
+        self._constrain_state_var()
+        if dt > FLT_EPSILON and abs(self._dt - dt) > 0.001:
+            self._lpf.set_parameters(dt, self._innov_seq_tau)
+            self._dt = dt
+
+    def fuse_bias(self, measurement, measurement_var):
+        innov_var = self._state_var + max(sq(0.01), measurement_var)
+        innov = measurement - self._state
+        K = self._state_var / innov_var
+        test_ratio = innov * innov / (self._gate_size * self._gate_size * innov_var)
+        if test_ratio < 1.0:
+            self._state += K * innov
+            self._state_var -= K * self._state_var
+            self._constrain_state_var()
+        self._update_offset_detection(innov, test_ratio)
+        self.innov, self.innov_var, self.innov_test_ratio = innov, innov_var, test_ratio
+
+    def _update_offset_detection(self, innov, test_ratio):
+        signed = np.sign(innov) * test_ratio
+        self._lpf.update(float(np.clip(signed, -1.0, 1.0)))
+        if innov > 0.0:
+            self._t_since_last_pos = 0.0
+            self._t_since_last_neg += self._dt
+        else:
+            self._t_since_last_neg = 0.0
+            self._t_since_last_pos += self._dt
+
+    def _is_offset_detected(self):
+        return (abs(self._lpf.state) > 0.2
+                or self._t_since_last_pos > self._innov_seq_tau
+                or self._t_since_last_neg > self._innov_seq_tau)

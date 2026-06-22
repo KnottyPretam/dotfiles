@@ -1,0 +1,26 @@
+{
+  "claude-plugins-official": {
+    "source": {
+      "source": "github",
+      "repo": "anthropics/claude-plugins-official"
+    },
+    "installLocation": "/home/choudhury/.claude/plugins/marketplaces/claude-plugins-official",
+    "lastUpdated": "2026-06-09T17:40:15.470Z"
+  },
+  "mempalace": {
+    "source": {
+      "source": "github",
+      "repo": "MemPalace/mempalace"
+    },
+    "installLocation": "/home/choudhury/.claude/plugins/marketplaces/mempalace",
+    "lastUpdated": "2026-04-30T12:26:08.728Z"
+  },
+  "hamel-review": {
+    "source": {
+      "source": "github",
+      "repo": "hamelsmu/claude-review-loop"
+    },
+    "installLocation": "/home/choudhury/.claude/plugins/marketplaces/hamel-review",
+    "lastUpdated": "2026-06-05T21:20:25.880Z"
+  }
+}

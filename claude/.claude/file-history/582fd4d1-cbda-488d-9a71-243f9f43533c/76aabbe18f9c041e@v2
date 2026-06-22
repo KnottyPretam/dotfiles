@@ -1,0 +1,459 @@
+# EKF2 Estimator — End-to-End Pipeline, Math & Outputs
+
+> **Document date:** 2026-05-25
+> **Source repository:** `git@gitlab.knightwerx.com:kwgit/px4/PX4-Autopilot.git`
+> **Local path:** `/home/choudhury/repos/PX4-Autopilot`
+> **Branch:** `hotfix`
+> **HEAD commit:** `791030d72193440844b8ca8230568fc64f02e6ee`
+> **git describe:** `ext/ODD-0.0.0-3-g791030d721`
+> **Module:** `src/modules/ekf2/` (this is an older *flat* ECL/EKF fork — fusion files live directly under `EKF/`, the state vector is the classic **24-state** filter)
+
+---
+
+## TL;DR
+
+EKF2 is a **24-state Extended Kalman Filter** (quaternion, NED velocity & position, IMU delta-angle/delta-velocity biases, earth & body magnetic field, horizontal wind). Mechanics in one breath:
+
+- **IMU is the input, not a measurement.** Bias-corrected delta-angle/delta-velocity drive the *prediction* (strapdown INS + covariance). Everything else (baro, GPS, mag, flow, range, vision, airspeed…) is a *measurement* fused with a Kalman update.
+- **The filter runs at a delayed time horizon.** Each sensor is time-shifted by its own `EKF2_*_DELAY` and dropped into a ring buffer; the EKF fuses at the timestamp of the oldest IMU sample so all measurements line up. A separate **output predictor** propagates the newest IMU forward to *now* and is what the rest of the vehicle actually consumes (low latency).
+- **Prefiltering between driver and EKF is minimal.** The IMU path EKF2 consumes (`vehicle_imu`) is calibrated + integrated (coning) only — **no LPF/notch** (those filtered IMU topics feed the *controllers*, see the IMU note). Baro gets a small alpha-LPF and dynamic-pressure compensation; GPS gets quality checks; that is essentially it.
+- **One generic Kalman update** (`Ekf::fuse`) plus a family of `control*Fusion()` gatekeepers. Every measurement computes `innov`, `innov_var = HPHᵀ+R`, a normalized test ratio for outlier gating, then `K = PHᵀ/S`, `x ← x − K·innov`, `P ← P − KHP`.
+- **R and Q are adapted at runtime**, not just static params: GPS observation noise is relaxed/capped by accuracy and aiding state; process noise is frozen (bias-inhibit), gated (mag/wind), or boosted (×1000 on a detected height-bias offset).
+- **A selector** (`EKF2Selector`) runs *N* independent EKF2 instances (one per IMU/mag set), scores them, and republishes the winner as the system `vehicle_*` topics.
+
+This note traces all of that from the driver level to the published topics, with the equations and the variable/parameter ↔ symbol mapping. It absorbs and generalises the earlier height-reference note (`ekf2_height_ref_baro_2026-05-21.*`), which is the worked example for the height **bias estimator** in §6.4.
+
+---
+
+## 1. Scope & board context
+
+This documents the estimator architecture generically, grounded in the source at the commit above. On the **`armada-ctrl-zero-h7-oem`** board the wired sensors are 3 IMUs (BMI088, ICM-20602, ICM-20948 — the last with an AK09916 magnetometer) plus a barometer and external GNSS; see `imu_clarification_2026-05-14.*` for the IMU driver/topic detail this note builds on. EKF2 only ever sees the *aggregated* uORB topics (`vehicle_imu`, `vehicle_magnetometer`, `vehicle_air_data`, `sensor_gps`, …), never the raw `sensor_*` driver topics.
+
+The flow studied here:
+
+```
+drivers → sensors-module prefilter → uORB topic → EKF2 ingest (delay+buffer)
+        → EKF core (predict + fuse) → output predictor → output topics → selector
+```
+
+---
+
+## 2. End-to-end pipeline
+
+![EKF2 end-to-end sensor pipeline](ekf2_estimator_pipeline_2026-05-25_pipeline.svg)
+
+Five layers, left to right:
+
+1. **Sensor drivers** (`src/drivers/…`) publish raw `sensor_*` topics.
+2. **Sensors module** (`src/modules/sensors/…`) calibrates, votes/aggregates, and (for the controller-facing IMU topics only) filters; it publishes the topics EKF2 subscribes to. The IMU path that reaches EKF2 (`vehicle_imu`) is **integration + coning + calibration, no LPF**.
+3. **EKF2 ingest** (`EKF2.cpp` `Update*Sample()` → `EstimatorInterface::set*Data`) time-shifts each sample by its delay and pushes it into a per-sensor `RingBuffer`; the IMU stream is down-sampled to the filter rate and defines the **fusion horizon**. The **output predictor runs on every full-rate IMU sample** (it is not delayed).
+4. **EKF core** (`Ekf::update`) predicts then fuses at the delayed horizon; the **output predictor** propagates forward to *now* and is corrected toward the EKF solution by a complementary filter.
+5. **Outputs** — the `vehicle_*` / `estimator_*` uORB topics. With multiple instances the **EKF2Selector** picks one and republishes the system topics.
+
+Call chain (verified):
+
+```
+EKF2::Run()                                   EKF2.cpp:381
+├─ <UpdateXxxSample()> → _ekf.set*Data(...)   EKF2.cpp / estimator_interface.cpp
+│     └─ OutputPredictor::calculateOutputStates()   output_predictor.cpp:168   (full IMU rate)
+│     └─ ImuDownSampler::update() → _imu_buffer.push()  imu_down_sampler.cpp:13 / estimator_interface.cpp:86
+├─ PublishAttitude(now)                        EKF2.cpp:642   (BEFORE update — lowest latency)
+└─ _ekf.update()                               ekf.cpp:158
+   ├─ predictCovariance(imu_delayed)           covariance.cpp:102
+   ├─ predictState(imu_delayed)                ekf.cpp:253
+   ├─ controlFusionModes(imu_delayed)          control.cpp:46   → 14 control*Fusion() (see §6)
+   │     └─ … → fuseVelPosHeight()/fuse(K)     vel_pos_fusion.cpp:193 / ekf_helper.cpp:789
+   └─ OutputPredictor::correctOutputStates()   output_predictor.cpp:242
+        → PublishLocalPosition / Odometry / Status / Innovations / …  EKF2.cpp:688-…
+```
+
+---
+
+## 3. Sensor input layer
+
+### 3.1 Topic → struct → entry point → buffer
+
+| Sensor | uORB topic | sample struct | EKF2 ingest | `EstimatorInterface` entry | buffer |
+|---|---|---|---|---|---|
+| IMU | `vehicle_imu` (multi) / `sensor_combined` (single) | `imuSample` | `Run()` `EKF2.cpp:505/573` | `setIMUData()` `estimator_interface.cpp:73` | down-sampler → `_imu_buffer` |
+| Magnetometer | `vehicle_magnetometer` | `magSample` | `UpdateMagSample()` | `setMagData()` `:105` | `RingBuffer<magSample>` |
+| Barometer | `vehicle_air_data` | `baroSample` | `UpdateBaroSample()` | `setBaroData()` `:220` | `RingBuffer<baroSample>` |
+| GNSS | `sensor_gps` | `gpsMessage`→`gpsSample` | `UpdateGpsSample()` | `setGpsData()` `:141` | `RingBuffer<gpsSample>` |
+| Airspeed | `airspeed_validated` | `airspeedSample` | `UpdateAirspeedSample()` | `setAirspeedData()` | `RingBuffer<airspeedSample>` |
+| Optical flow | `vehicle_optical_flow` | `flowSample` | `UpdateFlowSample()` | `setOpticalFlowData()` | `RingBuffer` (`_imu_buffer_length`) |
+| Range finder | `distance_sensor` | `rangeSample` | `UpdateRangeSample()` | `setRangeData()` | `RingBuffer<rangeSample>` |
+| External vision | `vehicle_visual_odometry` | `extVisionSample` | `UpdateExtVisionSample()` | `setExtVisionData()` | `RingBuffer<extVisionSample>` |
+| Aux velocity | `landing_target_pose` | `auxVelSample` | `UpdateAuxVelSample()` | `setAuxVelData()` | `RingBuffer<auxVelSample>` |
+
+### 3.2 IMU prefilter path (driver → EKF)
+
+`VehicleIMU` (`src/modules/sensors/vehicle_imu/`) subscribes to `sensor_accel`/`sensor_gyro`, applies **calibration** (scale/offset/rotation) and **integrates** over the `IMU_INTEG_RATE` window (default 200 Hz) with a coning-corrected integrator, publishing `vehicle_imu.{delta_angle, delta_velocity}` (+ their `dt`). **No low-pass or notch filter is applied on this path** — EKF2 does its own internal handling. (The notched/LPF'd `vehicle_angular_velocity` / `vehicle_acceleration` topics are for the *rate/attitude/position controllers*, not the estimator — see the IMU note.)
+
+The integrated delta form is what the strapdown prediction (§5.1) consumes directly:
+
+```
+delta_angle  ≈ ∫ ω_body dt     (rad, body frame, over the integration window)
+delta_velocity ≈ ∫ a_body dt   (m/s, body frame, gravity included)
+```
+
+### 3.3 Time alignment, down-sampling & buffering
+
+Every non-IMU sample is **time-shifted backward** before being buffered so its timestamp lands on the EKF's delayed fusion horizon (`estimator_interface.cpp:123/159/238`):
+
+```
+t_buffer = t_sample − EKF2_<S>_DELAY·1e3[µs] − _dt_ekf_avg·5e5      (the ·5e5 = ½ EKF step, in µs)
+```
+
+A `_min_obs_interval_us = (t_imu_now − _time_delayed_us)/(_obs_buffer_length − 1)` rate-limits each buffer so no sample is overwritten before the horizon reaches it (`:97`).
+
+The **IMU down-sampler** (`imu_down_sampler.cpp:13`) accumulates fast IMU samples to the filter rate set by `EKF2_PREDICT_US` (10 000 µs → 100 Hz):
+
+```
+δθ_acc(quat) = δθ_acc ⊗ Δq(δθ_new)                 # quaternion accumulation of delta angle
+δv_acc       = R(Δq)⁻¹·δv_acc + ½(δv_new + R(Δq)⁻¹·δv_new)   # rotate forward, trapezoidal
+trigger when  (#samples ≥ _required_samples & δθ_dt > _min_dt_s)  OR  δθ_dt > _target_dt_s
+```
+
+On trigger the sample is pushed to `_imu_buffer`; `_time_delayed_us = _imu_buffer.get_oldest().time_us` is the **fusion horizon**. `_dt_ekf_avg` is the slewed average step used by both prediction steps (`ekf.cpp:293`). The **output predictor** (§7.1) instead runs on *every* full-rate IMU sample inside `setIMUData()` (`estimator_interface.cpp:83`).
+
+### 3.4 Sample structs (`EKF/common.h`)
+
+| struct | fields (units) | line |
+|---|---|---|
+| `imuSample` | `delta_ang` (rad), `delta_vel` (m/s), `delta_ang_dt`/`delta_vel_dt` (s), `delta_vel_clipping[3]` | `:177` |
+| `gpsSample` | `pos` (NE m), `hgt` (m), `vel` (NED m/s), `yaw` (rad), `hacc`/`vacc`/`sacc`, `yaw_acc` | `:186` |
+| `magSample` | `mag` (Gauss, body), `reset` | `:198` |
+| `baroSample` | `hgt` (m, pressure altitude), `reset` | `:204` |
+| `rangeSample` | `rng` (m), `quality` (0–100, −1 unknown) | `:210` |
+| `airspeedSample` | `true_airspeed` (m/s), `eas2tas` | `:216` |
+| `flowSample` | `flow_xy_rad` (rad), `gyro_xyz` (rad), `dt`, `quality` (0–255) | `:222` |
+| `extVisionSample` | `pos`/`vel`/`quat` + variances, `pos_frame`/`vel_frame`, `quality` | `:231` |
+| `dragSample` | `accelXY` (body specific force m/s²) | `:247` |
+| `auxVelSample` | `vel` (NE m/s), `velVar` | `:254` |
+
+### 3.5 Sensor-specific prefilters inside EKF2
+
+- **Baro alpha-LPF + dynamic-pressure compensation.** `controlBaroHeightFusion` (`baro_height_control.cpp:54`) takes `compensateBaroForDynamicPressure()` (`ekf_helper.cpp:238`) — corrects static-pressure error from airspeed/wind using `EKF2_PCOEF_*` — then feeds an `AlphaFilter _baro_lpf` (`:67/73`) before the bias/innovation logic.
+- **Ground-effect deadzone.** While `gnd_effect` is set, negative baro innovations within `EKF2_GND_EFF_DZ` are zeroed to reject rotor-wash transients (`baro_height_control.cpp:86-99`).
+- **GPS quality checks.** `gps_checks.cpp` gates on fix type, sat count, `EKF2_REQ_*` accuracy/drift thresholds before GPS is allowed to aid.
+
+### 3.6 Input parameters (verified defaults, `ekf2_params.c`)
+
+| Param | Default | Unit | Role |
+|---|---|---|---|
+| `EKF2_PREDICT_US` | 10000 | µs | filter (predict) period → ~100 Hz |
+| `EKF2_IMU_CTRL` | 3 | bitmask | bit0 GyroBias, bit1 AccelBias, bit2 GravityVector |
+| `EKF2_MAG_DELAY` / `EKF2_BARO_DELAY` | 0 / 0 | ms | sensor delay vs IMU |
+| `EKF2_GPS_DELAY` | 110 | ms | GNSS delay |
+| `EKF2_OF_DELAY` / `EKF2_RNG_DELAY` | 20 / 5 | ms | flow / range delay |
+| `EKF2_ASP_DELAY` / `EKF2_EV_DELAY` / `EKF2_AVEL_DELAY` | 100 / 0 / 5 | ms | airspeed / vision / aux-vel delay |
+| `EKF2_*_POS_{X,Y,Z}` | 0 | m | body-frame lever arms (`EKF2_IMU_POS_*`, `EKF2_GPS_POS_*`, `EKF2_RNG_POS_*`, `EKF2_OF_POS_*`, `EKF2_EV_POS_*`) |
+
+> **Note on defaults.** The C++ `parameters` struct in `common.h` carries *placeholder* initializers (e.g. `baro_noise{2.0}`, `accel_bias_p_noise{1e-2}`, `gps_vel_noise{0.5}`) that are **overwritten at boot** by the `EKF2_*` parameters (`EKF2.cpp` binds each param → struct field). Always read the `ekf2_params.c` value as the real default; this note cites those.
+
+---
+
+## 4. The 24-state vector
+
+`stateSample` (`common.h:269`); symbolic names from the SymForce derivation `EKF/python/ekf_derivation/derivation.py:39`. Covariance `P` is a 24×24 symmetric matrix.
+
+| Idx | Symbol | `stateSample` member | Meaning | Units |
+|---|---|---|---|---|
+| 0–3 | `qw qx qy qz` | `quat_nominal` | rotation **body → earth** (NED) | – |
+| 4–6 | `vx vy vz` | `vel` | velocity, earth NED | m/s |
+| 7–9 | `px py pz` | `pos` | position, earth NED (z = down) | m |
+| 10–12 | `d_ang_bx/by/bz` | `delta_ang_bias` | **delta-angle** (gyro) bias | rad |
+| 13–15 | `d_vel_bx/by/bz` | `delta_vel_bias` | **delta-velocity** (accel) bias | m/s |
+| 16–18 | `ix iy iz` | `mag_I` | earth magnetic field, NED | gauss |
+| 19–21 | `ibx iby ibz` | `mag_B` | magnetometer bias, body | gauss |
+| 22–23 | `wx wy` | `wind_vel` | horizontal wind, earth NE | m/s |
+
+> **Delta biases, not rate biases.** States 10–15 are biases on the *integrated* IMU increments over one sample, so the equivalent rate/accel bias is `delta_ang_bias / δt` and `delta_vel_bias / δt`. The same `K`-slice mapping is used everywhere by `Ekf::fuse` (`ekf_helper.cpp:789`): `q -= K[0:4]·e`, `v -= K[4:7]·e`, `p -= K[7:10]·e`, `δθ_b -= K[10:13]·e`, `δv_b -= K[13:16]·e`, `mag_I -= K[16:19]·e`, `mag_B -= K[19:22]·e`, `wind -= K[22:24]·e`.
+
+`P(9,9)` is the vertical-position variance, `P(4..6,·)` the velocity block, etc. — the indices above *are* the covariance indices.
+
+---
+
+## 5. EKF update cycle
+
+![EKF2 update cycle and R/Q hooks](ekf2_estimator_pipeline_2026-05-25_cycle.svg)
+
+`Ekf::update()` (`ekf.cpp:158`) runs once per down-sampled IMU sample, in this order: **predictCovariance → predictState → controlFusionModes → correctOutputStates**.
+
+### 5.1 State prediction — strapdown INS (`predictState`, `ekf.cpp:253`)
+
+```
+δθ_corr = δθ − δθ_b − Rᵀ·ω_earth·δt          # gyro bias + earth-rotation removed   (:257-260)
+q       ← (q ⊗ Δq(δθ_corr)).normalized()      # quaternion propagation               (:262-265)
+R_eb    = DCM(q)
+δv_corr = δv − δv_b
+v       ← v + R_eb·δv_corr                     # specific-force increment, earth frame (:271-277)
+v(2)    ← v(2) + g·δt          (g = +9.80665, NED down)                                (:280)
+p       ← p + ½(v_old + v)·δt                  # trapezoidal position                  (:283)
+_dt_ekf_avg ← 0.99·_dt_ekf_avg + 0.01·clamp(½(δθ_dt+δv_dt))                            (:288-293)
+```
+
+Bias states are **unchanged** by prediction — they only move during fusion. The symbolic form is `derivation.py:94-96` (`q_new = q ⊗ [1, ½δθ_true]`, `v_new = v + R·δv_true + g·dt`, `p_new = p + v·dt`).
+
+### 5.2 Covariance prediction & process noise Q (`predictCovariance`, `covariance.cpp:102`)
+
+The propagation is the standard EKF form, generated symbolically by SymForce and compiled into `predict_covariance.h` (`sym::PredictCovariance(...)`, “Total ops: 2887”):
+
+```
+P ← A·P·Aᵀ + G·var_u·Gᵀ
+A = ∂x_new/∂x  (24×24 state Jacobian)      G = ∂x_new/∂[δv,δθ]  (noise Jacobian)
+var_u = diag(δv_var×3 , δθ_var×3)          dt = _dt_ekf_avg
+δθ_var = (dt·gyro_noise)²                  δv_var(i) = (dt·accel_noise)²  [or BADACC if clipping/bad]
+```
+
+The **stationary** states get a process-noise diagonal added on top (`covariance.cpp:227-241`):
+
+| States | σ (process) | Param (default) | Gating |
+|---|---|---|---|
+| 10–12 δθ-bias | `dt²·gyro_bias_p_noise` | `EKF2_GYR_B_NOISE` 1.0e-3 | frozen if `!ImuCtrl::GyroBias` |
+| 13–15 δv-bias | `dt²·accel_bias_p_noise` | `EKF2_ACC_B_NOISE` 3.0e-3 | frozen if `!AccelBias` ∥ high-manoeuvre ∥ bad-accel ∥ axis clipping ∥ not observable |
+| 16–18 mag_I | `dt·mage_p_noise` | `EKF2_MAG_E_NOISE` 1.0e-3 | only if `mag_3D` & `ΣP(16:18) < 0.1` |
+| 19–21 mag_B | `dt·magb_p_noise` | `EKF2_MAG_B_NOISE` 1.0e-4 | only if `mag_3D` & `ΣP(19:21) < 0.1` |
+| 22–23 wind | `[wind_vel_nsd·(1+0.5·|ḣ_lpf|)]²·dt` | `EKF2_WIND_NSD` 1.0e-2 | only if `wind` & `ΣP(22:23) < 1` |
+| IMU δθ in | `(dt·gyro_noise)²` | `EKF2_GYR_NOISE` 1.5e-2 | via `G` |
+| IMU δv in | `(dt·accel_noise)²` | `EKF2_ACC_NOISE` 3.5e-1 | via `G`; → `BADACC_BIAS_PNOISE` on clip/bad |
+
+**Bias inhibit** (`covariance.cpp:125-190`): when a gyro/accel-bias axis is unobservable or the vehicle is manoeuvring hard (`_ang_rate_magnitude_filt > acc_bias_learn_gyr_lim` ∥ `_accel_magnitude_filt > acc_bias_learn_acc_lim`), its variance is *frozen* (saved & restored) so the bias estimate cannot wander. Covariance symmetry/limits are enforced by `fixCovarianceErrors()`.
+
+### 5.3 Generic measurement update
+
+Each aiding source builds an `estimator_aid_source*_s` (innovation, variance, test ratio) then calls the shared update. For velocity/position/height this is the **sequential scalar** helper `fuseVelPosHeight()` (`vel_pos_fusion.cpp:193`); other sources use the analogous `measurementUpdate()`/`fuse()` path. The maths:
+
+```
+innov  = z − h(x)                              # e.g. updateVerticalPositionAidSrcStatus: pos(2) − obs
+S      = H·P·Hᵀ + R                            # innovation variance  (obs_var floored at 0.01²)
+test   = innov² / (gate²·S)        accept iff test < 1          # NIS outlier gate
+K      = P·Hᵀ / S                              # Kalman gain  (for vel/pos H is a unit row → K = P(:,sᵢ)/S)
+x      ← x − K·innov                           # Ekf::fuse, ekf_helper.cpp:789
+P      ← P − K·H·P  ( = P − KHP )              # then fixCovarianceErrors() + symmetry
+```
+
+For `fuseVelPosHeight` the observation index 0–5 maps to state index 4–9 (vN vE vD pN pE pD); a special case clamps (rather than rejects) vertical innovations when `bad_acc_vertical` is set, to ride out IMU clipping without destabilising height.
+
+---
+
+## 6. Fusion sources
+
+`controlFusionModes()` (`control.cpp:46`) dispatches the controllers below **in this fixed order** every tick (bracketed ones are `CONFIG_*`-gated build options):
+
+`mag → [flow] → gps → [airspeed] → [sideslip] → [drag] → height → gravity → [ext-vision] → [aux-vel] → zero-yaw → zero-vel → fake-pos → fake-hgt`.
+
+### 6.1 Master fusion table
+
+| # | Controller → fuser (file) | Observation `z` | Model `h(x)` | States | `R` (param) | Gate (param) | Generated Jacobian |
+|---|---|---|---|---|---|---|---|
+| 1 | `controlMagFusion`→`fuseMag` (`mag_fusion.cpp:54`) | `mag` (body) | `Rᵉᵇᵀ·mag_I + mag_B`, seq X→Y→Z | q, mag_I, mag_B | `mag_noise²` (`EKF2_MAG_NOISE` 0.05 G) | `EKF2_MAG_GATE` 3.0 | `compute_mag_innov_innov_var_and_hx.h` |
+| 1b | `…fuseYaw` (`mag_fusion.cpp:227`) | mag heading | yaw from rotated `mag_I` | q (yaw) | `mag_heading_noise²` (0.3 rad) | `EKF2_HDG_GATE` 2.6 | `compute_yaw_321/312_*.h` |
+| 2 | `controlOpticalFlowFusion` (`optflow_fusion.cpp`) | `flow_xy_rad` (LOS rate) | `v_body/range − ω_body` | q, v, terrain | `flow_noise²` (`EKF2_OF_N_MIN` 0.15) | `EKF2_OF_GATE` 3.0 | `compute_flow_*_innov_var_and_h*.h` |
+| 3 | `controlGpsFusion` (`gps_control.cpp:42`) | GPS NED vel, NE pos | `v(0:2)`, `p(0:1)` | v, p | `max(sacc,gps_vel_noise)²` / `max(hacc,gps_pos_noise)²` | `EKF2_GPS_V_GATE`/`P_GATE` 5.0 | direct (`vel_pos_fusion`) |
+| 3b | `controlGpsYawFusion` (`gps_control.cpp:316`) | dual-antenna yaw | yaw from `q` | q | `gps_heading_noise²` (0.1) | `EKF2_HDG_GATE` 2.6 | `compute_gnss_yaw_pred_innov_var_and_h.h` |
+| 4 | `controlAirDataFusion`→`fuseAirspeed` (`airspeed_fusion.cpp`) | `true_airspeed` | `‖[vx−wx, vy−wy, vz]‖` | v, wind | `(eas_noise·eas2tas)²` (`EKF2_EAS_NOISE` 1.4) | `EKF2_TAS_GATE` 3.0 | `compute_airspeed_innov_and_innov_var.h` |
+| 5 | `controlBetaFusion`→`fuseSideslip` (`sideslip_fusion.cpp`) | `0` (synthetic β) | `v_body,y / v_body,x` | q, v, wind | `beta_noise²` (0.3) | `EKF2_BETA_GATE` 5.0 | `compute_sideslip_innov_and_innov_var.h` |
+| 6 | `controlDragFusion`→`fuseDrag` (`drag_fusion.cpp`) | body specific force `accelXY` | `−½·ρ/bcoef·vᵣ‖vᵣ‖ − mcoef·vᵣ` | v, wind | `drag_noise` (`EKF2_DRAG_NOISE` 2.5) | test-ratio | `compute_drag_{x,y}_innov_var_and_k.h` |
+| 7 | `controlHeightFusion` (`height_control.cpp`) → baro/gnss/rng/ev height | sensor height − bias | `p(2) + bias` | p(2) (+ bias est.) | `baro_noise²`/gps/range/ev | `EKF2_BARO_GATE` 5.0 | direct (`vel_pos_fusion` pD) |
+| 8 | `controlGravityFusion`→`fuseGravity` (`gravity_fusion.cpp`) | accel (when ‖a‖≈g) | unit gravity `Rᵀ·ĝ` | q | `gravity_noise²` (`EKF2_GRAV_NOISE` 1.0) | internal | `compute_gravity_innov_var_and_k_and_h.h` |
+| 9 | `controlExternalVisionFusion` (`ev_*_control.cpp`) | EV pos / vel / yaw | `p` / `v` / yaw(q) | p, v, q (+ bias est.) | `ev_pos/vel/att_noise²` (0.1) | `EKF2_EVP/EVV_GATE` 5/3 | direct + yaw |
+| 10 | `controlAuxVelFusion` (`auxvel_fusion.cpp`) | NE velocity | `v(0:1)` | v | `auxvel_noise²` (0.5) | gate 5.0 | direct |
+| 11 | `controlZeroInnovationHeadingUpdate` (`zero_innovation_heading_update.cpp`) | 0 (yaw) | yaw(q) | q | small | — | — |
+| 12 | `controlZeroVelocityUpdate` (`zero_velocity_update.cpp`) | 0 (at rest) | `v` | v | small | — | — |
+| 13 | `controlFakePosFusion` (`fake_pos_control.cpp`) | last position | `p(0:1)` | p | `pos_noaid_noise²` (10) | — | — |
+| 14 | `controlFakeHgtFusion` (`fake_height_control.cpp`) | constant | `p(2)` | p(2) | `pos_noaid_noise²` | — | — |
+
+Every `compute_*` follows the same symbolic recipe (`derivation.py`): predict the measurement `h(x)`, then `H = ∂h/∂x`, `innov_var = (H·P·Hᵀ + R)`.
+
+### 6.2 Deep dives
+
+**Velocity / position / height** (`vel_pos_fusion.cpp`). `H` is a unit row selecting one state, so the update is the scalar form of §5.3 with `S = P(sᵢ,sᵢ) + R`. Observations are built by `updateVelocityAidSrcStatus` / `updateHorizontalPositionAidSrcStatus` / `updateVerticalPositionAidSrcStatus` (`:46-130`): `innov = state − obs`, `innov_var = P(sᵢ,sᵢ) + max(0.01², obs_var)`. Height is special because several sensors can drive `p(2)`; see the dispatcher and bias estimators below.
+
+**Magnetometer** (`mag_fusion.cpp`). 3-axis: `R_MAG = mag_noise²`; the generated `ComputeMagInnovInnovVarAndHx` yields a **sparse** Jacobian over states `{q(0:3), mag_I(16:18), mag_B(19:21)}`; fused sequentially X→Y→Z with per-axis covariance-conditioning checks. Heading-only mode uses `fuseYaw()` with `mag_heading_noise` and `EKF2_HDG_GATE`. Declination is constrained by `fuseDeclination()`. Mode selection (`EKF2_MAG_TYPE`, auto vs heading vs 3D) is in `mag_control.cpp`.
+
+**GPS** (`gps_control.cpp:42`). Velocity obs variance `vel_var = max(sacc, gps_vel_noise)²` with the **vertical component inflated** `×1.5²` (`:91-92`); horizontal position `pos_noise = max(hacc, gps_pos_noise)`, **capped at `pos_noaid_noise`** when GPS is the only horizontal aid (`:103-109`). GPS *height* (when `EKF2_GPS_CTRL` has the VPOS bit) goes through the height dispatcher with its own bias estimator (`gnss_height_control.cpp`). Dual-antenna yaw via `gps_yaw_fusion.cpp`.
+
+### 6.3 The specialised sources (one line each)
+
+- **Airspeed** (`airspeed_fusion.cpp`) — fixed-wing; `h = ‖v − wind‖`; observes velocity & wind; resets wind on first fusion; needs `EKF2_ARSP_THR > 0`.
+- **Sideslip** (`sideslip_fusion.cpp`) — synthetic `β = 0` assumption; `R = beta_noise²`; fused ~every 150 ms; bootstraps/holds the wind states for fixed-wing.
+- **Drag** (`drag_fusion.cpp`) — multirotor wind from body X/Y specific force using a bluff-body (`EKF2_BCOEF_*`) + rotor-momentum (`EKF2_MCOEF`) model; observes velocity & wind.
+- **Optical flow** (`optflow_fusion.cpp`) — LOS angular rate vs `v_body/range` minus body rate; noise scaled by sensor quality; couples to the terrain estimate for range.
+- **Range finder** (`range_height_control.cpp`, `sensor_range_finder.cpp`) — height-above-ground; `R = (range_noise + range_noise_scaler·range)²`; `EKF2_RNG_CTRL` (0/1/2 = off/conditional/on); conditional aiding limited by `max_hagl_for_range_aid`, `max_vel_for_range_aid`, tilt; kinematic-consistency check.
+- **External vision** (`ev_pos/vel/yaw/height_control.cpp`) — NED or FRD pos/vel/yaw/height; `EKF2_EV_CTRL` bitmask; frame conversion + lever arm; non-reference pos/height get bias estimators.
+- **Gravity** (`gravity_fusion.cpp`) — tilt constraint from the accelerometer when `‖a‖≈g`; enabled by `EKF2_IMU_CTRL` GravityVector bit; useful before mag/GPS alignment.
+- **Aux velocity** (`auxvel_fusion.cpp`) — generic external NE velocity (e.g. landing-target).
+- **Zero-velocity / zero-yaw** (`zero_velocity_update.cpp`, `zero_innovation_heading_update.cpp`) — pseudo-measurements applied at rest to bound velocity/yaw drift and let accel-bias learn.
+- **Fake position / height** (`fake_pos_control.cpp`, `fake_height_control.cpp`) — last-known constraints with `pos_noaid_noise` when no real aiding exists, preventing unbounded drift.
+
+### 6.4 Height / position **bias estimators** (the non-reference reconciliation)
+
+Several sources can supply height (or horizontal position); one is the **reference** and the others are reconciled to it through a scalar Kalman **bias** filter (`bias_estimator.cpp`, `height_bias_estimator.hpp`). Model (`bias_estimator.hpp`): `A=1`, `x[k+1]=x[k]+v`, `y=x+w`.
+
+```
+predict:  Δσ² = _process_psd·dt;  if offset detected → Δσ² ·= 1000;  σ² += Δσ²; clamp[1e-8, σ²_max]
+fuse:     S = σ² + max(0.01², R);  innov = z − x;  K = σ²/S
+          if innov²/(gate²·S) < 1:  x += K·innov;  σ² −= K·σ²
+offset:   |LPF(sign·test_ratio)| > 0.2  or persistent same-sign innovations (>10 s)
+```
+
+`_process_psd = (EKF2_*_BIAS_NSD)²` with all four NSDs = 0.13 m·s⁻¹·√Hz⁻¹ (baro/gps/rng/ev). The **reference sensor's bias estimator is inert** — `HeightBiasEstimator::predict/fuseBias` are guarded by `(_sensor_ref != _sensor)` (`height_bias_estimator.hpp:57/64`), so the reference owns the datum and only the non-reference offsets are tracked. **Worked example:** `EKF2_HGT_REF=0` (baro reference) with GPS height enabled — baro's estimator is frozen, GPS gets a bias ≈ (GPS-MSL) − (baro-altitude). Full treatment in `ekf2_height_ref_baro_2026-05-21.*`.
+
+### 6.5 EKFGSF_yaw — emergency yaw (`EKFGSF_yaw.cpp`)
+
+A bank of *N* lightweight AHRS+EKF filters seeded at different yaw angles, weighted by a Gaussian-Sum likelihood from GPS-velocity consistency. When the main filter's yaw diverges (e.g. mag loss), the composite `_gsf_yaw` (if confident enough) is used to **reset** the main EKF yaw. Output is published as `yaw_estimator_status`.
+
+---
+
+## 7. Outputs
+
+### 7.1 Output predictor (`output_predictor.cpp`)
+
+The EKF solution is at the *delayed* horizon; the output predictor produces the low-latency `now` solution the vehicle consumes. Two phases:
+
+**Forward INS — `calculateOutputStates()` (`:168`, every full-rate IMU sample):**
+```
+δθ_c = δθ − δθ_b + _delta_angle_corr            # note the complementary correction term
+q_o  ← (q_o ⊗ Δq(δθ_c)).normalize()
+δv_e = R(q_o)·(δv − δv_b);  δv_e(2) += g·δt
+v_o  ← v_o + δv_e;  p_o ← p_o + ½(v_o+v_o,prev)·δt     # trapezoidal
+v_imu_rel = (δθ_c/δt) × imu_pos_body            # IMU lever-arm correction → NED
+```
+
+**Complementary correction — `correctOutputStates()` (`:242`, once per EKF update):** push `_output_new` to a ring buffer, take the oldest (delayed) entry, and drive it toward the EKF state:
+```
+q_err = (q_ekf⁻¹ ⊗ q_o,delayed).normalize();  δa = ∓2·[q_err(1:3)]
+att_gain = 0.5·dt_update_avg / time_delay       # keeps damping ≈ 0.7 across varying delay
+_delta_angle_corr = δa · att_gain               # fed back into the forward step above
+vel_gain = dt/clamp(_vel_tau, dt, 10);  pos_gain = dt/clamp(_pos_tau, dt, 10)
+vel_corr = vel_err·vel_gain + Σvel_err·vel_gain²·0.1     # PD, ~5% overshoot
+pos_corr = pos_err·pos_gain + Σpos_err·pos_gain²·0.1
+→ applyCorrectionToOutputBuffer(vel_corr, pos_corr)      # constant correction across history
+```
+`_vel_tau`/`_pos_tau` are set by `EKF2_TAU_VEL` / `EKF2_TAU_POS` (both 0.25 s). `getOutputTrackingError()` (angle/vel/pos) is published in `estimator_status`.
+
+### 7.2 Output topics (`EKF2.cpp` `Publish*`)
+
+| Method (line) | Topic | Key fields |
+|---|---|---|
+| `PublishAttitude` (983) | `vehicle_attitude` | `q`, quaternion reset (published *before* update) |
+| `PublishLocalPosition` (1420) | `vehicle_local_position` | x/y/z, vx/vy/vz, ax/ay/az, z_deriv, heading, dist_bottom, eph/epv/evh/evv, ref_lat/lon/alt, reset counters, dead_reckoning, ctrl limits |
+| `PublishGlobalPosition` (1169) | `vehicle_global_position` | lat/lon/alt, terrain_alt, eph/epv |
+| `PublishOdometry` (1547) | `vehicle_odometry` | pos, q, vel, angular_velocity, pos/vel/orientation variances |
+| `PublishStatus` (1655) | `estimator_status` | `*_test_ratio` (mag/vel/pos/hgt/tas/hagl/beta), `output_tracking_error`, control/fault flags, accuracies, resets |
+| `PublishStatusFlags` (1706) | `estimator_status_flags` | per-bit control (`cs_*`) / fault (`fs_*`) / innovation-reject flags |
+| `PublishInnovations` (1256) | `estimator_innovations` | innovations for every source |
+| `PublishInnovationTestRatios` (1333) | `estimator_innovation_test_ratios` | the NIS test ratios |
+| `PublishInnovationVariances` (1377) | `estimator_innovation_variances` | innovation variances |
+| `PublishStates` (1643) | `estimator_states` | 24-state vector + variances |
+| `PublishCovariances` (1521) | `estimator_covariances` | covariance diagonals |
+| `PublishSensorBias` (1589) | `estimator_sensor_bias` | gyro / accel / mag bias + variances |
+| `PublishWindEstimate` (1832) | `wind` | wind N/E + variance, tas/beta innov |
+| `PublishGpsStatus` (1221) | `estimator_gps_status` | GPS check pass/fail, sat info |
+| `PublishYawEstimatorStatus` (1812) | `yaw_estimator_status` | EKFGSF yaw + variance |
+| `PublishBaroBias` / `…GnssHgtBias` / `…RngHgtBias` / `…EvPosBias` (1003/1017/1031/1046) | `estimator_*_bias` | per-source bias estimator state |
+| `PublishEventFlags` (1096) | `estimator_event_flags` | information/warning events |
+| `PublishOpticalFlowVel` (1862) | `vehicle_optical_flow_vel` | flow-derived velocity |
+| `PublishAidSourceStatus` (923) | `estimator_aid_src_*` | innovation/variance/test-ratio per aid source |
+
+All position/velocity/attitude outputs are the **output-predictor** states (`getPosition/getVelocity/getQuaternion`), i.e. propagated to *now*, not the delayed EKF state.
+
+---
+
+## 8. EKF selector & runtime noise adaptation
+
+![EKF2Selector scoring and failover](ekf2_estimator_pipeline_2026-05-25_selector.svg)
+
+### 8.1 EKF2Selector (`EKF2Selector.cpp`)
+
+In multi-EKF builds, one EKF2 instance runs per IMU/mag set; the selector promotes one to publish the system topics.
+
+- **IMU fault accumulators** (`UpdateErrorScores`, `:151`): per sensor, `Σ(inconsistency − threshold)·dt` for gyro (threshold `EKF2_SEL_IMU_RAT` 7°/s; fault if accumulation > `EKF2_SEL_IMU_ANG` 15°) and accel (`EKF2_SEL_IMU_ACC` 1 m/s²; fault if > `EKF2_SEL_IMU_VEL` 2 m/s).
+- **Per-instance score** (`:298-356`): `combined_test_ratio = max(½(vel_tr + pos_tr), hgt_tr)`; `relative_test_ratio += (combined_i − combined_selected)` clamped to ±1; `healthy = (no fault) & combined>0`; `warning = combined ≥ 1`.
+- **Selection / failover** (`SelectInstance`, `:114`): a health hysteresis (~1 s); switch to a better instance once it wins by `EKF2_SEL_ERR_RED` (0.2); **instant** switch on IMU fault or timeout; relative scores reset on a switch. The winner republishes `vehicle_attitude/local_position/global_position/odometry/wind` and `sensor_selection`; `estimator_selector_status` reports the scores. Single-EKF builds skip all this and publish directly.
+
+### 8.2 Where R and Q are "bumped" at runtime
+
+| Kind | Location | Trigger | Effect / parameter |
+|---|---|---|---|
+| **R** | `gps_control.cpp:103-109` | GPS sole horizontal aid | cap pos noise at `pos_noaid_noise` (10 m) |
+| **R** | `gnss_height_control.cpp:53-61` | GPS vertical accuracy / sole vert source | `max(vacc, 1.5·gps_pos_noise)`, capped at `pos_noaid_noise` |
+| **R** | `gps_control.cpp:92` | always | GPS **vertical** velocity variance ×1.5² |
+| **R** | `ev_height_control.cpp` | EV height | floor at `gps_pos_noise²` |
+| **R** | range/flow controllers | always | `+range_noise_scaler·range`; flow noise ÷ quality |
+| **R** | `bias_estimator.cpp:72` | always (bias fuse) | floor `max(0.01², R)` |
+| **Q** | `covariance.cpp:109/112` | every predict | bias Q from `EKF2_GYR_B_NOISE` / `EKF2_ACC_B_NOISE` |
+| **Q** | `covariance.cpp:125-190` | unobservable / high manoeuvre / clipping / bad accel | **freeze** gyro/accel-bias variance (bias-inhibit) |
+| **Q** | `covariance.cpp:195-210` | `mag_3D` & ΣP<0.1 | grow `mag_I/B` by `EKF2_MAG_E/B_NOISE`, else 0 |
+| **Q** | `covariance.cpp:219-224` | wind active & ΣP<1 | wind Q = `WIND_NSD·(1+0.5·|ḣ|)` |
+| **Q** | `covariance.cpp:253-255` | bad accel / clipping | δv input var → `BADACC_BIAS_PNOISE` |
+| **P** | `ekf_helper.cpp` resets | aiding (re)start | `uncorrelateCovarianceSetVariance`, min 0.01² |
+| **P** | `ekf_helper.cpp:1046` | yaw reset / mag transition | `increaseQuatYawErrVariance(yaw_var)` |
+| **Q** | `bias_estimator.cpp:48-52` | height-bias **offset detected** | process variance **×1000** until offset cleared |
+
+---
+
+## 9. Parameter reference (verified defaults, `ekf2_params.c`)
+
+| Param | Default | Unit | Role |
+|---|---|---|---|
+| `EKF2_PREDICT_US` | 10000 | µs | predict period (≈100 Hz) |
+| `EKF2_IMU_CTRL` | 3 | mask | GyroBias(1)/AccelBias(2)/Gravity(4) |
+| `EKF2_GYR_NOISE` / `EKF2_ACC_NOISE` | 1.5e-2 / 3.5e-1 | rad/s, m/s² | IMU input (Q via G) |
+| `EKF2_GYR_B_NOISE` / `EKF2_ACC_B_NOISE` | 1.0e-3 / 3.0e-3 | rad/s², m/s³ | bias process noise |
+| `EKF2_MAG_E_NOISE` / `EKF2_MAG_B_NOISE` | 1.0e-3 / 1.0e-4 | G/s | mag field/bias process noise |
+| `EKF2_WIND_NSD` | 1.0e-2 | m/s²/√Hz | wind process noise |
+| `EKF2_BARO_NOISE` | 3.5 | m | baro height R |
+| `EKF2_GPS_P_NOISE` / `EKF2_GPS_V_NOISE` | 0.5 / 0.3 | m, m/s | GPS pos/vel R floor |
+| `EKF2_MAG_NOISE` | 5.0e-2 | G | 3-axis mag R |
+| `EKF2_EAS_NOISE` | 1.4 | m/s | airspeed R |
+| `EKF2_BETA_NOISE` | 0.3 | rad | sideslip R |
+| `EKF2_GRAV_NOISE` | 1.0 | m/s² | gravity R |
+| `EKF2_RNG_NOISE` | 0.1 | m | range R |
+| `EKF2_OF_N_MIN` | 0.15 | rad/s | flow R (best quality) |
+| `EKF2_DRAG_NOISE` | 2.5 | (m/s²)² | drag R |
+| `EKF2_*_BIAS_NSD` (baro/gps/rng/ev hgt) | 0.13 | m/s/√Hz | bias-estimator process noise |
+| `EKF2_BARO_GATE` / `EKF2_GPS_P_GATE` / `EKF2_GPS_V_GATE` | 5.0 | σ | innovation gates |
+| `EKF2_HDG_GATE` / `EKF2_MAG_GATE` | 2.6 / 3.0 | σ | heading / 3-axis mag gates |
+| `EKF2_TAS_GATE` / `EKF2_OF_GATE` / `EKF2_RNG_GATE` | 3.0 / 3.0 / 5.0 | σ | airspeed / flow / range gates |
+| `EKF2_TAU_VEL` / `EKF2_TAU_POS` | 0.25 / 0.25 | s | output-predictor complementary time constants |
+| `EKF2_ABL_LIM` / `EKF2_ABL_ACCLIM` / `EKF2_ABL_GYRLIM` / `EKF2_ABL_TAU` | 0.4 / 25 / 3.0 / 0.5 | mixed | accel-bias-learning limits |
+| `EKF2_HGT_REF` / `EKF2_BARO_CTRL` / `EKF2_GPS_CTRL` | 1 / 1 / 7 | enum/mask | height reference / baro on / GPS bitmask (HPOS1·VPOS2·VEL4·YAW8) |
+| `EKF2_MAG_TYPE` | 0 | enum | mag fusion mode (auto) |
+| `EKF2_SEL_ERR_RED` | 0.2 | – | selector switch margin |
+| `EKF2_SEL_IMU_RAT` / `_ANG` / `_ACC` / `_VEL` | 7.0 / 15 / 1.0 / 2.0 | deg/s, deg, m/s², m/s | selector IMU fault thresholds |
+
+---
+
+## 10. File reference
+
+| Area | File | Notable symbols / lines |
+|---|---|---|
+| Module / scheduling | `EKF2.cpp` | `Run` 381, `_ekf.update` 688, `Publish*` 923–1862 |
+| Selector | `EKF2Selector.cpp` | `UpdateErrorScores` 151, `SelectInstance` 114 |
+| Params | `ekf2_params.c`, `ekf2_params_selector.c` | defaults in §9 |
+| State / structs / enums | `EKF/common.h` | `stateSample` 269, sample structs 177–259, enums 118–156, `parameters` 280 |
+| Symbolic model | `EKF/python/ekf_derivation/derivation.py` | `State` 39, `predict_covariance` 72, `compute_*` 119+ |
+| Generated Jacobians | `EKF/python/ekf_derivation/generated/*.h` | `predict_covariance.h`, `compute_*_innov_var_and_h*.h` |
+| Update entry | `EKF/ekf.cpp` | `update` 158, `predictState` 253 |
+| Covariance / Q | `EKF/covariance.cpp` | `predictCovariance` 102 |
+| Generic fuse | `EKF/ekf_helper.cpp` | `fuse` 789, `compensateBaroForDynamicPressure` 238, `increaseQuatYawErrVariance` 1046 |
+| Ingest / buffers | `EKF/estimator_interface.cpp`, `EKF/RingBuffer.h`, `EKF/imu_down_sampler.cpp` | `setIMUData` 73, time-shift 123/159/238 |
+| Output predictor | `EKF/output_predictor.cpp` | `calculateOutputStates` 168, `correctOutputStates` 242 |
+| Fusion dispatch | `EKF/control.cpp` | `controlFusionModes` 46 |
+| Vel/pos/height | `EKF/vel_pos_fusion.cpp` | `fuseVelPosHeight` 193 |
+| Mag | `EKF/mag_fusion.cpp`, `mag_control.cpp` | `fuseMag` 54, `fuseYaw` 227 |
+| GPS | `EKF/gps_control.cpp`, `gnss_height_control.cpp`, `gps_yaw_fusion.cpp` | `controlGpsFusion` 42 |
+| Baro / height | `EKF/baro_height_control.cpp`, `height_control.cpp` | dynamic-pressure 54, LPF 67 |
+| Airspeed / sideslip / drag | `EKF/airspeed_fusion.cpp`, `sideslip_fusion.cpp`, `drag_fusion.cpp` | — |
+| Flow / range | `EKF/optflow_fusion.cpp`, `optical_flow_control.cpp`, `range_height_control.cpp`, `sensor_range_finder.cpp` | — |
+| Ext vision / gravity / aux | `EKF/ev_*_control.cpp`, `gravity_fusion.cpp`, `auxvel_fusion.cpp` | — |
+| Special updates | `EKF/zero_velocity_update.cpp`, `zero_innovation_heading_update.cpp`, `fake_*_control.cpp` | — |
+| Bias estimators | `EKF/bias_estimator.cpp/.hpp`, `height_bias_estimator.hpp`, `position_bias_estimator.hpp` | predict/fuse 42/70, ref-freeze guard 57/64 |
+| Emergency yaw | `EKF/EKFGSF_yaw.cpp/.h` | — |
+| Reference docs | `EKF/documentation/` | *Process and Observation Models.pdf*, *Output Predictor.pdf* |
+
+---
+
+*Generated from source at commit `791030d721` (branch `hotfix`). No PX4 source was modified. Diagrams are hand-authored SVG (`*_pipeline.svg`, `*_cycle.svg`, `*_selector.svg`); HTML rendered with pandoc. Companion note: `ekf2_height_ref_baro_2026-05-21.*`.*

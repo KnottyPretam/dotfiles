@@ -1,0 +1,35 @@
+#include "ms_colibri_command_interface.h"
+#include <iostream>
+#include <string>
+#include <cstring> // For memset
+#include "ms_app.h"
+
+double ms_colibri_command_interface::get_gimbal_az(void)
+{
+    return 0.0;
+}
+
+double ms_colibri_command_interface::get_gimbal_el(void)
+{
+    return 0.0;
+}
+
+void ms_colibri_command_interface::addObserver(kw_observer* observer)
+{
+    outputObserver = observer;
+}
+
+void ms_colibri_command_interface::input_message( uint8_t *data, int length )
+{
+    if(colibri_full_ack == false)
+    {
+        // Parse Message
+        colibri_ack_decode(colibri_message_camera_ack, data);
+    }
+    else
+    {
+        // Parse Message
+        colibri_full_ack_decode(colibri_message_camera_full_ack, data);
+    };
+
+}

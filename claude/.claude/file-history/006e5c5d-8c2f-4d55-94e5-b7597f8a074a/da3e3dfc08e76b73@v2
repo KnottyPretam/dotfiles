@@ -1,0 +1,88 @@
+/****************************************************************************
+ *
+ *   Copyright (c) 2024 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+#pragma once
+
+#include <mathlib/mathlib.h>
+#include <math.h>
+
+/**
+ * Polynomial frequency-sweep (chirp) signal generator.
+ *
+ * The instantaneous frequency sweeps from freq_init to freq_final over the
+ * total_time duration following a polynomial of order chirp_order:
+ *
+ *     f(t)  = freq_init + beta * t^k,   with  beta = (freq_final - freq_init) / T^k
+ *     out(t)= amp * sin( 2*pi * ( beta/(k+1) * t^(k+1) + freq_init * t ) )
+ *
+ * where t is the running elapsed time in [0, T], T = total_time and k = chirp_order.
+ * k = 1 yields the textbook linear chirp. At t = 0 the output is 0 (smooth start).
+ */
+class Chirp
+{
+public:
+	Chirp() = default;
+
+	void configure(float freq_init, float freq_final, float chirp_order, float total_time, float amplitude)
+	{
+		_freq_init = freq_init;
+		_freq_final = freq_final;
+		_chirp_order = chirp_order;
+		_total_time = total_time;
+		_amplitude = amplitude;
+	}
+
+	// Chirp signal at elapsed time t [s]. t is clamped to [0, total_time].
+	float update(float t) const
+	{
+		if (_total_time <= 0.f) {
+			return 0.f;
+		}
+
+		const float tc = math::constrain(t, 0.f, _total_time);
+		const float beta = (_freq_final - _freq_init) / powf(_total_time, _chirp_order);
+		const float phase = 2.f * M_PI_F * (beta / (_chirp_order + 1.f) * powf(tc, _chirp_order + 1.f) + _freq_init * tc);
+		return _amplitude * sinf(phase);
+	}
+
+	bool finished(float t) const { return t > _total_time; }
+
+	float duration() const { return _total_time; }
+
+private:
+	float _freq_init{0.f};   ///< sweep start frequency [Hz]
+	float _freq_final{0.f};  ///< sweep end frequency [Hz]
+	float _chirp_order{1.f}; ///< polynomial order of the sweep (1 = linear)
+	float _total_time{0.f};  ///< sweep duration [s]
+	float _amplitude{0.f};   ///< output amplitude (units of the target axis)
+};

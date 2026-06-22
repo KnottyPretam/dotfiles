@@ -1,0 +1,165 @@
+# Colibri Camera/Gimbal Driver — Implementation Plan
+
+## Context
+
+The `feature/ColibriCommandandControl` branch added a scaffold for a NextVision NightHawk-family camera/gimbal driver (the "Colibri" serial protocol) but the scaffold is incomplete and won't compile or work correctly:
+
+- `app/include/ms_colibri_command_interface.h` defines the wire structs (good) but the encode/decode functions have wrong byte ordering, packed correlator bytes twice, use uninitialised checksum variables, and put `index += 8` where `+= 1` is meant. A free-floating `double k = …` lives in the header (ODR violation across translation units).
+- `app/include/ms_vehicleData.h` declares `addNighthawkObserver(messageName, observer)` but `.cc` defines `addNighthawkObserver(observer)` — link error.
+- `app/src/ms_vehicleData.cc` calls `nighthawk_interface.inputMessage(...)`; the method is `input_message`.
+- `app/src/ms_gimbalControl.cc` has a stray `vehicleData->` token in `rotation_test()` — won't compile.
+- `app/CMakeLists.txt` doesn't list `ms_colibri_command_interface.cc`, so the file is invisible to the build.
+- The class is missing the observer-dispatch / output-observer API that the rest of the codebase uses (see `mavlink_interface` and `stanag_interface`).
+
+The intended outcome: a working wire-level driver that correctly encodes outgoing Host→Camera (H2CAM) 20-byte command messages, decodes incoming Camera→Host (CAM2H) 20-byte and 64-byte Full-ACK reports per *Colibri Protocol Rev 2.0.43* (May 2025), dispatches decoded reports to observers using the same pattern as `mavlink_interface`, and exposes a small high-level command API on `ms_gimbalControl`. The camera and gimbal share one physical serial link and one protocol, so a single driver covers both.
+
+Protocol default: **Full ACK (fast) mode** — 115,200 bps, 100 Hz reports, 64-byte CAM2H. Header3 = `0xF8` (auto-roll, yaw-stabilise) is issued on the first command to flip the camera link out of slow mode. The HDMI-sync developer guide explicitly states fast mode is the only mode intended for high-accuracy systems.
+
+## Approach
+
+Restructure `ms_colibri_command_interface` to mirror `mavlink_interface` (the established pattern in this repo): a non-`kw_component` class that lives as a member of `ms_vehicleData`, owns named-observer dispatch, has overloaded `send_message(struct)` methods, and an `addOutputObserver(kw_observer*)` that funnels encoded bytes out through `mOUTPUT_GIMBAL`. `ms_gimbalControl` becomes the consumer — it registers as an observer for decoded acks, holds the latest gimbal state, and exposes a handful of typed setters (mode, rate, FOV, channel, LRF) that build a `__colibri_message_command` and call into the interface.
+
+## Files to modify
+
+### 1. `app/include/ms_colibri_command_interface.h` — header refactor
+
+Replace the contents. Keep the three `#pragma pack`ed structs (`__colibri_message_command`, `__colibri_message_ack`, `__colibri_message_full_ack`) — the byte layouts match the PDF. Remove the global `double k = …` (move to `ms_colibri_command_interface.cc` as `static constexpr double K_RATE`). Move encode/decode and checksum functions to the .cc; declare them in the header as free functions.
+
+Add message-name constants at the top of the header (matching the `mMAVLINK_*` style):
+```cpp
+#define mCOLIBRI_MESSAGE_ENCODED  "colibri_message_encoded"
+#define mCOLIBRI_ACK_FIXED        "colibri_ack_fixed"      // 20-byte slow-mode ack
+#define mCOLIBRI_ACK_FULL         "colibri_ack_full"       // 64-byte fast-mode full ack
+```
+
+Rewrite the class to match `mavlink_interface`:
+```cpp
+enum enColibriMode  { eCOL_MODE_PILOT=3, eCOL_MODE_STOW=4, eCOL_MODE_RATE=6,
+                      eCOL_MODE_HOLD_LOS=7, eCOL_MODE_PARK=8, eCOL_MODE_BACKLOCK=9,
+                      eCOL_MODE_PILOT_90=14, eCOL_MODE_SET_ANGLE=24,
+                      eCOL_MODE_FIX_YAW=25, eCOL_MODE_STOW_YAW=26,
+                      eCOL_MODE_MOTORS_OFF=28, eCOL_MODE_NO_BIT=29 };
+enum enColibriChannel { eCOL_CHAN_EO=0, eCOL_CHAN_IR=1 };
+enum enColibriProtocol { eCOL_PROTO_SLOW, eCOL_PROTO_FAST };
+
+class ms_colibri_command_interface {
+public:
+    void input_message(uint8_t* data, int length);
+    void send_message(const __colibri_message_command& cmd);
+    void addObserver(const std::string& messageName, kw_observer* observer);
+    void addOutputObserver(kw_observer* observer);
+    void notify(const std::string& name, void* data);
+
+    void set_protocol(enColibriProtocol p) { protocol_mode = p; }
+    double get_gimbal_az() const;        // returns mech yaw in deg (cached from last full ack)
+    double get_gimbal_el() const;        // returns mech pitch in deg
+    double get_fov_deg() const;          // FOV = 100 / 1.03^report
+
+protected:
+    void dispatch_fixed_ack();
+    void dispatch_full_ack();
+
+    std::unordered_map<std::string, std::vector<kw_observer*>> observers;
+    kw_observer* outputObserver = nullptr;
+    std::mutex observersMutex;
+
+    enColibriProtocol protocol_mode = eCOL_PROTO_FAST;
+    uint8_t  rx_buffer[128];
+    int      rx_index = 0;
+
+    __colibri_message_full_ack cached_full_ack{};
+    __colibri_message_ack      cached_fixed_ack{};
+};
+```
+
+### 2. `app/src/ms_colibri_command_interface.cc` — full implementation
+
+Implement:
+
+- `static uint8_t colibri_checksum(const uint8_t* buf, int len)` — 8-bit additive sum of `buf[0..len-2]` (standard for this family; flag in a `// TODO` comment that this needs HW verification on first integration).
+- `bool colibri_command_encode(const __colibri_message_command& m, uint8_t out[20])` — pack the 20 bytes in the correct order per *Colibri Protocol Rev 43* §3.1 (page 9-13). Use one `out[idx++] = m.field;` per byte. The struct is already `#pragma pack(push,1)` and lays out the fields in protocol order, so a `memcpy(out, &m, 19)` works for the body; then `out[19] = colibri_checksum(out, 20)`.
+- `bool colibri_fixed_ack_decode(__colibri_message_ack& m, const uint8_t in[20])` — `memcpy` body + validate checksum; return false on mismatch.
+- `bool colibri_full_ack_decode(__colibri_message_full_ack& m, const uint8_t in[64])` — same.
+- `input_message(uint8_t* data, int len)` — append bytes to `rx_buffer`, scan for header `0xB0 0x3B`, then peek the expected message length (20 for slow / known headers `0x77..0x7A` and `0x83`; 64 for fast / `0xF7..0xFA` echo). On a valid checksum, decode into the cached struct, then `notify(mCOLIBRI_ACK_FIXED|FULL, &cached_*)`. Discard the consumed bytes; if header sync is lost, shift one byte and keep scanning.
+- `send_message(const __colibri_message_command& m)` — encode, wrap in `stBuffer`, forward to `outputObserver->update(mCOLIBRI_MESSAGE_ENCODED, &buf)`.
+- `notify`, `addObserver`, `addOutputObserver` — copy verbatim from `mavlink_interface.cc` (same shape).
+- `get_gimbal_az/el/fov` — convert the cached MSB/LSB pairs to degrees using the 14-bit formula in *Camera Optical Report v1.5* §3.1 and the FOV formula `100 / 1.03^report` from *Colibri Rev 43* §4.2 correlator 0x04.
+
+Reuse: `pack/unpack` from `pack_unpack.h` is available but unnecessary for this protocol — all fields are byte-aligned uint8_t. Stick with direct byte assignment for clarity.
+
+### 3. `app/include/ms_messages.h` — add Colibri message constants
+
+Add two `#define`s for inbound/outbound colibri events. Actually scoped to that file so all components share them:
+```cpp
+#define mCOLIBRI_ACK_FIXED  "colibri_ack_fixed"
+#define mCOLIBRI_ACK_FULL   "colibri_ack_full"
+```
+(The `mCOLIBRI_MESSAGE_ENCODED` constant lives in the interface header alongside its peers, matching how `mMAVLINK_MESSAGE_ENCODED` is defined in `mavlink_interface.h`.)
+
+### 4. `app/include/ms_vehicleData.h` — fix signature
+
+Change line 37 from `void addNighthawkObserver(const std::string& messageName, kw_observer* observer);` to either match the .cc (single-arg) or — preferred — keep the named-observer signature and update the .cc. Use the named signature so it parallels `addMavlinkObserver`.
+
+### 5. `app/src/ms_vehicleData.cc` — three fixes
+
+- Fix `addNighthawkObserver(kw_observer* observer)` → `addNighthawkObserver(const std::string& messageName, kw_observer* observer)` and forward to `nighthawk_interface.addObserver(messageName, observer)` (line 71-74).
+- Fix the typo `nighthawk_interface.inputMessage(...)` → `nighthawk_interface.input_message(...)` (line 94).
+- Register an output observer in `createComponent`: `nighthawk_interface.addOutputObserver(this);` (alongside the existing `mavlinkGCSInterface.addOutputObserver(this)` etc.).
+- Add a `processUpdate` branch that maps `mCOLIBRI_MESSAGE_ENCODED` → `mOUTPUT_GIMBAL` (analogous to the existing `mMAVLINK_MESSAGE_ENCODED` → `mOUTPUT_AUTOPILOT` mapping at lines 106-111).
+- Fix `set_mission` missing return value (pre-existing, but trivial — return `true`).
+
+### 6. `app/include/ms_gimbalControl.h` — add command API + state observer
+
+```cpp
+class ms_gimbalControl : public kw_component {
+public:
+    ms_gimbalControl(const std::string& componentName);
+    ~ms_gimbalControl();
+    void createComponent(kw_observer* _outputObserver);
+    void mainThread();
+    void processUpdate(const std::string& name, void* data);   // for ack callbacks
+
+    // High-level commands
+    void setMode(enColibriMode mode);
+    void setChannel(enColibriChannel ch);                       // EO or IR
+    void setRate(int16_t pitch_rate, int16_t roll_rate, int16_t yaw_rate);
+    void setFOV(uint16_t deg_x10);                              // via correlator 0x05
+    void fireLRF(bool fire);
+
+protected:
+    void send_current_command();    // packages cmd_template + sends via vehicleData->nighthawk_interface
+    __colibri_message_command cmd_template{};   // sticky header + status bits between calls
+};
+```
+
+Delete `rotation_test` and the stray `direction` member — they were placeholder noise.
+
+### 7. `app/src/ms_gimbalControl.cc` — implement
+
+- Constructor seeds `cmd_template.header1=0xB0; header2=0x3B; header3=0xF8;` (fast-mode auto-roll/yaw-stab).
+- `createComponent` registers `this` with `vehicleData->addNighthawkObserver(mCOLIBRI_ACK_FULL, this)` and `mCOLIBRI_ACK_FIXED`.
+- Each setter mutates the appropriate bits of `cmd_template`, then calls `send_current_command()` which does `vehicleData->nighthawk_interface.send_message(cmd_template)`. The 5-bit Mode lives in bits `[0..4]` of byte 3; channel/illuminator/fusion in bits `[7..5]` of byte 3.
+- `setRate` encodes the 12-bit signed pitch/roll/yaw values into bytes 14-18 per *Rev 43* §3.1 byte 14-18 layout, with the centre value 2048 added (see Appendix A §1.i).
+- `setFOV` builds a correlator-0x05 command: byte 9 bits [5..0] = `0x05`, bytes 10-11 = MSB/LSB of deg×10, bytes 12-13 = 0x00.
+- `fireLRF` sets byte 4 bit 4 (and the appropriate safety key in byte 6 bits[7..4]=`0x5`).
+- `processUpdate` casts `data` to `__colibri_message_full_ack*` for `mCOLIBRI_ACK_FULL` (or fixed ack) and caches relevant state for getters / downstream consumers.
+- Empty out the previous `mainThread` body to just `while (running) std::this_thread::sleep_for(std::chrono::seconds(1));` (no polling needed — commands are caller-driven; acks arrive via observer).
+
+### 8. `app/CMakeLists.txt` — add source file
+
+Add `${CMAKE_CURRENT_LIST_DIR}/src/ms_colibri_command_interface.cc` to the `add_executable` source list (alphabetised, after `ms_authorization.cc`).
+
+## Reused existing utilities
+
+- `kw_observer` (`lib/kw_core/include/kw_observer.h:25-48`) — base class for observer pattern, defines `stBuffer`.
+- `kw_component` (`lib/kw_core/include/kw_component.h`) — `ms_gimbalControl` already inherits.
+- `mavlink_interface` pattern (`lib/mavlink/include/mavlink_interface.h:62-112`, `.cc:91-110` for the encode-then-notify flow) — copied for the colibri class.
+- `mINPUT_GIMBAL` / `mOUTPUT_GIMBAL` constants (`app/include/ms_messages.h:16-17`) — already wired through `ms_communications`, no changes needed.
+- `ms_vehicleData::processUpdate` mapping of `mMAVLINK_MESSAGE_ENCODED` → `mOUTPUT_AUTOPILOT` (`app/src/ms_vehicleData.cc:106-111`) — template for the new colibri mapping.
+
+## Verification
+
+1. **Build**: `./build-all.sh` (or `cd app/build && cmake .. && make`) completes with no errors. clang-tidy passes (enabled by default in `app/CMakeLists.txt:14`).
+2. **Round-trip unit test** in `app/test/` (test dir exists, hook into existing CMakeLists): construct a `__colibri_message_command` with known mode/rate/FOV values, encode to 20 bytes, verify byte-by-byte against a hand-calculated reference (taken from *Rev 43* worked examples), then decode the camera-emitted reference acks (one 20-byte, one 64-byte) and check the decoded struct matches expected field values. Also assert a corrupted-checksum input returns false.
+3. **Wire-level**: with a USB-to-RS422 dongle and a NightHawk2 (or loopback via socat), point `ms_communications::m_gimbal_socket` at the device, send a STOW command (mode 4) and observe a 64-byte ack message arriving with header `B0 3B F8`. Confirm `ms_gimbalControl::get_gimbal_el()` reaches ~0° after settling.
+4. **Static**: grep for any remaining `inputMessage` calls in the tree (`grep -rn 'inputMessage' app/`) — should return nothing.

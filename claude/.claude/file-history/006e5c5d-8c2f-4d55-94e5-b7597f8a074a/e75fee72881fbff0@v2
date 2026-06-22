@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chirp Injection for Twin Rotor Tailsitter — Change Documentation</title>
+<style>
+  :root{
+    --bg:#f6f8fa; --fg:#1f2328; --muted:#57606a; --accent:#0969da; --accent2:#1a7f37;
+    --warn-bg:#fff8c5; --warn-bd:#d4a72c; --note-bg:#ddf4ff; --note-bd:#54aeff;
+    --code-bg:#0d1117; --code-fg:#e6edf3; --border:#d0d7de; --card:#ffffff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;}
+  .wrap{max-width:980px;margin:0 auto;padding:32px 24px 80px;}
+  header.title{border-bottom:3px solid var(--accent);padding-bottom:16px;margin-bottom:8px;}
+  header.title h1{margin:0 0 6px;font-size:30px;line-height:1.2;}
+  header.title .sub{color:var(--muted);font-size:15px;}
+  header.title .pill{display:inline-block;background:var(--accent);color:#fff;border-radius:999px;
+    padding:2px 10px;font-size:12px;font-weight:600;margin-right:6px;vertical-align:middle;}
+  h2{font-size:22px;margin:38px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border);}
+  h3{font-size:17px;margin:24px 0 8px;}
+  code{font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:13.5px;
+    background:#eaeef2;border-radius:4px;padding:1px 5px;}
+  pre{background:var(--code-bg);color:var(--code-fg);border-radius:8px;padding:16px 18px;overflow:auto;
+    font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace;font-size:13px;line-height:1.5;}
+  pre code{background:none;padding:0;color:inherit;font-size:inherit;}
+  .tok-c{color:#8b949e;font-style:italic;}      /* comment */
+  .tok-k{color:#ff7b72;}                          /* keyword */
+  .tok-s{color:#a5d6ff;}                          /* string */
+  .tok-f{color:#d2a8ff;}                          /* function/type */
+  .tok-n{color:#79c0ff;}                          /* number/const */
+  table{border-collapse:collapse;width:100%;margin:14px 0;background:var(--card);font-size:14.5px;}
+  th,td{border:1px solid var(--border);padding:8px 11px;text-align:left;vertical-align:top;}
+  th{background:#eef2f6;font-weight:600;}
+  tbody tr:nth-child(even){background:#fafbfc;}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:4px 18px;margin:14px 0;}
+  .note,.warn{border-radius:8px;padding:12px 16px;margin:16px 0;font-size:14.5px;}
+  .note{background:var(--note-bg);border:1px solid var(--note-bd);}
+  .warn{background:var(--warn-bg);border:1px solid var(--warn-bd);}
+  .note b,.warn b{display:block;margin-bottom:2px;}
+  .formula{background:#fff;border:1px solid var(--border);border-left:4px solid var(--accent);
+    border-radius:6px;padding:14px 18px;margin:14px 0;font-size:17px;text-align:center;}
+  .formula .lbl{color:var(--muted);font-size:13px;}
+  ul.toc{list-style:none;padding:0;margin:10px 0;column-count:2;column-gap:28px;}
+  ul.toc li{margin:4px 0;}
+  ul.toc a{text-decoration:none;color:var(--accent);}
+  ul.toc a:hover{text-decoration:underline;}
+  .filelist code{font-size:13px;}
+  .tag{display:inline-block;font-size:11px;font-weight:700;border-radius:4px;padding:1px 7px;color:#fff;margin-right:6px;}
+  .tag.new{background:var(--accent2);}
+  .tag.mod{background:#9a6700;}
+  .ok{color:var(--accent2);font-weight:700;}
+  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:14px 0;font-size:13.5px;}
+  .flow .box{background:#fff;border:1px solid var(--border);border-radius:6px;padding:8px 12px;text-align:center;}
+  .flow .box.hl{border-color:var(--accent);background:#eaf3ff;font-weight:600;}
+  .flow .box.dim{color:var(--muted);}
+  .flow .arr{color:var(--muted);font-weight:700;}
+  .small{color:var(--muted);font-size:13px;}
+  kbd{background:#fff;border:1px solid var(--border);border-bottom-width:2px;border-radius:4px;padding:1px 6px;font-size:12px;}
+  footer{margin-top:50px;padding-top:16px;border-top:1px solid var(--border);color:var(--muted);font-size:13px;}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="title">
+  <h1>Chirp Injection for the Twin&nbsp;Rotor&nbsp;Tailsitter</h1>
+  <div class="sub">
+    <span class="pill">PX4</span><span class="pill">act_sysID</span>
+    Actuator system-identification feature — inject a swept-frequency signal straight into the control allocator, bypassing the multicopter controllers.
+  </div>
+</header>
+
+<p class="small">Module: <code>src/modules/control_allocator</code> &nbsp;·&nbsp; 6 files (4 modified, 2 added) &nbsp;·&nbsp; <span class="ok">13/13 unit tests passing</span></p>
+
+<h2 id="toc">Contents</h2>
+<ul class="toc">
+  <li><a href="#overview">1. Overview &amp; rationale</a></li>
+  <li><a href="#flow">2. How it works (data flow)</a></li>
+  <li><a href="#equation">3. The chirp equation</a></li>
+  <li><a href="#mapping">4. Axis mapping</a></li>
+  <li><a href="#params">5. New parameters</a></li>
+  <li><a href="#changes">6. File-by-file changes</a></li>
+  <li><a href="#behavior">7. Behavior notes &amp; safety</a></li>
+  <li><a href="#testing">8. How to test</a></li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="overview">1. Overview &amp; rationale</h2>
+<p>
+For actuator <strong>system identification</strong> on the twin-rotor tailsitter we need a clean, repeatable
+<em>chirp</em> (swept-frequency sine) driving one control axis at a time, with the rotors held at a fixed RPM, so the
+open-loop actuator / airframe frequency response can be measured. Normally
+<code>mc_att_control</code> &rarr; <code>mc_rate_control</code> produce the torque/thrust setpoints that the control
+allocator turns into actuator commands. This feature <strong>replaces</strong> those setpoints with a generated chirp,
+bypassing the attitude/rate controllers entirely.
+</p>
+<p>
+The injection lives in <code>ActuatorEffectivenessTwinRotorTailsitter::updateSetpoint()</code>. For this airframe the
+effectiveness <em>matrix</em> is all-zeros (motors and servos are added with empty axis vectors in
+<code>getEffectivenessMatrix()</code>), so <code>updateSetpoint()</code> is the single authoritative stage that computes
+<em>every</em> motor and servo output from the 6-axis control setpoint. Injecting there gives full, clean control of the
+outputs while reusing the existing swashplate / elevon geometry.
+</p>
+
+<!-- ===================================================================== -->
+<h2 id="flow">2. How it works (data flow)</h2>
+
+<p><strong>Normal path:</strong></p>
+<div class="flow">
+  <div class="box dim">attitude / rate<br>controllers</div><span class="arr">&rarr;</span>
+  <div class="box dim">torque + thrust<br>setpoint</div><span class="arr">&rarr;</span>
+  <div class="box">ControlAllocator</div><span class="arr">&rarr;</span>
+  <div class="box hl">updateSetpoint()</div><span class="arr">&rarr;</span>
+  <div class="box">actuator_motors<br>actuator_servos</div>
+</div>
+
+<p><strong>Chirp path</strong> (<code>CA_CHIRP_MODE &ne; 0</code>, armed):</p>
+<div class="flow">
+  <div class="box dim" style="text-decoration:line-through">controllers</div><span class="arr">&times;</span>
+  <div class="box hl">Chirp generator<br><span class="small">(elapsed time t)</span></div><span class="arr">&rarr;</span>
+  <div class="box hl">applyChirp()<br><span class="small">zero sp · drive 1 axis</span></div><span class="arr">&rarr;</span>
+  <div class="box hl">updateSetpoint()<br><span class="small">swashplate / elevon map</span></div><span class="arr">&rarr;</span>
+  <div class="box">actuators</div>
+</div>
+
+<p>
+When the chirp is active, the incoming control setpoint is copied to a local vector, <strong>zeroed</strong> (full MC
+bypass), and the chirp value is written onto the selected axis. The rotors are held at <code>CA_CHIRP_RPM</code> (or
+swept, for the RPM chirp). The rest of <code>updateSetpoint()</code> — the body&rarr;rotor transform, swashplate
+geometry and elevon mixing — runs unchanged on that vector. When <code>CA_CHIRP_MODE = 0</code> the original code path
+is byte-for-byte unchanged.
+</p>
+
+<!-- ===================================================================== -->
+<h2 id="equation">3. The chirp equation</h2>
+<p>
+A polynomial frequency sweep. The instantaneous frequency rises from <code>freq_init</code> to <code>freq_final</code>
+over the duration <code>total_time</code> following a polynomial of order <code>chirp_order</code>. The running elapsed
+time <code>t</code> sweeps <code>0 &rarr; T</code>.
+</p>
+
+<div class="formula">
+  <div class="lbl">sweep coefficient</div>
+  &beta; = ( f<sub>1</sub> &minus; f<sub>0</sub> ) / T<sup>k</sup>
+</div>
+<div class="formula">
+  <div class="lbl">output</div>
+  out(t) = A &middot; sin( 2&pi; &middot; ( &beta;/(k+1) &middot; t<sup>(k+1)</sup> &nbsp;+&nbsp; f<sub>0</sub> &middot; t ) )
+</div>
+
+<p class="small">
+where <code>f<sub>0</sub>=freq_init</code>, <code>f<sub>1</sub>=freq_final</code>, <code>k=chirp_order</code>,
+<code>T=total_time</code>, <code>A=amp</code>. Instantaneous frequency is <code>&beta;&middot;t<sup>k</sup>+f<sub>0</sub></code>,
+so it sweeps <em>exactly</em> <code>f<sub>0</sub>&rarr;f<sub>1</sub></code> over <code>T</code>. <code>k=1</code> is the
+classic linear chirp; at <code>t=0</code> the output is 0 (smooth start).
+</p>
+
+<div class="note">
+  <b>Note on the original formula</b>
+  The request wrote <code>beta = (f1-f0)*total_time^k</code> and used <code>total_time</code> inside the sine. The sine
+  argument must use the <em>running</em> time <code>t</code> (not the constant duration), and <code>beta</code> needs
+  <code>&divide;T<sup>k</sup></code> (not <code>&times;</code>) for the sweep to actually reach <code>freq_final</code> at
+  <code>t=T</code>. This corrected, standard form was confirmed before implementing.
+</div>
+
+<pre><code><span class="tok-c">// Chirp.hpp — the core logic, pure & deterministic (no dependence on hrt)</span>
+<span class="tok-k">float</span> <span class="tok-f">update</span>(<span class="tok-k">float</span> t) <span class="tok-k">const</span>
+{
+    <span class="tok-k">if</span> (_total_time &lt;= <span class="tok-n">0.f</span>) {
+        <span class="tok-k">return</span> <span class="tok-n">0.f</span>;
+    }
+    <span class="tok-k">const float</span> tc    = math::<span class="tok-f">constrain</span>(t, <span class="tok-n">0.f</span>, _total_time);
+    <span class="tok-k">const float</span> beta  = (_freq_final - _freq_init) / <span class="tok-f">powf</span>(_total_time, _chirp_order);
+    <span class="tok-k">const float</span> phase = <span class="tok-n">2.f</span> * <span class="tok-n">M_PI_F</span> * (beta / (_chirp_order + <span class="tok-n">1.f</span>) * <span class="tok-f">powf</span>(tc, _chirp_order + <span class="tok-n">1.f</span>) + _freq_init * tc);
+    <span class="tok-k">return</span> _amplitude * <span class="tok-f">sinf</span>(phase);
+}</code></pre>
+
+<!-- ===================================================================== -->
+<h2 id="mapping">4. Axis mapping</h2>
+<p>The five requested chirps map onto the quantities <code>updateSetpoint()</code> already consumes:</p>
+<table>
+  <thead><tr><th><code>CA_CHIRP_MODE</code></th><th>Chirp</th><th>Injected into</th><th>Physical effect</th></tr></thead>
+  <tbody>
+    <tr><td>1</td><td>Cyclic pitch</td><td><code>control_sp(PITCH)</code></td><td>symmetric cyclic (both rotors)</td></tr>
+    <tr><td>2</td><td>Cyclic yaw</td><td><code>control_sp(YAW)</code></td><td>differential cyclic</td></tr>
+    <tr><td>3</td><td>Collective</td><td><code>collective_pitch</code> term</td><td>symmetric collective pitch</td></tr>
+    <tr><td>4</td><td>Collective roll</td><td><code>control_sp(ROLL)</code></td><td>differential collective</td></tr>
+    <tr><td>5</td><td>RPM</td><td>motor command (<code>actuator_sp 0/1</code>)</td><td>rotor speed sweep</td></tr>
+  </tbody>
+</table>
+<p class="small">
+Rotor RPM and collective both derive from <code>THRUST_Z</code> in the stock code, so a clean RPM chirp and a clean
+collective chirp are <strong>decoupled</strong>: collective is swept on the collective-pitch term while the motor is held
+at <code>CA_CHIRP_RPM</code>; RPM is swept on the motor command while collective/cyclic stay at baseline.
+</p>
+
+<pre><code><span class="tok-c">// applyChirp() — bypasses the MC setpoint and routes the chirp onto one axis</span>
+<span class="tok-k">void</span> ActuatorEffectivenessTwinRotorTailsitter::<span class="tok-f">applyChirp</span>(<span class="tok-k">float</span> t, matrix::Vector&lt;<span class="tok-k">float</span>, NUM_AXES&gt; &amp;sp,
+        <span class="tok-k">float</span> &amp;motor_cmd, <span class="tok-k">float</span> &amp;collective_add)
+{
+    <span class="tok-k">const float</span> c = _chirp.<span class="tok-f">finished</span>(t) ? <span class="tok-n">0.f</span> : _chirp.<span class="tok-f">update</span>(t);
+
+    sp.<span class="tok-f">setAll</span>(<span class="tok-n">0.f</span>);          <span class="tok-c">// bypass the MC controllers</span>
+    collective_add = <span class="tok-n">0.f</span>;
+    motor_cmd = _chirp_rpm;   <span class="tok-c">// hold the rotor at the configured speed</span>
+
+    <span class="tok-k">switch</span> (_chirp_mode) {
+    <span class="tok-k">case</span> CHIRP_CYCLIC_PITCH:    sp(ControlAxis::PITCH) = c; <span class="tok-k">break</span>;
+    <span class="tok-k">case</span> CHIRP_CYCLIC_YAW:      sp(ControlAxis::YAW)   = c; <span class="tok-k">break</span>;
+    <span class="tok-k">case</span> CHIRP_COLLECTIVE_ROLL: sp(ControlAxis::ROLL)  = c; <span class="tok-k">break</span>;
+    <span class="tok-k">case</span> CHIRP_COLLECTIVE:      collective_add = c;         <span class="tok-k">break</span>;
+    <span class="tok-k">case</span> CHIRP_RPM:             motor_cmd = _chirp_rpm + c; <span class="tok-k">break</span>;
+    <span class="tok-k">default</span>: <span class="tok-k">break</span>;
+    }
+}</code></pre>
+
+<!-- ===================================================================== -->
+<h2 id="params">5. New parameters</h2>
+<p>Added as a <code>Chirp (System ID)</code> group in <code>module.yaml</code>. Set <code>CA_AIRFRAME = 11</code> (Twin Rotor Tailsitter) to use them.</p>
+<table>
+  <thead><tr><th>Parameter</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>CA_CHIRP_MODE</code></td><td>enum 0–5</td><td>0</td><td>0 Off · 1 Cyclic pitch · 2 Cyclic yaw · 3 Collective · 4 Collective roll · 5 RPM</td></tr>
+    <tr><td><code>CA_CHIRP_AMP</code></td><td>float</td><td>0.0</td><td>amplitude, in the units of the selected axis</td></tr>
+    <tr><td><code>CA_CHIRP_T</code></td><td>float (s)</td><td>10.0</td><td>sweep duration <code>T</code> (<code>total_time</code>)</td></tr>
+    <tr><td><code>CA_CHIRP_ORD</code></td><td>float</td><td>1.0</td><td>polynomial order <code>k</code> (1 = linear)</td></tr>
+    <tr><td><code>CA_CHIRP_F0</code></td><td>float (Hz)</td><td>0.1</td><td>start frequency <code>freq_init</code></td></tr>
+    <tr><td><code>CA_CHIRP_F1</code></td><td>float (Hz)</td><td>10.0</td><td>end frequency <code>freq_final</code></td></tr>
+    <tr><td><code>CA_CHIRP_RPM</code></td><td>float</td><td>0.0</td><td>held / baseline normalized motor command (your ≈6000 rpm value)</td></tr>
+  </tbody>
+</table>
+
+<!-- ===================================================================== -->
+<h2 id="changes">6. File-by-file changes</h2>
+
+<div class="card">
+  <h3><span class="tag new">NEW</span><code>ActuatorEffectiveness/Chirp.hpp</code></h3>
+  <p>Small, header-only, pure helper implementing the equation: <code>configure(f0,f1,order,T,amp)</code>,
+  <code>float update(float t)</code>, <code>bool finished(float t)</code>. Guards <code>T&le;0</code>. Isolated so the
+  equation is unit-testable deterministically (no <code>hrt</code> dependency).</p>
+</div>
+
+<div class="card">
+  <h3><span class="tag mod">MOD</span><code>ActuatorEffectivenessTwinRotorTailsitter.hpp</code></h3>
+  <p>Added the <code>ChirpMode</code> enum, the public <code>applyChirp()</code> declaration (also used by the test),
+  the <code>Chirp</code> member, chirp parameter handles, and chirp run-state.</p>
+  <pre><code><span class="tok-c">// public — one chirp active at a time</span>
+<span class="tok-k">enum</span> ChirpMode {
+    CHIRP_OFF = <span class="tok-n">0</span>,
+    CHIRP_CYCLIC_PITCH,    <span class="tok-c">// sweep body PITCH  -&gt; symmetric cyclic</span>
+    CHIRP_CYCLIC_YAW,      <span class="tok-c">// sweep body YAW    -&gt; differential cyclic</span>
+    CHIRP_COLLECTIVE,      <span class="tok-c">// sweep collective pitch</span>
+    CHIRP_COLLECTIVE_ROLL, <span class="tok-c">// sweep body ROLL   -&gt; differential collective</span>
+    CHIRP_RPM              <span class="tok-c">// sweep rotor RPM (motor command)</span>
+};
+
+<span class="tok-c">// private state</span>
+Chirp     _chirp{};
+<span class="tok-k">int32_t</span>   _chirp_mode{CHIRP_OFF};
+<span class="tok-k">float</span>     _chirp_rpm{<span class="tok-n">0.f</span>};
+<span class="tok-k">uint64_t</span>  _chirp_start_time{<span class="tok-n">0</span>};
+<span class="tok-k">bool</span>      _chirp_started{<span class="tok-k">false</span>};</code></pre>
+</div>
+
+<div class="card">
+  <h3><span class="tag mod">MOD</span><code>ActuatorEffectivenessTwinRotorTailsitter.cpp</code></h3>
+  <ul>
+    <li><b>Constructor / <code>updateParams()</code>:</b> <code>param_find</code> / <code>param_get</code> the seven
+      <code>CA_CHIRP_*</code> params, call <code>_chirp.configure(...)</code>, and reset the one-shot latch when the mode changes.</li>
+    <li><b><code>throttleSpoolupProgress()</code>:</b> the <code>vehicle_status</code> read was moved out…</li>
+    <li><b><code>updateSetpoint()</code>:</b> …to the top, then the chirp block runs before the throttle/collective
+      computation. The selected axis is driven via a local copy of the setpoint; motors are overridden when chirping.</li>
+  </ul>
+  <pre><code><span class="tok-c">// refreshed once at the top of updateSetpoint() (was inside throttleSpoolupProgress)</span>
+vehicle_status_s vehicle_status;
+<span class="tok-k">if</span> (_vehicle_status_sub.<span class="tok-f">update</span>(&amp;vehicle_status)) {
+    _armed      = vehicle_status.arming_state == vehicle_status_s::ARMING_STATE_ARMED;
+    _armed_time = vehicle_status.armed_time;
+}
+
+_saturation_flags = {};
+
+<span class="tok-c">// Chirp injection: replace the incoming setpoint with a swept signal on the selected axis.</span>
+matrix::Vector&lt;<span class="tok-k">float</span>, NUM_AXES&gt; sp = control_sp;
+<span class="tok-k">float</span> collective_add = <span class="tok-n">0.f</span>;
+<span class="tok-k">float</span> motor_cmd      = <span class="tok-n">0.f</span>;
+<span class="tok-k">bool</span>  motor_override = <span class="tok-k">false</span>;
+
+<span class="tok-k">if</span> (_chirp_mode != CHIRP_OFF) {
+    <span class="tok-k">if</span> (_armed) {
+        <span class="tok-k">if</span> (!_chirp_started) {                 <span class="tok-c">// one-shot: start on first armed frame</span>
+            _chirp_start_time = <span class="tok-f">hrt_absolute_time</span>();
+            _chirp_started    = <span class="tok-k">true</span>;
+        }
+        <span class="tok-k">const float</span> t = (<span class="tok-f">hrt_absolute_time</span>() - _chirp_start_time) / <span class="tok-n">1e6f</span>;
+        <span class="tok-f">applyChirp</span>(t, sp, motor_cmd, collective_add);
+        motor_override = <span class="tok-k">true</span>;
+    } <span class="tok-k">else</span> {
+        _chirp_started = <span class="tok-k">false</span>;             <span class="tok-c">// re-arm replays the sweep</span>
+    }
+}
+
+<span class="tok-c">// throttle: held/swept motor command when chirping, else the normal throttle curve</span>
+<span class="tok-k">const float</span> throttle = motor_override
+               ? motor_cmd
+               : math::<span class="tok-f">interpolateN</span>(-sp(ControlAxis::THRUST_Z), _geometry.throttle_curve) * <span class="tok-f">throttleSpoolupProgress</span>() * _krpm;
+<span class="tok-k">const float</span> collective_pitch = math::<span class="tok-f">interpolateN</span>(-sp(ControlAxis::THRUST_Z), _geometry.pitch_curve) + collective_add;</code></pre>
+  <p class="small">The swashplate and elevon loops were switched from <code>control_sp(...)</code> to the local <code>sp(...)</code> (identical when the chirp is off).</p>
+</div>
+
+<div class="card">
+  <h3><span class="tag mod">MOD</span><code>module.yaml</code></h3>
+  <p>New <code>Chirp (System ID)</code> parameter group with the seven <code>CA_CHIRP_*</code> definitions (see table above). These are auto-generated into <code>px4_parameters.hpp</code> at configure time.</p>
+</div>
+
+<div class="card">
+  <h3><span class="tag mod">MOD</span><code>ActuatorEffectiveness/CMakeLists.txt</code></h3>
+  <p>Added <code>Chirp.hpp</code> to the <code>ActuatorEffectiveness</code> library and registered the new test:</p>
+  <pre><code><span class="tok-f">px4_add_functional_gtest</span>(SRC ActuatorEffectivenessTwinRotorTailsitterTest.cpp LINKLIBS ActuatorEffectiveness)</code></pre>
+</div>
+
+<div class="card">
+  <h3><span class="tag new">NEW</span><code>ActuatorEffectivenessTwinRotorTailsitterTest.cpp</code></h3>
+  <p>13 GoogleTest cases (see <a href="#testing">§8</a>): 6 verifying the chirp equation, 5 verifying per-mode axis
+  routing through <code>applyChirp()</code>, plus an armed end-to-end RPM-hold/bypass test and a chirp-off regression test.</p>
+</div>
+
+<!-- ===================================================================== -->
+<h2 id="behavior">7. Behavior notes &amp; safety</h2>
+<div class="warn">
+  <b>Armed only, one-shot</b>
+  The sweep starts on the first armed frame after the chirp is enabled and returns to baseline after
+  <code>CA_CHIRP_T</code> seconds. Disarming (or toggling <code>CA_CHIRP_MODE</code>) re-arms the one-shot so it replays.
+</div>
+<ul>
+  <li><b>Full MC bypass.</b> While active, the rate/attitude controller output is ignored — only the chirp drives the selected axis; all others are held at baseline.</li>
+  <li><b>Cyclic / roll chirps pass through the body&rarr;rotor gains</b> (<code>CA_TWIN*_B2R_*</code>), so the effective servo amplitude is scaled by those. During them the collective sits at its swashplate trim (<code>CA_TWIN*_B2R_Z_0</code>) and the motors are held at <code>CA_CHIRP_RPM</code>.</li>
+  <li><b>RPM units.</b> <code>CA_CHIRP_RPM</code> is the <em>normalized motor command</em> that corresponds to ~6000 rpm on your hardware (the motor output, not a physical rpm number).</li>
+  <li><b>No change when off.</b> With <code>CA_CHIRP_MODE = 0</code> the actuator outputs are identical to the stock throttle-curve behavior (guarded by a regression test).</li>
+</ul>
+
+<!-- ===================================================================== -->
+<h2 id="testing">8. How to test</h2>
+
+<h3>8.1 — Open a dev container</h3>
+<p>Use the global <code>devcon</code> wrapper (starts/attaches the Docker dev container, repo mounted at the same path):</p>
+<pre><code><span class="tok-c"># from the repo root on the host</span>
+devcon</code></pre>
+<p class="small">All commands below run inside the container, from the repo root <code>/home/choudhury/repos/px4-update</code>.
+(If you already have a running container you can also run a one-off command non-interactively with
+<code>docker exec -i px4_px4-update bash -lc '&lt;cmd&gt;'</code>.)</p>
+
+<h3>8.2 — Build &amp; run the unit tests</h3>
+<p>Build just this test target (configures <code>px4_sitl_test</code> and validates the new params, without building the whole firmware):</p>
+<pre><code>make px4_sitl_test functional-ActuatorEffectivenessTwinRotorTailsitter
+./build/px4_sitl_test/functional-ActuatorEffectivenessTwinRotorTailsitter</code></pre>
+
+<p>Expected output — <span class="ok">13 / 13 passing</span>:</p>
+<pre><code>[==========] Running 13 tests from 2 test suites.
+[----------] 6 tests from ChirpTest
+[       OK ] ChirpTest.StartsAtZero
+[       OK ] ChirpTest.ConstantFrequencyIsPureSine
+[       OK ] ChirpTest.LinearSweep
+[       OK ] ChirpTest.SecondOrderSweep
+[       OK ] ChirpTest.FinishedAfterDuration
+[       OK ] ChirpTest.ZeroDurationIsSafe
+[----------] 7 tests from ActuatorEffectivenessTwinRotorTailsitterTest
+[       OK ] ...ChirpRoutingCyclicPitch
+[       OK ] ...ChirpRoutingCyclicYaw
+[       OK ] ...ChirpRoutingCollectiveRoll
+[       OK ] ...ChirpRoutingCollective
+[       OK ] ...ChirpRoutingRpm
+[       OK ] ...ChirpHoldsRpmAndBypassesControl
+[       OK ] ...ChirpOffFollowsThrottleCurve
+[  PASSED  ] 13 tests.</code></pre>
+
+<p>What each group checks:</p>
+<table>
+  <thead><tr><th>Test</th><th>Verifies</th></tr></thead>
+  <tbody>
+    <tr><td><code>ChirpTest.*</code></td><td>the equation: zero start, pure sine for <code>f0=f1</code>, linear &amp; 2nd-order sweeps hit known values, <code>finished()</code> after <code>T</code>, and the <code>T&le;0</code> guard.</td></tr>
+    <tr><td><code>ChirpRouting*</code></td><td>each mode drives the correct axis to <code>amp·sin(phase(t))</code> and leaves the rest at baseline; motors held at <code>CA_CHIRP_RPM</code> (or <code>rpm+chirp</code> for RPM mode).</td></tr>
+    <tr><td><code>ChirpHoldsRpmAndBypassesControl</code></td><td>armed end-to-end: motors stay at <code>CA_CHIRP_RPM</code> even with a large (bypassed) thrust setpoint.</td></tr>
+    <tr><td><code>ChirpOffFollowsThrottleCurve</code></td><td>regression: <code>CA_CHIRP_MODE=0</code> reproduces the stock throttle-curve output.</td></tr>
+  </tbody>
+</table>
+
+<p>Optionally confirm no regression in the sibling effectiveness tests:</p>
+<pre><code>ninja -C build/px4_sitl_test functional-ActuatorEffectivenessHelicopter functional-ActuatorEffectivenessRotors
+./build/px4_sitl_test/functional-ActuatorEffectivenessHelicopter
+./build/px4_sitl_test/functional-ActuatorEffectivenessRotors</code></pre>
+
+<p class="small">To run via CTest instead (note: <code>make tests</code> also builds the full <code>px4</code> binary):</p>
+<pre><code>make tests TESTFILTER=<span class="tok-s">"functional-ActuatorEffectivenessTwinRotorTailsitter"</span></code></pre>
+
+<h3>8.3 — SITL spot-check (end-to-end)</h3>
+<p>Run a twin-rotor-tailsitter SITL model, then in the <code>pxh&gt;</code> shell:</p>
+<pre><code><span class="tok-c"># select the airframe and a cyclic-pitch chirp at a held rotor speed</span>
+param set CA_AIRFRAME  <span class="tok-n">11</span>
+param set CA_CHIRP_MODE <span class="tok-n">1</span>      <span class="tok-c"># 1 = cyclic pitch</span>
+param set CA_CHIRP_AMP  <span class="tok-n">0.2</span>
+param set CA_CHIRP_F0   <span class="tok-n">0.5</span>
+param set CA_CHIRP_F1   <span class="tok-n">15</span>
+param set CA_CHIRP_T    <span class="tok-n">20</span>
+param set CA_CHIRP_ORD  <span class="tok-n">1</span>
+param set CA_CHIRP_RPM  <span class="tok-n">0.6</span>    <span class="tok-c"># normalized motor cmd = your ~6000 rpm point</span>
+
+<span class="tok-c"># arm, then watch the outputs</span>
+listener actuator_servos     <span class="tok-c"># cyclic/collective servos sweeping</span>
+listener actuator_motors     <span class="tok-c"># motors held at CA_CHIRP_RPM (or sweeping in RPM mode)</span></code></pre>
+<p>
+Confirm: the swept axis oscillates with increasing frequency over <code>CA_CHIRP_T</code>; the motors stay at
+<code>CA_CHIRP_RPM</code> for cyclic/collective modes; output returns to baseline after <code>T</code> (re-arm to repeat).
+For analysis, log <code>actuator_motors</code> / <code>actuator_servos</code> to a <code>.ulog</code> and plot the response.
+</p>
+
+<footer>
+  Generated documentation for the chirp-injection feature on branch <code>act_sysID</code>.
+  Source of truth: <code>src/modules/control_allocator/ActuatorEffectiveness/</code> and <code>module.yaml</code>.
+</footer>
+
+</div>
+</body>
+</html>

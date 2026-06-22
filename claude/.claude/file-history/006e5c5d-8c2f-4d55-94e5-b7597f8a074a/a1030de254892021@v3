@@ -1,0 +1,286 @@
+/****************************************************************************
+ *
+ *   Copyright (c) 2024 PX4 Development Team. All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in
+ *    the documentation and/or other materials provided with the
+ *    distribution.
+ * 3. Neither the name PX4 nor the names of its contributors may be
+ *    used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+ * FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+ * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+ * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+ * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ ****************************************************************************/
+
+#include <gtest/gtest.h>
+#include "ActuatorEffectivenessTwinRotorTailsitter.hpp"
+
+#include <uORB/Publication.hpp>
+#include <uORB/topics/vehicle_status.h>
+#include <drivers/drv_hrt.h>
+
+using namespace matrix;
+using Twin = ActuatorEffectivenessTwinRotorTailsitter;
+using Axis = ActuatorEffectiveness::ControlAxis;
+
+// ------------------------------------------------------------------------
+// Chirp equation (the core "logic"). Deterministic, no dependence on hrt.
+// ------------------------------------------------------------------------
+
+TEST(ChirpTest, StartsAtZero)
+{
+	Chirp chirp;
+	chirp.init(0.1f, 10.f, 1.f, 10.f, 1.f);
+	EXPECT_NEAR(chirp.update(0.f), 0.f, 1e-6f);
+}
+
+TEST(ChirpTest, ConstantFrequencyIsPureSine)
+{
+	// f0 == f1 -> beta = 0 -> out(t) = amp * sin(2*pi*f*t)
+	Chirp chirp;
+	chirp.init(2.f, 2.f, 1.f, 10.f, 1.f);
+	EXPECT_NEAR(chirp.update(0.125f), 1.f, 1e-4f); // 2*pi*2*0.125 = pi/2 -> sin = 1
+	EXPECT_NEAR(chirp.update(0.25f), 0.f, 1e-4f);  // 2*pi*2*0.25  = pi    -> sin = 0
+
+	// amplitude scales the output
+	chirp.init(2.f, 2.f, 1.f, 10.f, 3.f);
+	EXPECT_NEAR(chirp.update(0.125f), 3.f, 1e-4f);
+}
+
+TEST(ChirpTest, LinearSweep)
+{
+	// f0=0, f1=2, k=1, T=4 -> beta=0.5, phase(t)=2*pi*(0.25*t^2)
+	Chirp chirp;
+	chirp.init(0.f, 2.f, 1.f, 4.f, 1.f);
+	EXPECT_NEAR(chirp.update(0.f), 0.f, 1e-6f);
+	EXPECT_NEAR(chirp.update(1.f), 1.f, 1e-4f); // phase = pi/2 -> sin = 1
+	EXPECT_NEAR(chirp.update(2.f), 0.f, 1e-4f); // phase = 2*pi -> sin = 0
+}
+
+TEST(ChirpTest, SecondOrderSweep)
+{
+	// f0=0, f1=3, k=2, T=3 -> beta=1/3, phase(t)=2*pi*(t^3/9); at t=T phase=6*pi -> sin = 0
+	Chirp chirp;
+	chirp.init(0.f, 3.f, 2.f, 3.f, 1.f);
+	EXPECT_NEAR(chirp.update(3.f), 0.f, 1e-3f);
+}
+
+TEST(ChirpTest, FinishedAfterDuration)
+{
+	Chirp chirp;
+	chirp.init(0.f, 2.f, 1.f, 4.f, 1.f);
+	EXPECT_FALSE(chirp.finished(3.5f));
+	EXPECT_TRUE(chirp.finished(4.5f));
+}
+
+TEST(ChirpTest, ZeroDurationIsSafe)
+{
+	Chirp chirp;
+	chirp.init(0.f, 2.f, 1.f, 0.f, 1.f);
+	EXPECT_FLOAT_EQ(chirp.update(2.f), 0.f);
+}
+
+// ------------------------------------------------------------------------
+// Routing: applyChirp() bypasses the control setpoint and drives the
+// selected axis. Called with an explicit elapsed time, so deterministic.
+// ------------------------------------------------------------------------
+
+static void setChirpParams(int32_t mode, float amp, float f0, float f1, float total_time, float order, float rpm)
+{
+	int32_t m = mode;
+	param_set(param_find("CA_CHIRP_MODE"), &m);
+	param_set(param_find("CA_CHIRP_AMP"), &amp);
+	param_set(param_find("CA_CHIRP_F0"), &f0);
+	param_set(param_find("CA_CHIRP_F1"), &f1);
+	param_set(param_find("CA_CHIRP_T"), &total_time);
+	param_set(param_find("CA_CHIRP_ORD"), &order);
+	param_set(param_find("CA_CHIRP_RPM"), &rpm);
+}
+
+// Builds a chirp value of 1.0 at t=0.125 by using a constant 2 Hz sweep (f0=f1=2).
+static constexpr float kChirpEvalTime = 0.125f;
+static constexpr float kChirpExpected = 1.f; // sin(2*pi*2*0.125) = 1
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpRoutingCyclicPitch)
+{
+	param_control_autosave(false);
+	setChirpParams(Twin::CHIRP_CYCLIC_PITCH, 1.f, 2.f, 2.f, 10.f, 1.f, 0.5f);
+	Twin twin(nullptr);
+
+	Vector<float, 6> sp;
+	sp.setAll(7.f); // garbage that must be overwritten
+	float motor = -1.f;
+	float coll = -1.f;
+	twin.applyChirp(kChirpEvalTime, sp, motor, coll);
+
+	EXPECT_NEAR(sp(Axis::PITCH), kChirpExpected, 1e-4f);
+	EXPECT_FLOAT_EQ(sp(Axis::ROLL), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::YAW), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::THRUST_Z), 0.f);
+	EXPECT_FLOAT_EQ(motor, 0.5f); // rotor held at CA_CHIRP_RPM
+	EXPECT_FLOAT_EQ(coll, 0.f);
+}
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpRoutingCyclicYaw)
+{
+	param_control_autosave(false);
+	setChirpParams(Twin::CHIRP_CYCLIC_YAW, 1.f, 2.f, 2.f, 10.f, 1.f, 0.5f);
+	Twin twin(nullptr);
+
+	Vector<float, 6> sp;
+	float motor = -1.f;
+	float coll = -1.f;
+	twin.applyChirp(kChirpEvalTime, sp, motor, coll);
+
+	EXPECT_NEAR(sp(Axis::YAW), kChirpExpected, 1e-4f);
+	EXPECT_FLOAT_EQ(sp(Axis::PITCH), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::ROLL), 0.f);
+	EXPECT_FLOAT_EQ(motor, 0.5f);
+	EXPECT_FLOAT_EQ(coll, 0.f);
+}
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpRoutingCollectiveRoll)
+{
+	param_control_autosave(false);
+	setChirpParams(Twin::CHIRP_COLLECTIVE_ROLL, 1.f, 2.f, 2.f, 10.f, 1.f, 0.5f);
+	Twin twin(nullptr);
+
+	Vector<float, 6> sp;
+	float motor = -1.f;
+	float coll = -1.f;
+	twin.applyChirp(kChirpEvalTime, sp, motor, coll);
+
+	EXPECT_NEAR(sp(Axis::ROLL), kChirpExpected, 1e-4f);
+	EXPECT_FLOAT_EQ(sp(Axis::PITCH), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::YAW), 0.f);
+	EXPECT_FLOAT_EQ(motor, 0.5f);
+	EXPECT_FLOAT_EQ(coll, 0.f);
+}
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpRoutingCollective)
+{
+	param_control_autosave(false);
+	setChirpParams(Twin::CHIRP_COLLECTIVE, 1.f, 2.f, 2.f, 10.f, 1.f, 0.5f);
+	Twin twin(nullptr);
+
+	Vector<float, 6> sp;
+	float motor = -1.f;
+	float coll = -1.f;
+	twin.applyChirp(kChirpEvalTime, sp, motor, coll);
+
+	EXPECT_NEAR(coll, kChirpExpected, 1e-4f); // chirp added to collective pitch
+	EXPECT_FLOAT_EQ(sp(Axis::PITCH), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::ROLL), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::YAW), 0.f);
+	EXPECT_FLOAT_EQ(motor, 0.5f); // rotor still held at CA_CHIRP_RPM
+}
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpRoutingRpm)
+{
+	param_control_autosave(false);
+	setChirpParams(Twin::CHIRP_RPM, 1.f, 2.f, 2.f, 10.f, 1.f, 0.5f);
+	Twin twin(nullptr);
+
+	Vector<float, 6> sp;
+	float motor = -1.f;
+	float coll = -1.f;
+	twin.applyChirp(kChirpEvalTime, sp, motor, coll);
+
+	EXPECT_NEAR(motor, 0.5f + kChirpExpected, 1e-4f); // baseline rpm + chirp
+	EXPECT_FLOAT_EQ(sp(Axis::PITCH), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::ROLL), 0.f);
+	EXPECT_FLOAT_EQ(sp(Axis::YAW), 0.f);
+	EXPECT_FLOAT_EQ(coll, 0.f);
+}
+
+// ------------------------------------------------------------------------
+// updateSetpoint() invariants.
+// ------------------------------------------------------------------------
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpHoldsRpmAndBypassesControl)
+{
+	param_control_autosave(false);
+	// Cyclic-pitch chirp: rotors must be held at CA_CHIRP_RPM regardless of the (bypassed) thrust setpoint.
+	setChirpParams(Twin::CHIRP_CYCLIC_PITCH, 0.5f, 1.f, 5.f, 10.f, 1.f, 0.42f);
+
+	// Arm the vehicle so the chirp activates.
+	uORB::Publication<vehicle_status_s> status_pub{ORB_ID(vehicle_status)};
+	vehicle_status_s status{};
+	status.arming_state = vehicle_status_s::ARMING_STATE_ARMED;
+	status.armed_time = hrt_absolute_time();
+	status_pub.publish(status);
+
+	Twin twin(nullptr);
+	ActuatorEffectiveness::Configuration configuration{};
+	twin.getEffectivenessMatrix(configuration, EffectivenessUpdateReason::MOTOR_ACTIVATION_UPDATE);
+
+	Vector<float, 6> control_sp{};
+	control_sp(Axis::THRUST_Z) = -1.f; // would command high throttle on the normal path
+
+	ActuatorEffectiveness::ActuatorVector actuator_sp{};
+	ActuatorEffectiveness::ActuatorVector actuator_min{};
+	actuator_min.setAll(-1.f);
+	ActuatorEffectiveness::ActuatorVector actuator_max{};
+	actuator_max.setAll(2.f);
+
+	twin.updateSetpoint(control_sp, 0, actuator_sp, actuator_min, actuator_max);
+
+	// Sweep is at t ~= 0 (<< CA_CHIRP_T), so it is active and the motors are held at CA_CHIRP_RPM.
+	EXPECT_FLOAT_EQ(actuator_sp(0), 0.42f);
+	EXPECT_FLOAT_EQ(actuator_sp(1), 0.42f);
+}
+
+TEST(ActuatorEffectivenessTwinRotorTailsitterTest, ChirpOffFollowsThrottleCurve)
+{
+	param_control_autosave(false);
+
+	// Predefined throttle curve (same shape as the helicopter test).
+	float curve[5] = {0.f, .3f, .6f, .8f, 1.f};
+	for (int i = 0; i < 5; i++) {
+		char buffer[17];
+		snprintf(buffer, sizeof(buffer), "CA_HELI_THR_C%u", i);
+		param_set(param_find(buffer), &curve[i]);
+	}
+	float krpm = 1.f;
+	param_set(param_find("CA_TWIN0_KRPM"), &krpm);
+	setChirpParams(Twin::CHIRP_OFF, 0.f, 0.1f, 10.f, 10.f, 1.f, 0.f);
+
+	Twin twin(nullptr);
+	ActuatorEffectiveness::Configuration configuration{};
+	twin.getEffectivenessMatrix(configuration, EffectivenessUpdateReason::MOTOR_ACTIVATION_UPDATE);
+
+	Vector<float, 6> control_sp{};
+	control_sp(Axis::THRUST_Z) = -.5f; // -> throttle curve maps to 0.6
+
+	ActuatorEffectiveness::ActuatorVector actuator_sp{};
+	ActuatorEffectiveness::ActuatorVector actuator_min{};
+	actuator_min.setAll(0.f);
+	ActuatorEffectiveness::ActuatorVector actuator_max{};
+	actuator_max.setAll(1.f);
+
+	// First call initialises the blended _krpm via updateConfig(); assert on the second.
+	twin.updateSetpoint(control_sp, 0, actuator_sp, actuator_min, actuator_max);
+	twin.updateSetpoint(control_sp, 0, actuator_sp, actuator_min, actuator_max);
+
+	EXPECT_FLOAT_EQ(actuator_sp(0), 0.6f); // throttle curve value * spoolup(1, disarmed) * krpm(1)
+	EXPECT_FLOAT_EQ(actuator_sp(1), 0.6f);
+}

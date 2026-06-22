@@ -1,0 +1,202 @@
+#!/usr/bin/env python3
+"""
+Map and compare actuator outputs across PX4 logs (SITL vs flight test).
+
+Background: the `actuator_outputs` uORB topic has one *instance* per output driver
+(MixingOutput), numbered in driver start order. SITL runs a single driver (pwm_out_sim)
+so it only has `actuator_outputs_0`; flight hardware runs several (e.g. a UAVCAN ESC bus
+and a UAVCAN servo bus), giving `actuator_outputs_1`, `_2`, ... The channel ordering and
+units differ per bus. The chirp itself is carried instance-independently by the control
+allocator's `actuator_motors` (Motor1..12) and `actuator_servos` (Servo1..8), which are
+present in every log. This tool aligns outputs *by function* rather than by instance index.
+
+  # identify what each actuator_outputs instance/channel carries
+  python3 output_map.py --ulog flight.ulg
+  python3 output_map.py --ulog Tools/chirp_sysid/logs/cyclic_pitch_*.ulg
+
+  # compare the same physical actuator between a SITL and a flight log
+  python3 output_map.py --compare sitl.ulg flight.ulg --function Servo3 --plot cmp.png
+
+Runs on the host (needs pyulog + numpy; matplotlib only for --plot). The flight log need
+not be under the dev-container mount.
+"""
+
+import argparse
+import sys
+
+import numpy as np
+
+try:
+    from pyulog import ULog
+except ImportError:
+    sys.exit("pyulog not found (pip install pyulog)")
+
+TOPICS = ["actuator_outputs", "actuator_motors", "actuator_servos"]
+INVALID = 60000.0          # disabled magic (e.g. UAVCAN 65535) -> ignore
+DISARMED = (900.0, 600.0)  # PWM_SIM disarmed / failsafe magics (SITL) -> ignore
+LOW_CONF = 0.5             # correlation below this is flagged as low-confidence
+
+
+def load(path):
+    return ULog(path, message_name_filter_list=TOPICS)
+
+
+def _series(d, key):
+    """Return (t[s], x) for a dataset field, dropping non-finite, disabled (>=INVALID) and
+    disarmed/failsafe-magic samples (those are constant outliers at the log edges that otherwise
+    wreck the correlation; the magics differ per driver, hence both the INVALID and DISARMED sets)."""
+    if key not in d.data:
+        return None
+    t = np.asarray(d.data["timestamp"], dtype=float)
+    x = np.asarray(d.data[key], dtype=float)
+    good = np.isfinite(x) & (np.abs(x) < INVALID)
+    for magic in DISARMED:
+        good &= x != magic
+    if good.sum() < 10:
+        return None
+    return t[good], x[good]
+
+
+def ref_functions(u):
+    """{function_name: (t, x)} for every actuator_motors/servos channel that has signal."""
+    refs = {}
+    for d in u.data_list:
+        if d.name == "actuator_motors":
+            for i in range(12):
+                s = _series(d, "control[%d]" % i)
+                if s and np.std(s[1]) > 1e-6:
+                    refs["Motor%d" % (i + 1)] = s
+        elif d.name == "actuator_servos":
+            for i in range(8):
+                s = _series(d, "control[%d]" % i)
+                if s and np.std(s[1]) > 1e-6:
+                    refs["Servo%d" % (i + 1)] = s
+    return refs
+
+
+def corr(a, b):
+    """Normalized correlation of two (t, x) series on their overlapping time span.
+
+    Both series are sampled on the *coarser* one's timestamps. actuator_outputs is logged
+    much faster than the allocator refs (e.g. 239 Hz vs 10 Hz); on a uniform fine grid the
+    fast signal keeps high-frequency content the slow (aliased) ref lacks, killing the
+    correlation. Sampling on the coarse grid makes their aliasing match.
+    """
+    (t1, x1), (t2, x2) = a, b
+    lo, hi = max(t1[0], t2[0]), min(t1[-1], t2[-1])
+    if hi <= lo:
+        return 0.0
+    m1, m2 = (t1 >= lo) & (t1 <= hi), (t2 >= lo) & (t2 <= hi)
+    grid = t1[m1] if m1.sum() <= m2.sum() else t2[m2]
+    if len(grid) < 10:
+        return 0.0
+    p = np.interp(grid, t1, x1); q = np.interp(grid, t2, x2)
+    p = p - p.mean(); q = q - q.mean()
+    if p.std() < 1e-9 or q.std() < 1e-9:
+        return 0.0
+    return float(np.corrcoef(p, q)[0, 1])
+
+
+def cmd_ulog(path):
+    u = load(path)
+    refs = ref_functions(u)
+    ao = sorted([d for d in u.data_list if d.name == "actuator_outputs"], key=lambda d: d.multi_id)
+
+    print("file: %s" % path.split("/")[-1])
+    print("actuator_outputs instances: %s   (functions with signal: %s)"
+          % ([d.multi_id for d in ao], ", ".join(refs.keys()) or "none"))
+    if not refs:
+        print("  (no actuator_motors/actuator_servos signal -> cannot correlate; see *_FUNC* below)")
+
+    for d in ao:
+        t = np.asarray(d.data["timestamp"], dtype=float)
+        rate = len(t) / ((t[-1] - t[0]) / 1e6) if len(t) > 1 else 0.0
+        print("\n== actuator_outputs_%d  (%.0f Hz, n=%d) ==" % (d.multi_id, rate, len(t)))
+
+        chans = [(i, s) for i in range(16)
+                 for s in [_series(d, "output[%d]" % i)] if s is not None and np.std(s[1]) > 1e-6]
+        # greedy 1:1 assignment (each function maps to exactly one channel on a given bus)
+        pairs = sorted(((abs(corr(s, ref)), i, fn) for (i, s) in chans for fn, ref in refs.items()),
+                       reverse=True)
+        assign = {}
+        used = set()
+        for c, i, fn in pairs:
+            if i not in assign and fn not in used:
+                assign[i] = (fn, c)
+                used.add(fn)
+        for i, s in chans:
+            fn, c = assign.get(i, ("?", 0.0))
+            flag = "" if c >= LOW_CONF else "  (low-conf; cross-check *_FUNC*)"
+            print("   ch%2d  mean=%9.1f std=%8.2f  ->  %-7s corr=%.3f%s"
+                  % (i, np.mean(s[1]), np.std(s[1]), fn, c, flag))
+
+    ip = u.initial_parameters
+    chirp = {k: ip[k] for k in sorted(ip) if k.startswith("CA_CHIRP")}
+    funcs = {k: ip[k] for k in sorted(ip) if "_FUNC" in k and ip.get(k, 0) not in (0, "0")}
+    print("\nCA_CHIRP_* params: %s" % (chirp or "(none — this log did not use the CA_CHIRP feature)"))
+    print("nonzero *_FUNC* params (authoritative driver->function map): %s" % (funcs or "(none)"))
+
+
+def cmd_compare(sitl_path, flight_path, function, plot):
+    su, fu = load(sitl_path), load(flight_path)
+    sref, fref = ref_functions(su), ref_functions(fu)
+    if function not in sref:
+        sys.exit("function %s has no signal in SITL log (have: %s)" % (function, ", ".join(sref)))
+    if function not in fref:
+        sys.exit("function %s has no signal in flight log (have: %s)" % (function, ", ".join(fref)))
+
+    def stats(name, s):
+        t = (s[0] - s[0][0]) / 1e6
+        print("  %-7s %-8s dur=%5.1fs n=%-5d mean=%+.4f std=%.4f range=[%+.3f, %+.3f]"
+              % (name, function, t[-1], len(t), np.mean(s[1]), np.std(s[1]), np.min(s[1]), np.max(s[1])))
+
+    print("Comparing %s (control-allocator level, instance-independent):" % function)
+    stats("SITL", sref[function])
+    stats("flight", fref[function])
+    print("Note: these are actuator_servos/actuator_motors (same layer in both logs). In raw outputs "
+          "this is SITL actuator_outputs_0 vs flight actuator_outputs_2 (servos) / _1 (motors).")
+
+    if plot:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not available; skipping --plot")
+            return
+
+        def norm(s):
+            t = (s[0] - s[0][0]) / 1e6
+            x = s[1] - np.mean(s[1])
+            return t, x / (np.std(x) or 1.0)
+
+        fig, ax = plt.subplots(2, 1, figsize=(11, 6), sharex=False)
+        for a, (lbl, s) in zip(ax, [("SITL", sref[function]), ("flight", fref[function])]):
+            tn, xn = norm(s)
+            a.plot(tn, xn, lw=0.6)
+            a.set_title("%s  %s (normalized)" % (lbl, function))
+            a.set_xlabel("t since log start [s]")
+            a.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(plot, dpi=110)
+        print("wrote overlay: %s" % plot)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ulog", help="identify actuator_outputs instance/channel -> function for one log")
+    ap.add_argument("--compare", nargs=2, metavar=("SITL", "FLIGHT"), help="compare two logs by function")
+    ap.add_argument("--function", default="Servo3", help="function for --compare (e.g. Servo3, Motor1)")
+    ap.add_argument("--plot", help="for --compare: write a normalized overlay PNG to this path")
+    args = ap.parse_args()
+
+    if args.ulog:
+        cmd_ulog(args.ulog)
+    elif args.compare:
+        cmd_compare(args.compare[0], args.compare[1], args.function, args.plot)
+    else:
+        ap.error("provide --ulog FILE or --compare SITL FLIGHT")
+
+
+if __name__ == "__main__":
+    main()

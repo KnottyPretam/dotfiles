@@ -1,0 +1,547 @@
+#!/usr/bin/env python3
+"""
+Verify the Twin Rotor Tailsitter chirp (actuator system-ID) feature from a PX4 ulog.
+
+The chirp is gated in the control allocator: it injects an open-loop frequency sweep into one
+actuator axis only when CA_CHIRP_MODE != 0 AND CA_CHIRP_EN == 1 AND the vehicle is ARMED, and it
+is one-shot on the CA_CHIRP_EN 0->1 edge *while already armed*. This tool reads a ulog and decides
+PASS/FAIL for both halves of that contract:
+
+  * the chirp DID run when it should have (positive / timing scenarios), starting at the EN edge, and
+  * the chirp did NOT run when it should not have (armed-but-disabled, disarmed-but-enabled).
+
+Detection is a matched filter, NOT an energy threshold: an armed vehicle on the ground produces
+large attitude-controller actuator motion, so raw signal energy is actually *higher* outside the
+sweep window. We instead reconstruct the exact Chirp::update() waveform from the logged CA_CHIRP_*
+params and correlate it against every actuator_outputs channel over a sliding start time; the swept
+channel locks at |corr| ~ 0.9 only when the real sweep is present.
+
+  # one log, expectation derived from the log's own EN/arm edges (or pass --expected)
+  python3 verify_chirp.py --ulog logs/pos_cyclic_pitch_<UTC>.ulg
+  python3 verify_chirp.py --ulog logs/neg_armed_disabled_<UTC>.ulg --expected no_chirp
+
+  # verify a whole run directory (reads *.scenario.json sidecars), PASS/FAIL matrix, nonzero on fail
+  python3 verify_chirp.py --batch logs/
+
+  # diagnostic plot (re-openable: also writes <png>.pkl.gz; reopen with show_figure.py)
+  python3 verify_chirp.py --ulog logs/pos_cyclic_pitch_<UTC>.ulg --plot pitch.png
+
+Runs on the host (needs pyulog + numpy; matplotlib only for --plot). Reuses output_map.corr/_series.
+"""
+
+import argparse
+import glob
+import json
+import os
+import sys
+
+import numpy as np
+
+try:
+    from pyulog import ULog
+except ImportError:
+    sys.exit("pyulog not found (pip install pyulog)")
+
+# output_map.py lives next to this file; reuse its coarse-grid correlation and series cleaner.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from output_map import corr, _series  # noqa: E402
+
+# --------------------------------------------------------------------------- #
+# tunables
+# --------------------------------------------------------------------------- #
+CORR_THRESHOLD = 0.70   # matched-filter lock threshold. Validated positive |corr| ~ 0.905 on the
+                        # swept swashplate channels; broadband controller motion stays well below.
+ONSET_TOL_S = 1.5       # |detected sweep onset - CA_CHIRP_EN 0->1 edge| tolerance
+ARM_OUTPUTS_ID = 0      # actuator_outputs multi_id to analyse (SITL has only instance 0)
+CAND_STEP_S = 0.02      # candidate sweep-start grid spacing. Must be fine: a chirp's alignment is
+                        # hyper-sensitive (a constant time offset is a *growing* phase error as the
+                        # frequency rises), so |corr| falls from ~0.9 to ~0.05 within 0.1 s of offset.
+EN_FASTPATH_S = 3.0     # when an EN edge is known, only search +/- this around it
+ARMED = 2               # vehicle_status_s::ARMING_STATE_ARMED
+
+# Load every log with a high-rate topic present (actuator_outputs, 225 Hz) alongside vehicle_status.
+# pyulog attributes changed-parameter timestamps to the surrounding data stream, so loading only the
+# 2 Hz vehicle_status shifts the recorded CA_CHIRP_EN edge by a few hundred ms; including
+# actuator_outputs pins it to the true edge. One load also keeps every series in one time frame.
+LOAD_TOPICS = ["vehicle_status", "actuator_outputs"]
+
+
+def load_ulog(path):
+    return ULog(path, message_name_filter_list=LOAD_TOPICS)
+
+
+# Controller commands into the allocator, for the --show-control "open-loop / bypass" panels. The
+# chirp sets actBench_sp (== these setpoints) to 0 in applyChirp(), so during a sweep these stay flat
+# while the actuators sweep -> visual proof the attitude/rate controllers are not driving the output.
+CONTROL_TOPICS = ["vehicle_attitude_setpoint", "vehicle_rates_setpoint", "vehicle_torque_setpoint"]
+
+
+# --------------------------------------------------------------------------- #
+# timeline: armed intervals, EN/MODE edges, CA_CHIRP_* params (all log-relative seconds)
+# --------------------------------------------------------------------------- #
+def _state_intervals(t, mask):
+    """[(start_s, end_s), ...] for each contiguous run where mask is True."""
+    out = []
+    start = None
+    for ti, m in zip(t, mask):
+        if m and start is None:
+            start = ti
+        elif not m and start is not None:
+            out.append((start, ti))
+            start = None
+    if start is not None:
+        out.append((start, t[-1]))
+    return out
+
+
+def read_timeline(u):
+    t0 = u.start_timestamp
+
+    armed_intervals = []
+    try:
+        vs = u.get_dataset("vehicle_status").data
+        t = (np.asarray(vs["timestamp"], dtype=float) - t0) / 1e6
+        arm = np.asarray(vs["arming_state"], dtype=int)
+        armed_intervals = _state_intervals(t, arm == ARMED)
+    except (KeyError, IndexError):
+        pass
+
+    # CA_CHIRP_* params: start from the boot snapshot, then apply every runtime change (last wins).
+    # When the log starts at boot (SDLOG_MODE 2), the real sweep params arrive as changed_parameters
+    # after MAVLink applies them, so the boot snapshot alone would carry only defaults.
+    ip = u.initial_parameters
+    chirp_params = {k: ip[k] for k in ip if k.startswith("CA_CHIRP")}
+    en_edges, mode_edges = [], []
+    for ts, name, val in u.changed_parameters:
+        tr = (ts - t0) / 1e6
+        if name.startswith("CA_CHIRP"):
+            chirp_params[name] = val
+        if name == "CA_CHIRP_EN":
+            en_edges.append((tr, int(val)))
+        elif name == "CA_CHIRP_MODE":
+            mode_edges.append((tr, int(val)))
+    en_edges.sort()
+    mode_edges.sort()
+
+    mode = int(mode_edges[-1][1]) if mode_edges else int(chirp_params.get("CA_CHIRP_MODE", 0))
+
+    return {
+        "start_us": t0,
+        "dur_s": (u.last_timestamp - t0) / 1e6,
+        "armed_intervals": armed_intervals,
+        "en_edges": en_edges,
+        "mode_edges": mode_edges,
+        "mode": mode,
+        "chirp_params": chirp_params,
+    }
+
+
+def en_on_time(timeline):
+    """Log-relative time of the first CA_CHIRP_EN 0->1 edge, or None."""
+    return next((tr for tr, v in timeline["en_edges"] if v == 1), None)
+
+
+# --------------------------------------------------------------------------- #
+# waveform reconstruction (mirror of Chirp.hpp Chirp::update / finished)
+# --------------------------------------------------------------------------- #
+def reconstruct_template(params, t_s):
+    """amp * sin(phase(t)) for t in [0, T], 0 elsewhere. t_s is seconds since sweep start."""
+    f0 = float(params["CA_CHIRP_F0"])
+    f1 = float(params["CA_CHIRP_F1"])
+    total = float(params["CA_CHIRP_T"])
+    order = float(params["CA_CHIRP_ORD"])
+    amp = float(params["CA_CHIRP_AMP"])
+    t = np.asarray(t_s, dtype=float)
+    tc = np.clip(t, 0.0, total)
+    beta = (f1 - f0) / (total ** order) if total > 0 else 0.0
+    phase = 2.0 * np.pi * (beta / (order + 1.0) * tc ** (order + 1.0) + f0 * tc)
+    y = amp * np.sin(phase)
+    y[(t < 0.0) | (t > total)] = 0.0   # Chirp::finished(t) = t > T
+    return y
+
+
+# --------------------------------------------------------------------------- #
+# detection: sliding matched filter over actuator_outputs channels
+# --------------------------------------------------------------------------- #
+def _nontrivial_channels(d):
+    """[(channel_index, (t_us, x)), ...] for actuator_outputs channels that actually move."""
+    chans = []
+    for i in range(16):
+        s = _series(d, "output[%d]" % i)
+        if s is not None and np.std(s[1]) > 1e-6:
+            chans.append((i, s))
+    return chans
+
+
+def _candidate_starts(timeline):
+    """Sweep-start times to try (s). Fast path around a known EN edge, else scan armed intervals."""
+    total = float(timeline["chirp_params"].get("CA_CHIRP_T", 20.0))
+    room = 0.5 * total   # need at least half a sweep inside the armed window to lock
+    en_on = en_on_time(timeline)
+    cands = []
+    for a, b in timeline["armed_intervals"]:
+        if b - a < room:
+            continue
+        lo, hi = a, b - room
+        if en_on is not None and a <= en_on <= b:
+            lo = max(lo, en_on - EN_FASTPATH_S)
+            hi = min(hi, en_on + EN_FASTPATH_S)
+        if hi >= lo:
+            cands.extend(np.arange(lo, hi + 1e-6, CAND_STEP_S))
+    return cands
+
+
+def detect_chirp(u, timeline):
+    """Best matched-filter lock across channels and candidate starts.
+
+    Returns {found, channel, t_start, corr, second, reason}.
+    """
+    params = timeline["chirp_params"]
+    if not params or float(params.get("CA_CHIRP_T", 0.0)) <= 0.0:
+        return {"found": False, "channel": None, "t_start": None, "corr": 0.0,
+                "second": 0.0, "reason": "no_chirp_params"}
+
+    cands = _candidate_starts(timeline)
+    if not cands:
+        return {"found": False, "channel": None, "t_start": None, "corr": 0.0,
+                "second": 0.0, "reason": "no_armed_window"}
+
+    ds = [x for x in u.data_list if x.name == "actuator_outputs" and x.multi_id == ARM_OUTPUTS_ID]
+    if not ds:
+        return {"found": False, "channel": None, "t_start": None, "corr": 0.0,
+                "second": 0.0, "reason": "no_actuator_outputs"}
+    chans = _nontrivial_channels(ds[0])
+    if not chans:
+        return {"found": False, "channel": None, "t_start": None, "corr": 0.0,
+                "second": 0.0, "reason": "no_moving_channels"}
+
+    total = float(params["CA_CHIRP_T"])
+    t0 = timeline["start_us"]
+    # Best matched-filter correlation per channel. The filter is evaluated *inside* the candidate
+    # sweep window [ts, ts+T] only: outside it the channel carries large attitude-controller motion
+    # that has nothing to do with the sweep, so correlating over the full series would dilute the
+    # lock to ~0. Several swashplate channels carry the same chirp, so multiple channels locking is
+    # expected (stronger evidence) -- we threshold on the best, not on best-vs-second.
+    best_per_chan = {}        # channel -> (corr, t_start)
+    for i, (t_us, x) in chans:
+        t_rel = (t_us - t0) / 1e6
+        cbest, tbest = 0.0, None
+        for ts in cands:
+            win = (t_rel >= ts) & (t_rel <= ts + total)
+            if win.sum() < 20:
+                continue
+            tw = t_us[win]
+            templ = reconstruct_template(params, t_rel[win] - ts)
+            if np.std(templ) < 1e-9:
+                continue
+            c = abs(corr((tw, x[win]), (tw, templ)))
+            if c > cbest:
+                cbest, tbest = c, ts
+        best_per_chan[i] = (cbest, tbest)
+
+    ranked = sorted(best_per_chan.items(), key=lambda kv: kv[1][0], reverse=True)
+    (ch0, (c0, ts0)) = ranked[0]
+    c1 = ranked[1][1][0] if len(ranked) > 1 else 0.0   # diagnostic only (not a pass gate)
+    found = c0 >= CORR_THRESHOLD
+    return {"found": found, "channel": ch0, "t_start": ts0, "corr": c0,
+            "second": c1, "reason": "ok" if found else "below_threshold"}
+
+
+# --------------------------------------------------------------------------- #
+# verification: combine detection with the gate's expected behaviour
+# --------------------------------------------------------------------------- #
+def verify(u, expected, timeline, pre_en=None):
+    """expected in {"chirp_present", "no_chirp"}. Returns {passed, expected, detection, reasons}."""
+    det = detect_chirp(u, timeline)
+    en_on = en_on_time(timeline)
+    reasons = []
+
+    if expected == "chirp_present":
+        passed = det["found"]
+        reasons.append("detect: corr=%.3f ch=%s @%.2fs (2nd-best ch=%.3f, thr=%.2f)"
+                       % (det["corr"], det["channel"],
+                          -1.0 if det["t_start"] is None else det["t_start"],
+                          det["second"], CORR_THRESHOLD))
+        if not passed:
+            reasons.append("FAIL: no sweep locked (reason=%s)" % det["reason"])
+        else:
+            if en_on is None:
+                passed = False
+                reasons.append("FAIL: sweep detected but no CA_CHIRP_EN 0->1 edge recorded")
+            else:
+                in_armed = any(a <= en_on <= b for a, b in timeline["armed_intervals"])
+                onset_dt = abs(det["t_start"] - en_on)
+                onset_ok = onset_dt <= ONSET_TOL_S
+                reasons.append("gate: EN_on@%.2fs in_armed=%s onset_match=%s(|d|=%.2fs)"
+                               % (en_on, in_armed, onset_ok, onset_dt))
+                passed = passed and in_armed and onset_ok
+                if not in_armed:
+                    reasons.append("FAIL: EN edge not inside an armed interval")
+                if not onset_ok:
+                    reasons.append("FAIL: sweep onset does not match the EN edge")
+                if pre_en is not None:
+                    timing_ok = abs(en_on - pre_en) <= ONSET_TOL_S and abs(det["t_start"] - pre_en) <= ONSET_TOL_S
+                    reasons.append("timing: expected onset ~%.1fs -> %s" % (pre_en, "ok" if timing_ok else "FAIL"))
+                    passed = passed and timing_ok
+
+    elif expected == "no_chirp":
+        passed = not det["found"]
+        reasons.append("detect: best corr=%.3f ch=%s (must be < %.2f; reason=%s)"
+                       % (det["corr"], det["channel"], CORR_THRESHOLD, det["reason"]))
+        if not passed:
+            reasons.append("FAIL: a sweep was detected but none should have run")
+
+    else:
+        raise ValueError("expected must be 'chirp_present' or 'no_chirp', got %r" % expected)
+
+    return {"passed": passed, "expected": expected, "detection": det,
+            "en_on": en_on, "timeline": timeline, "reasons": reasons}
+
+
+def derive_expected(timeline):
+    """Fallback when there is no sidecar: the runtime gate itself. Chirp should run iff there is an
+    armed interval AND a CA_CHIRP_EN 0->1 edge inside it AND a non-OFF mode."""
+    en_on = en_on_time(timeline)
+    armed = any(a <= en_on <= b for a, b in timeline["armed_intervals"]) if en_on is not None else False
+    return "chirp_present" if (armed and timeline["mode"] != 0) else "no_chirp"
+
+
+# --------------------------------------------------------------------------- #
+# CLI commands
+# --------------------------------------------------------------------------- #
+def _sidecar_for(ulog_path):
+    side = ulog_path[:-4] + ".scenario.json"
+    if os.path.exists(side):
+        with open(side) as f:
+            return json.load(f)
+    return None
+
+
+def cmd_one(path, expected, plot, channel, threshold, onset_tol, show_control=False):
+    global CORR_THRESHOLD, ONSET_TOL_S
+    if threshold is not None:
+        CORR_THRESHOLD = threshold
+    if onset_tol is not None:
+        ONSET_TOL_S = onset_tol
+
+    meta = _sidecar_for(path)
+    u = load_ulog(path)
+    timeline = read_timeline(u)
+    pre_en = None
+    if expected is None:
+        if meta is not None:
+            expected = meta["expected_outcome"]
+            pre_en = meta.get("pre_en")
+        else:
+            expected = derive_expected(timeline)
+    elif meta is not None:
+        pre_en = meta.get("pre_en")
+    res = verify(u, expected, timeline, pre_en=pre_en)
+
+    print("file: %s" % os.path.basename(path))
+    print("expected: %s   ->   %s" % (expected, "PASS" if res["passed"] else "FAIL"))
+    for r in res["reasons"]:
+        print("  - %s" % r)
+    if plot:
+        make_plot(u, path, res, plot, channel, show_control)
+    return 0 if res["passed"] else 1
+
+
+def cmd_batch(dirpath, threshold, onset_tol, plot_dir=None, channel=None, show_control=False):
+    global CORR_THRESHOLD, ONSET_TOL_S
+    if threshold is not None:
+        CORR_THRESHOLD = threshold
+    if onset_tol is not None:
+        ONSET_TOL_S = onset_tol
+
+    ulogs = sorted(glob.glob(os.path.join(dirpath, "*.ulg")))
+    if not ulogs:
+        sys.exit("no .ulg files under %s" % dirpath)
+    if plot_dir:
+        os.makedirs(plot_dir, exist_ok=True)
+
+    rows = []
+    for ulg in ulogs:
+        meta = _sidecar_for(ulg)
+        u = load_ulog(ulg)
+        timeline = read_timeline(u)
+        pre_en = meta.get("pre_en") if meta else None
+        scenario = meta.get("scenario", "(derived)") if meta else "(derived)"
+        expected = meta["expected_outcome"] if meta else derive_expected(timeline)
+        res = verify(u, expected, timeline, pre_en=pre_en)
+        rows.append((os.path.basename(ulg), scenario, expected, res))
+        if plot_dir:
+            out_png = os.path.join(plot_dir, os.path.basename(ulg)[:-4] + ".png")
+            make_plot(u, ulg, res, out_png, channel, show_control)
+
+    print("\n================== chirp verification ==================")
+    print("%-34s %-20s %-13s %s" % ("ulog", "scenario", "expected", "result"))
+    print("-" * 78)
+    n_pass = 0
+    for fn, scn, exp, res in rows:
+        ok = res["passed"]
+        n_pass += ok
+        print("%-34s %-20s %-13s %s" % (fn[:34], scn[:20], exp, "PASS" if ok else "FAIL"))
+        if not ok:
+            for r in res["reasons"]:
+                if r.startswith("FAIL") or "FAIL" in r:
+                    print("        %s" % r)
+    print("-" * 78)
+    print("%d/%d scenarios passed" % (n_pass, len(rows)))
+    return 0 if n_pass == len(rows) else 1
+
+
+def _decorate(ax, timeline, en_on, total):
+    """Shade armed intervals, mark CA_CHIRP_EN edges, and the expected sweep window on one axis."""
+    for k, (a, b) in enumerate(timeline["armed_intervals"]):
+        ax.axvspan(a, b, color="tab:green", alpha=0.07, label="armed" if k == 0 else None)
+    for tr, v in timeline["en_edges"]:
+        ax.axvline(tr, color="tab:blue", ls="--", lw=1.0, label="CA_CHIRP_EN %d->%d" % (1 - v, v))
+    if en_on is not None:
+        ax.axvspan(en_on, en_on + total, color="tab:orange", alpha=0.12, label="expected sweep window")
+    ax.grid(True, alpha=0.3)
+
+
+def _plot_control_topic(ax, uc, t0, en_on, total, topic, fields, labels):
+    """Plot selected fields of a control topic and annotate their std *during* the sweep window
+    (the proof point: ~flat). Returns True if anything was drawn."""
+    try:
+        d = uc.get_dataset(topic).data
+    except (KeyError, IndexError, ValueError):
+        ax.text(0.5, 0.5, "%s not in log" % topic, ha="center", va="center", transform=ax.transAxes,
+                fontsize=8, color="0.5")
+        return False
+    t = (np.asarray(d["timestamp"], dtype=float) - t0) / 1e6
+    win = (t >= en_on) & (t <= en_on + total) if en_on is not None else np.zeros(len(t), bool)
+    drew = False
+    for fld, lbl in zip(fields, labels):
+        if fld not in d:
+            continue
+        x = np.asarray(d[fld], dtype=float)
+        sd = np.std(x[win]) if win.any() else np.std(x)
+        ax.plot(t, x, lw=0.8, label="%s (std=%.3f in sweep)" % (lbl, sd))
+        drew = True
+    return drew
+
+
+def make_plot(u, path, res, out_png, channel, show_control=False):
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not available; skipping plot")
+        return
+
+    timeline = res["timeline"]
+    det = res["detection"]
+    en_on = res["en_on"]
+    total = float(timeline["chirp_params"].get("CA_CHIRP_T", 20.0))
+    t0 = timeline["start_us"]
+    ch = channel if channel is not None else det["channel"]
+    if ch is None and not show_control:
+        print("no channel to plot (no sweep detected and no --channel given); skipping plot")
+        return
+
+    panels = 3 if show_control else 1
+    fig, axes = plt.subplots(panels, 1, figsize=(12, 3.1 * panels), sharex=True, squeeze=False)
+    axes = axes[:, 0]
+
+    # Panel 0: the actuator output (the chirp) + reconstructed-sweep overlay.
+    ax = axes[0]
+    if ch is not None:
+        d = [x for x in u.data_list if x.name == "actuator_outputs" and x.multi_id == ARM_OUTPUTS_ID][0]
+        s = _series(d, "output[%d]" % ch)
+        t = (s[0] - t0) / 1e6
+        x = s[1]
+        ax.plot(t, x, lw=0.6, color="0.3", label="actuator_outputs ch%d" % ch)
+        if det["t_start"] is not None:
+            templ = reconstruct_template(timeline["chirp_params"], t - det["t_start"])
+            scale = np.std(x - np.mean(x)) / (np.std(templ) or 1.0)
+            ax.plot(t, np.mean(x) + scale * templ, color="tab:red", lw=0.8, alpha=0.8,
+                    label="reconstructed sweep (|corr|=%.2f)" % det["corr"])
+        ax.set_ylabel("output ch%d" % ch)
+    else:
+        ax.set_ylabel("actuator")
+    _decorate(ax, timeline, en_on, total)
+    ax.legend(loc="upper right", fontsize=8, ncol=2)
+
+    if show_control:
+        uc = ULog(path, message_name_filter_list=CONTROL_TOPICS)
+        # Panel 1: attitude setpoint (the "command") — flat across the sweep.
+        ax = axes[1]
+        _plot_control_topic(ax, uc, t0, en_on, total, "vehicle_attitude_setpoint",
+                            ["roll_body", "pitch_body", "yaw_body"], ["roll_body", "pitch_body", "yaw_body"])
+        _decorate(ax, timeline, en_on, total)
+        ax.set_ylabel("att setpoint [rad]")
+        ax.set_title("attitude setpoint — flat across the sweep ⇒ not commanding the actuators", fontsize=9)
+        ax.legend(loc="upper right", fontsize=7, ncol=3)
+
+        # Panel 2: control-allocator input torque (vehicle_torque_setpoint == the control_sp the chirp
+        # zeroes in applyChirp). Flat ⇒ the chirp, not the rate controller, drives the output.
+        ax = axes[2]
+        _plot_control_topic(ax, uc, t0, en_on, total, "vehicle_torque_setpoint",
+                            ["xyz[0]", "xyz[1]", "xyz[2]"], ["roll torque", "pitch torque", "yaw torque"])
+        _decorate(ax, timeline, en_on, total)
+        ax.set_ylabel("torque sp [norm]")
+        ax.set_title("control-allocator input torque — flat ⇒ chirp bypasses the rate controller", fontsize=9)
+        ax.legend(loc="upper right", fontsize=7, ncol=3)
+
+    verdict = "PASS" if res["passed"] else "FAIL"
+    axes[0].set_title("%s  [%s, expected=%s]" % (os.path.basename(path), verdict, res["expected"]))
+    axes[-1].set_xlabel("t since log start [s]")
+    fig.tight_layout()
+    save_figure(fig, out_png)
+    plt.close(fig)
+
+
+def save_figure(fig, out_png):
+    """Save a PNG and, when available, a re-openable gzipped pickle next to it (show_figure.py)."""
+    fig.savefig(out_png, dpi=120)
+    print("wrote plot: %s" % out_png)
+    try:
+        import gzip
+        import pickle
+        pkl = out_png + ".pkl.gz"
+        with gzip.open(pkl, "wb") as f:
+            pickle.dump(fig, f)
+        print("wrote re-openable figure: %s  (reopen: python3 show_figure.py %s)" % (pkl, pkl))
+    except Exception as exc:  # noqa: BLE001 - pickling a figure is best-effort
+        print("note: could not write picklable figure (%s)" % exc)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--ulog", help="verify a single ulog")
+    ap.add_argument("--expected", choices=["chirp_present", "no_chirp"],
+                    help="override the expected outcome (default: sidecar, else derived from the log)")
+    ap.add_argument("--batch", help="verify every *.ulg in this directory and print a PASS/FAIL matrix")
+    ap.add_argument("--plot", help="for --ulog: write a diagnostic PNG (+ .pkl.gz) to this path")
+    ap.add_argument("--plot-dir", help="for --batch: write one diagnostic PNG (+ .pkl.gz) per ulog into this directory")
+    ap.add_argument("--channel", type=int, help="force a specific actuator_outputs channel for plots")
+    ap.add_argument("--show-control", action="store_true",
+                    help="add attitude-setpoint and torque-setpoint panels to the plot (shows the "
+                         "controllers stay flat across the sweep => the chirp is open-loop)")
+    ap.add_argument("--threshold", type=float, help="override matched-filter corr threshold (default %.2f)" % CORR_THRESHOLD)
+    ap.add_argument("--onset-tol", type=float, help="override onset tolerance in s (default %.1f)" % ONSET_TOL_S)
+    args = ap.parse_args()
+
+    if args.ulog:
+        if args.plot_dir and not args.plot:
+            args.plot = os.path.join(args.plot_dir, os.path.basename(args.ulog)[:-4] + ".png")
+            os.makedirs(args.plot_dir, exist_ok=True)
+        sys.exit(cmd_one(args.ulog, args.expected, args.plot, args.channel, args.threshold,
+                         args.onset_tol, args.show_control))
+    elif args.batch:
+        if args.plot and not args.plot_dir:
+            print("note: --plot is per-file (use it with --ulog); for --batch use --plot-dir DIR. "
+                  "Treating %r as the plot directory." % args.plot)
+            args.plot_dir = args.plot
+        sys.exit(cmd_batch(args.batch, args.threshold, args.onset_tol, args.plot_dir, args.channel,
+                           args.show_control))
+    else:
+        ap.error("provide --ulog FILE or --batch DIR")
+
+
+if __name__ == "__main__":
+    main()

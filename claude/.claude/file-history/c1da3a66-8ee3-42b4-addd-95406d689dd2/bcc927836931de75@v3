@@ -1,0 +1,50 @@
+# Drive sys-ID from the attitude setpoint (hardcoded), keep the full pipeline
+
+## Context
+In `analyze_axis` (`run_system_id_and_gain_design.m:135-136`) the sys-ID **input** was changed from
+`vehicle_torque_setpoint_0` (rate-controller output, normalized torque) to
+`vehicle_attitude_setpoint_0` (commanded attitude angle, rad); the **output** is still
+`vehicle_angular_velocity_0` (body rate, rad/s).
+
+Decision (confirmed with user):
+- **Hardcode the attitude setpoint** for all axes — no torque toggle, no per-axis / selectable option.
+- **Keep the full pipeline as-is** — identification, the pidtune retune, and the current + retune
+  inner/outer margins all still run on the identified attitude-cmd→rate TF, accepting that this TF
+  is now a closed-loop command response rather than the open-loop torque→rate plant.
+
+So the analysis flow does not change. The only thing now *factually wrong* is the input-signal
+labelling (still says "Torque Cmd"). This task makes the presentation honest and documents the
+changed semantics; it does not alter any computation.
+
+## Changes — `run_system_id_and_gain_design.m` only (surgical)
+1. **Input source:** keep lines 135-136 (attitude setpoint). Replace the two commented-out torque
+   lines (133-134) with a single comment noting the alternative source, so the active source is
+   unambiguous. Input/output stay in native units — **do not rescale the data fed to
+   `estimate_freq_response`** (rescaling would change the identified FRF).
+2. **Input label + units (display only, no math change):**
+   - `axis_defs.*.cmd`: `'<Axis> Torque Cmd'` → `'<Axis> Attitude Cmd (deg)'` (lines 65-67).
+   - In the time-domain figure, show the command in degrees (`*180/pi`) in the two `plot()` calls
+     that display `dele_total` (the initial trace ~line 158 and the detrended overlay ~line 290);
+     `ylabel` = `A.cmd`. The `lsim` model fit and all FFT/detrend inputs stay in radians.
+3. **Honesty note (no relabeling of the pipeline):** add a one-line note to the `margins.txt`
+   header (in `write_margins`) and a code comment in `analyze_axis` stating that the input is the
+   attitude command, so the identified TF / "plant" is the closed-loop command response
+   (att cmd→rate) and the current/retune margins are computed treating that TF as the plant.
+
+**Explicitly unchanged:** the `estimate_freq_response` call, the `(1,0)` TF-fit order in
+`estimate_tf_from_freq_response`, `compute_attitude_control_gains`, the current/retune loop
+construction, `closed_loop_bw`, every figure (names/filenames/counts), and `results.mat`.
+
+## Caveats to watch (left as-is per "keep full pipeline")
+- attitude-cmd→rate has ~0 DC gain and a low-frequency rise (≈+20 dB/dec); the 1-pole/0-zero fit is
+  a low-pass shape and may fit poorly. Inspect the Plant Bode + coherence; if the fit is bad, the
+  lever is bumping the zero count (`nz=1`) — out of scope unless requested.
+- The `coherence > 0.8` cutoff may drop low-frequency points for this command-response FRF.
+
+## Verification
+- Run `/home/choudhury/tools/dev/sysID_wrapper/sysID_wrapper.sh <OD1A053 .mat>`; confirm it completes
+  for roll/pitch/yaw, 13 figures/axis, `margins.txt` populated, and **no "Torque" label remains**.
+- Open `figures/pitch/Pitch_Current_Plant_Bode_Plot.png`: command axis reads "Attitude Cmd (deg)";
+  check FRF/coherence quality (per caveat).
+- Confirm identification numbers differ from the torque-input run (different TF) and that the
+  inner/outer current + retune margins and CL crossovers still populate in `margins.txt`.

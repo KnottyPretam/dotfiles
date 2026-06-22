@@ -1,0 +1,31 @@
+# Example gains YAML for replay_margins.sh.
+#
+# Workflow:
+#   1) Run run_sysid.sh on a ULG. It writes plants.mat under the output dir.
+#   2) Point `run_dir` below at that output dir.
+#   3) Copy the logged gains from that run's margins.txt (or edit freely).
+#   4) ./replay_margins.sh this_file.yaml
+#
+# To replay just one channel, narrow `axes` and `loops` (both default to all).
+
+run_dir: /home/choudhury/tools/dev/sysID_matlab/output/log_4_2026-5-13-15-46-26_20260514_170504
+
+# Optional filters. Default: all axes, both loops.
+axes:  [roll, pitch, yaw]
+loops: [rate, attitude]
+
+# MC gains:
+#   K              MC_*RATE_K            outer scaling
+#   Kp, Ki, Kd     MC_*RATE_{P,I,D}      rate PID
+#   Kp_att         MC_*_P                attitude P
+#   dterm_cutoff_Hz IMU_DGYRO_CUTOFF     d-term LPF cutoff
+mc:
+  roll:  {K: 1.0, Kp: 1.0, Ki: 0.2, Kd: 0.00163, Kp_att: 1.2, dterm_cutoff_Hz: 30}
+  pitch: {K: 1.0, Kp: 0.8, Ki: 0.6, Kd: 0.0,     Kp_att: 4.8, dterm_cutoff_Hz: 30}
+  yaw:   {K: 0.4, Kp: 1.9, Ki: 0.5, Kd: 0.005,   Kp_att: 0.6, dterm_cutoff_Hz: 30}
+
+# FW gains: no K (rate is plain PID); Kp_att normally = 1/FW_*_TC.
+fw:
+  roll:  {Kp: 0.08, Ki: 0.10, Kd: 0.0, Kp_att: 2.0, dterm_cutoff_Hz: 30}
+  pitch: {Kp: 0.08, Ki: 0.10, Kd: 0.0, Kp_att: 2.0, dterm_cutoff_Hz: 30}
+  yaw:   {Kp: 0.05, Ki: 0.10, Kd: 0.0, Kp_att: 1.0, dterm_cutoff_Hz: 30}

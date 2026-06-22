@@ -1,0 +1,173 @@
+#include "ms_colibri_command_interface.h"
+#include <cstring>
+
+// Cameras report 14-bit two's-complement angles (post-FW 1.280) covering -180..+180 deg.
+// In the 64-byte Full ACK each angle gets its own MSB+LSB byte pair; the 14-bit value
+// occupies the upper 14 bits of the 16-bit field (the low 2 bits are zero).
+static constexpr double DEG_PER_LSB_14 = 180.0 / 8192.0;
+
+uint8_t colibri_checksum(const uint8_t* buf, int len)
+{
+    // 8-bit additive sum of bytes [0..len-2]; byte [len-1] holds the checksum.
+    // TODO: verify on first HW integration — Rev 43 doesn't formally state the formula,
+    // and other NextVision tooling uses an 8-bit sum.
+    uint8_t sum = 0;
+    for (int i = 0; i < len - 1; ++i)
+        sum = static_cast<uint8_t>(sum + buf[i]);
+    return sum;
+}
+
+bool colibri_command_encode(const __colibri_message_command& m, uint8_t out[COLIBRI_CMD_LEN])
+{
+    std::memcpy(out, &m, COLIBRI_CMD_LEN - 1);
+    out[COLIBRI_CMD_LEN - 1] = colibri_checksum(out, COLIBRI_CMD_LEN);
+    return true;
+}
+
+bool colibri_fixed_ack_decode(__colibri_message_ack& m, const uint8_t in[COLIBRI_ACK_FIXED_LEN])
+{
+    if (colibri_checksum(in, COLIBRI_ACK_FIXED_LEN) != in[COLIBRI_ACK_FIXED_LEN - 1])
+        return false;
+    std::memcpy(&m, in, COLIBRI_ACK_FIXED_LEN);
+    return true;
+}
+
+bool colibri_full_ack_decode(__colibri_message_full_ack& m, const uint8_t in[COLIBRI_ACK_FULL_LEN])
+{
+    if (colibri_checksum(in, COLIBRI_ACK_FULL_LEN) != in[COLIBRI_ACK_FULL_LEN - 1])
+        return false;
+    std::memcpy(&m, in, COLIBRI_ACK_FULL_LEN);
+    return true;
+}
+
+ms_colibri_command_interface::ms_colibri_command_interface()  = default;
+ms_colibri_command_interface::~ms_colibri_command_interface() = default;
+
+void ms_colibri_command_interface::addObserver(const std::string& messageName, kw_observer* observer)
+{
+    std::lock_guard<std::mutex> lock(observersMutex);
+    observers[messageName].push_back(observer);
+}
+
+void ms_colibri_command_interface::addOutputObserver(kw_observer* observer)
+{
+    outputObserver = observer;
+}
+
+void ms_colibri_command_interface::notify(const std::string& name, void* data)
+{
+    std::lock_guard<std::mutex> lock(observersMutex);
+    auto it = observers.find(name);
+    if (it == observers.end())
+        return;
+    for (kw_observer* obs : it->second)
+        if (obs)
+            obs->update(name, data);
+}
+
+void ms_colibri_command_interface::send_message(const __colibri_message_command& cmd)
+{
+    if (!outputObserver)
+        return;
+
+    stBuffer buffer;
+    if (!colibri_command_encode(cmd, buffer.buffer))
+        return;
+    buffer.size = COLIBRI_CMD_LEN;
+
+    std::string name(mCOLIBRI_MESSAGE_ENCODED);
+    outputObserver->update(name, &buffer);
+}
+
+int ms_colibri_command_interface::expected_message_length(uint8_t header3) const
+{
+    // 0xF7..0xFA echoed back by camera = 64-byte Full ACK.
+    // 0x77..0x7A and 0x83 (get-version) = 20-byte fixed ack.
+    if (header3 >= 0xF7 && header3 <= 0xFA)
+        return COLIBRI_ACK_FULL_LEN;
+    return COLIBRI_ACK_FIXED_LEN;
+}
+
+void ms_colibri_command_interface::input_message(uint8_t* data, int length)
+{
+    for (int i = 0; i < length; ++i)
+    {
+        if (rx_index >= static_cast<int>(sizeof(rx_buffer)))
+            rx_index = 0;
+        rx_buffer[rx_index++] = data[i];
+    }
+
+    int consumed = 0;
+    while (rx_index - consumed >= 4)
+    {
+        if (rx_buffer[consumed] != COLIBRI_HDR1 || rx_buffer[consumed + 1] != COLIBRI_HDR2)
+        {
+            ++consumed;
+            continue;
+        }
+
+        const int msg_len = expected_message_length(rx_buffer[consumed + 2]);
+        if (rx_index - consumed < msg_len)
+            break;
+
+        const uint8_t* msg = &rx_buffer[consumed];
+        if (msg_len == COLIBRI_ACK_FULL_LEN)
+        {
+            if (colibri_full_ack_decode(cached_full_ack, msg))
+            {
+                std::string name(mCOLIBRI_ACK_FULL);
+                notify(name, &cached_full_ack);
+            }
+        }
+        else
+        {
+            if (colibri_fixed_ack_decode(cached_fixed_ack, msg))
+            {
+                std::string name(mCOLIBRI_ACK_FIXED);
+                notify(name, &cached_fixed_ack);
+            }
+        }
+
+        consumed += msg_len;
+    }
+
+    if (consumed > 0)
+    {
+        const int remainder = rx_index - consumed;
+        if (remainder > 0)
+            std::memmove(rx_buffer, &rx_buffer[consumed], remainder);
+        rx_index = remainder;
+    }
+}
+
+static double sixteen_bit_to_deg(uint8_t msb, uint8_t lsb)
+{
+    // 14-bit two's-complement angle left-justified in the 16-bit field.
+    const uint16_t raw16 = static_cast<uint16_t>((msb << 8) | lsb);
+    const int16_t  signed16 = static_cast<int16_t>(raw16);
+    return (signed16 >> 2) * DEG_PER_LSB_14;
+}
+
+double ms_colibri_command_interface::get_gimbal_az_deg() const
+{
+    return sixteen_bit_to_deg(cached_full_ack.mech_yaw_msb, cached_full_ack.mech_yaw_lsb);
+}
+
+double ms_colibri_command_interface::get_gimbal_el_deg() const
+{
+    return sixteen_bit_to_deg(cached_full_ack.mech_pitch_msb, cached_full_ack.mech_pitch_lsb);
+}
+
+double ms_colibri_command_interface::get_gimbal_roll_deg() const
+{
+    return sixteen_bit_to_deg(cached_full_ack.mech_roll_msb, cached_full_ack.mech_roll_lsb);
+}
+
+double ms_colibri_command_interface::get_fov_deg() const
+{
+    // Full ACK reports FOV as deg*10 in a 16-bit field (Rev 43 §5 byte 4-5,
+    // matching correlator 0x05 SetFOV semantics).
+    const uint16_t fov_x10 = static_cast<uint16_t>(
+        (cached_full_ack.fov_msb << 8) | cached_full_ack.fov_lsb);
+    return fov_x10 / 10.0;
+}

@@ -1,0 +1,11 @@
+# Cyclic yaw chirp: sweeps body YAW -> differential swashplate cyclic.
+# Rotors are held at CA_CHIRP_RPM for the whole sweep.
+# NOTE: CA_CHIRP_RPM is the normalized motor command for your ~6000 rpm hold point;
+#       edit it to match your hardware/model. CA_CHIRP_AMP is in torque-setpoint units.
+param set CA_CHIRP_MODE 2
+param set CA_CHIRP_AMP 0.20
+param set CA_CHIRP_F0 0.5
+param set CA_CHIRP_F1 15
+param set CA_CHIRP_T 20
+param set CA_CHIRP_ORD 1
+param set CA_CHIRP_RPM 0.60

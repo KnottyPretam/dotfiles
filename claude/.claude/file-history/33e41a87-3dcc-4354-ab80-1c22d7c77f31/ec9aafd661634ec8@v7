@@ -1,0 +1,790 @@
+#!/usr/bin/env python3
+"""Recreate PX4's vehicle_angular_velocity from raw sensor_gyro_fifo, and retune the
+gyro/dgyro filters offline.
+
+Pipeline (reproduces src/modules/sensors/vehicle_angular_velocity/VehicleAngularVelocity.cpp):
+
+  raw int16 --scale--> [notch0] [notch1] [gyro Butterworth, IMU_GYRO_CUTOFF] = filtered gyro
+  filtered gyro --d/dt * fs--> [alpha LPF, IMU_DGYRO_CUTOFF]                  = filtered dgyro
+  decimate to the logged publish instants (== "same integration rate", ~GYRO_RATEMAX/.. Hz)
+  body = R @ (gyro - cal_offset) - ekf_bias(t)   ;   d_body = R @ dgyro
+
+Filter math is copied verbatim from PX4:
+  LowPassFilter2p.hpp (2nd-order Butterworth), NotchFilter.hpp (biquad notch),
+  AlphaFilter.hpp (1st-order dgyro LPF). Rotation from rotation.{h,cpp} + Gyroscope.cpp.
+
+Usage:
+  python3 recreate_angular_velocity.py [LOG.ulg] --config filter_tune.yaml [--start S] [--end S] [--outdir DIR]
+
+Outputs (in ./recreate_av_<logstem>_plots/, each .png with a companion .pkl.gz for show_figure.py):
+  recreate_gyro_timeseries.png   recreate_gyro_psd.png
+  recreate_dgyro_timeseries.png  recreate_dgyro_psd.png
+  recreate_gyro_bode.png         recreate_gyro_nichols.png   (filter transfer functions)
+  recreate_match_metrics.txt     recreate_filter_response.txt (dB loss + phase at freqs of interest)
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+import numpy as np
+from pyulog import ULog
+from scipy.signal import lfilter, lfilter_zi, freqz, group_delay
+import matplotlib.pyplot as plt
+
+# Reuse the existing analysis module verbatim (fifo_to_series, direct_fft, save_fig,
+# get_topic, all_instances). T_OFFSET stays 0.0 because we never call its main().
+sys.path.insert(0, "/home/choudhury/tools/dev/imu_vibe")
+import analyze_imu_vibration as aiv  # noqa: E402
+
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+
+# Filter params, seeded with OD1A079's actual on-aircraft values (used if YAML omits them).
+PARAM_KEYS = ["IMU_GYRO_CUTOFF", "IMU_DGYRO_CUTOFF",
+              "IMU_GYRO_NF0_FRQ", "IMU_GYRO_NF0_BW",
+              "IMU_GYRO_NF1_FRQ", "IMU_GYRO_NF1_BW"]
+RAD2DEG = 180.0 / np.pi   # plots are in deg/s like analyze_imu_vibration's vehicle_angular_velocity FFT
+PARAM_DEFAULTS = {"IMU_GYRO_CUTOFF": 25.0, "IMU_DGYRO_CUTOFF": 30.0,
+                  "IMU_GYRO_NF0_FRQ": 0.0, "IMU_GYRO_NF0_BW": 20.0,
+                  "IMU_GYRO_NF1_FRQ": 0.0, "IMU_GYRO_NF1_BW": 20.0}
+# PX4 param metadata min/max (imu_gyro_parameters.c). The FC clamps to these; values outside
+# are unreachable on the vehicle. Notch BW in particular must be << Nyquist to stay a notch.
+PARAM_RANGES = {"IMU_GYRO_CUTOFF": (0, 1000), "IMU_DGYRO_CUTOFF": (0, 1000),
+                "IMU_GYRO_NF0_FRQ": (0, 1000), "IMU_GYRO_NF0_BW": (0, 100),
+                "IMU_GYRO_NF1_FRQ": (0, 1000), "IMU_GYRO_NF1_BW": (0, 100)}
+
+# PX4 rot_lookup (src/lib/conversion/rotation.h): (roll, pitch, yaw) degrees, indexed by enum.
+ROT_LOOKUP = [
+    (0, 0, 0), (0, 0, 45), (0, 0, 90), (0, 0, 135), (0, 0, 180), (0, 0, 225), (0, 0, 270), (0, 0, 315),
+    (180, 0, 0), (180, 0, 45), (180, 0, 90), (180, 0, 135), (0, 180, 0), (180, 0, 225), (180, 0, 270),
+    (180, 0, 315), (90, 0, 0), (90, 0, 45), (90, 0, 90), (90, 0, 135), (270, 0, 0), (270, 0, 45),
+    (270, 0, 90), (270, 0, 135), (0, 90, 0), (0, 270, 0), (0, 180, 90), (0, 180, 270), (90, 90, 0),
+    (180, 90, 0), (270, 90, 0), (90, 180, 0), (270, 180, 0), (90, 270, 0), (180, 270, 0), (270, 270, 0),
+    (90, 180, 90), (90, 0, 270), (90, 68, 293), (0, 315, 0), (90, 315, 0), (0, 225, 0), (180, 45, 0),
+    (0, 90, 180),
+]
+
+
+# ---------- PX4 filter coefficients ----------
+def butter2_coeffs(fs, fc):
+    """2nd-order Butterworth (LowPassFilter2p::set_cutoff_frequency). None => passthrough."""
+    if fc <= 0.0 or fc >= fs / 2.0 or not np.isfinite(fc):
+        return None
+    fc = max(fc, fs * 0.001)
+    ohm = np.tan(np.pi / (fs / fc))
+    c = 1.0 + 2.0 * np.cos(np.pi / 4.0) * ohm + ohm * ohm
+    b0 = ohm * ohm / c
+    b = np.array([b0, 2.0 * b0, b0])
+    a = np.array([1.0, 2.0 * (ohm * ohm - 1.0) / c,
+                  (1.0 - 2.0 * np.cos(np.pi / 4.0) * ohm + ohm * ohm) / c])
+    return b, a
+
+
+def notch_coeffs(fs, frq, bw):
+    """Biquad notch (NotchFilter::setParameters). None => disabled (frq<=0)."""
+    if frq <= 0.0:
+        return None
+    alpha = np.tan(np.pi * bw / fs)
+    beta = -np.cos(2.0 * np.pi * frq / fs)
+    a0i = 1.0 / (alpha + 1.0)
+    b = np.array([a0i, 2.0 * beta * a0i, a0i])
+    a = np.array([1.0, 2.0 * beta * a0i, (1.0 - alpha) * a0i])
+    return b, a
+
+
+def alpha_coeff(fs, fc):
+    """1st-order alpha LPF weight (AlphaFilter::setCutoffFreq/setParameters). 1.0 => passthrough."""
+    if fc <= 0.0 or fc >= fs / 2.0 or not np.isfinite(fc):
+        return 1.0
+    dt = 1.0 / fs
+    tau = 1.0 / (2.0 * np.pi * fc)
+    return dt / (tau + dt)
+
+
+def lfilt_ss(b, a, x):
+    """Causal IIR initialised to the steady state at x[0] (mirrors PX4 filter reset())."""
+    zi = lfilter_zi(b, a) * x[0]
+    y, _ = lfilter(b, a, x, zi=zi)
+    return y
+
+
+def filter_gyro_axis(x, fs, p):
+    """Notch0 -> Notch1 -> Butterworth, exactly as FilterAngularVelocity()."""
+    y = x
+    for frq, bw in [(p["IMU_GYRO_NF0_FRQ"], p["IMU_GYRO_NF0_BW"]),
+                    (p["IMU_GYRO_NF1_FRQ"], p["IMU_GYRO_NF1_BW"])]:
+        c = notch_coeffs(fs, frq, bw)
+        if c is not None:
+            y = lfilt_ss(c[0], c[1], y)
+    c = butter2_coeffs(fs, p["IMU_GYRO_CUTOFF"])
+    if c is not None:
+        y = lfilt_ss(c[0], c[1], y)
+    return y
+
+
+def dgyro_axis(filt, fs, fc):
+    """Derivative of the *filtered* gyro, then 1st-order alpha LPF (FilterAngularAcceleration())."""
+    accel_raw = np.diff(filt, prepend=filt[0]) * fs   # prepend => first sample 0, no boot spike
+    a = alpha_coeff(fs, fc)
+    if a >= 1.0:
+        return accel_raw
+    b_c, a_c = np.array([a]), np.array([1.0, -(1.0 - a)])
+    zi = lfilter_zi(b_c, a_c) * accel_raw[0]
+    y, _ = lfilter(b_c, a_c, accel_raw, zi=zi)
+    return y
+
+
+# ---------- filter frequency response (refilter_gyro.py reference logic) ----------
+def chain_ba(p, fs):
+    """Cascade the gyro filter chain (notch0 * notch1 * Butterworth) into one (b, a) by
+    convolving the biquads — same as refilter_gyro.py chain_ba (extended to two notches)."""
+    b, a = np.array([1.0]), np.array([1.0])
+    for frq, bw in [(p["IMU_GYRO_NF0_FRQ"], p["IMU_GYRO_NF0_BW"]),
+                    (p["IMU_GYRO_NF1_FRQ"], p["IMU_GYRO_NF1_BW"])]:
+        c = notch_coeffs(fs, frq, bw)
+        if c is not None:
+            b, a = np.convolve(b, c[0]), np.convolve(a, c[1])
+    c = butter2_coeffs(fs, p["IMU_GYRO_CUTOFF"])
+    if c is not None:
+        b, a = np.convolve(b, c[0]), np.convolve(a, c[1])
+    return b, a
+
+
+def chain_response(f, fs, b, a):
+    """Complex response H(f) of (b, a) on the Hz grid f (refilter_gyro.py chain_response)."""
+    return freqz(b, a, worN=f, fs=fs)[1]
+
+
+def gp(H, floor=-60.0):
+    """(phase_deg, gain_dB) with gain floored — refilter_gyro.py gp()."""
+    g = np.clip(20.0 * np.log10(np.abs(H) + 1e-12), floor, None)
+    p = np.degrees(np.unwrap(np.angle(H)))
+    return p, g
+
+
+def notch_suffix(p):
+    """' + NFx f/bw' label fragment for each enabled notch (empty if none)."""
+    s = ""
+    for nf in ("0", "1"):
+        if p[f"IMU_GYRO_NF{nf}_FRQ"] > 0:
+            s += f" + NF{nf} {p[f'IMU_GYRO_NF{nf}_FRQ']:g}/{p[f'IMU_GYRO_NF{nf}_BW']:g}"
+    return s
+
+
+# ---------- rotation / calibration ----------
+def euler_to_dcm(roll, pitch, yaw):
+    """matrix::Dcm(Euler) — phi=roll, theta=pitch, psi=yaw (matrix/Dcm.hpp)."""
+    cp, sp = np.cos(roll), np.sin(roll)
+    ct, st = np.cos(pitch), np.sin(pitch)
+    cy, sy = np.cos(yaw), np.sin(yaw)
+    return np.array([
+        [ct * cy, -cp * sy + sp * st * cy, sp * sy + cp * st * cy],
+        [ct * sy, cp * cy + sp * st * sy, -sp * cy + cp * st * sy],
+        [-st, sp * ct, cp * ct],
+    ])
+
+
+def get_rot_matrix(rot_enum):
+    r, p, y = ROT_LOOKUP[int(rot_enum)]
+    return euler_to_dcm(np.radians(r), np.radians(p), np.radians(y))
+
+
+def calibration_rotation(P, cal_rot, board_rot):
+    """_rotation = Dcm(level adjustment) @ get_rot_matrix(rot)  (Gyroscope.cpp:129)."""
+    level = euler_to_dcm(np.radians(P.get("SENS_BOARD_X_OFF", 0.0)),
+                         np.radians(P.get("SENS_BOARD_Y_OFF", 0.0)),
+                         np.radians(P.get("SENS_BOARD_Z_OFF", 0.0)))
+    rot = board_rot if int(cal_rot) < 0 else int(cal_rot)   # ROT=-1 => follow board rotation
+    return level @ get_rot_matrix(rot)
+
+
+def procrustes_rotation(src, dst):
+    """Best-fit rotation R minimising ||dst - R@src|| (orthogonal Procrustes). src,dst: (3,N)."""
+    H = src @ dst.T
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    return Vt.T @ np.diag([1, 1, d]) @ U.T
+
+
+def rotation_angle_deg(Ra, Rb):
+    """Angle (deg) of the relative rotation between two 3x3 rotation matrices."""
+    c = (np.trace(Ra @ Rb.T) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(c, -1.0, 1.0))))
+
+
+# ---------- log helpers ----------
+def get_gyro_by_device(ulog, device_id):
+    for d in aiv.all_instances(ulog, "sensor_gyro_fifo"):
+        if "device_id" in d.data and int(d.data["device_id"][0]) == int(device_id):
+            return d
+    return None
+
+
+def find_cal_index(P, device_id):
+    for x in range(4):
+        if int(P.get(f"CAL_GYRO{x}_ID", 0)) == int(device_id):
+            return x
+    return None
+
+
+def select_gyro_device(ulog, cfg):
+    """device_id of the gyro feeding vehicle_angular_velocity, with fallbacks for logs that
+    don't record sensor_selection (only ~2 of the oddjob logs do). All of these report the
+    *selected* gyro, since the controller, EKF and IMU status share sensor_selection.
+    Returns (device_id, source) or (None, None)."""
+    if cfg.get("gyro_device_id") is not None:
+        return int(cfg["gyro_device_id"]), "yaml gyro_device_id"
+    sel = aiv.get_topic(ulog, "sensor_selection")
+    if sel is not None and "gyro_device_id" in sel.data:
+        return int(sel.data["gyro_device_id"][-1]), "sensor_selection"
+    for topic in ("estimator_sensor_bias", "vehicle_imu_status"):
+        d = aiv.get_topic(ulog, topic)
+        if d is not None and "gyro_device_id" in d.data:
+            vals = np.unique(d.data["gyro_device_id"])
+            if len(vals) == 1:
+                return int(vals[0]), topic
+    return None, None
+
+
+def inflight_window(ulog):
+    """(t0, t1) FMU-boot seconds for the in-air segment via vehicle_land_detected.landed==0."""
+    d = aiv.get_topic(ulog, "vehicle_land_detected")
+    if d is not None and "landed" in d.data:
+        t = d.data["timestamp"] / 1e6
+        air = t[d.data["landed"] == 0]
+        if air.size:
+            return float(air[0]), float(air[-1])
+    return None, None
+
+
+def match_index(t_us, out_ts):
+    """For each output timestamp, index of the nearest per-sample FIFO timestamp."""
+    order = np.argsort(t_us, kind="stable")
+    ts = t_us[order]
+    pos = np.clip(np.searchsorted(ts, out_ts), 1, len(ts) - 1)
+    left, right = ts[pos - 1], ts[pos]
+    take = np.where(np.abs(out_ts - left) <= np.abs(out_ts - right), pos - 1, pos)
+    return order[take]
+
+
+def fifo_gap_intervals(d):
+    """(starts_s, ends_s) of FIFO logging dropouts (inter-batch gap > 1.5*dt).
+    The FC had continuous data here; only the SD log dropped samples, so filtering
+    across these gaps rings — exclude a settle window around them when scoring."""
+    ts_last = d.data["timestamp_sample"].astype(np.int64)
+    dt = d.data["dt"].astype(np.int64)
+    ns = d.data["samples"].astype(np.int32)
+    if len(ts_last) < 2:
+        return np.array([]), np.array([])
+    t_first = ts_last - (ns - 1) * dt
+    gap = t_first[1:] - ts_last[:-1]
+    dtn = dt[1:]
+    over = (dtn > 0) & (gap > 1.5 * dtn)
+    return ts_last[:-1][over] / 1e6, t_first[1:][over] / 1e6
+
+
+def gap_valid_mask(out_t, starts, ends, settle):
+    """True where out_t is NOT inside a FIFO gap (+- settle seconds)."""
+    bad = np.zeros(len(out_t), bool)
+    for s, e in zip(starts, ends):
+        bad |= (out_t >= s - settle) & (out_t <= e + settle)
+    return ~bad
+
+
+def gap_free_zoom(t0, t1, starts, ends, dur=2.0):
+    """Find a dur-second window within [t0, t1] containing no FIFO gap."""
+    for c in np.arange(t0 + 0.2 * (t1 - t0), t1 - dur, 0.5):
+        if not np.any((ends >= c) & (starts <= c + dur)):
+            return float(c), float(c + dur)
+    return float(t0), float(t0 + dur)
+
+
+def bias_at(ulog, device_id, out_ts):
+    """ZOH-interpolate estimator_sensor_bias.gyro_bias (this device) onto output times. (3,Nout)."""
+    d = aiv.get_topic(ulog, "estimator_sensor_bias")
+    if d is None or "gyro_bias[0]" not in d.data:
+        return np.zeros((3, len(out_ts)))
+    gid = d.data.get("gyro_device_id")
+    mask = (gid == int(device_id)) if gid is not None else np.ones(len(d.data["timestamp"]), bool)
+    bt = d.data["timestamp"][mask].astype(np.int64)
+    if bt.size == 0:
+        return np.zeros((3, len(out_ts)))
+    bxyz = np.vstack([d.data[f"gyro_bias[{i}]"][mask] for i in range(3)])
+    order = np.argsort(bt)
+    bt, bxyz = bt[order], bxyz[:, order]
+    pos = np.clip(np.searchsorted(bt, out_ts, side="right") - 1, 0, len(bt) - 1)
+    return bxyz[:, pos]
+
+
+# ---------- metrics ----------
+def axis_metrics(rec, log):
+    resid = rec - log
+    rms_log = np.sqrt(np.mean(log ** 2))
+    rms_ac = np.std(log)
+    nrmse = np.sqrt(np.mean(resid ** 2)) / rms_log if rms_log > 0 else np.nan
+    nrmse_ac = np.std(resid) / rms_ac if rms_ac > 0 else np.nan
+    corr = np.corrcoef(rec, log)[0, 1] if np.std(rec) > 0 and rms_ac > 0 else np.nan
+    return dict(rms_resid=float(np.sqrt(np.mean(resid ** 2))), nrmse=float(nrmse),
+                nrmse_ac=float(nrmse_ac), corr=float(corr), maxabs=float(np.max(np.abs(resid))))
+
+
+# ---------- plots ----------
+AX = ["x", "y", "z"]
+
+
+def plot_timeseries(t, rec, log, zoom, title, ylabel, outpath, gaps=None):
+    """Per-axis overlay of recreated vs logged over a gap-free zoom window."""
+    z0, z1 = zoom
+    zm = (t >= z0) & (t <= z1)
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    for i, ax in enumerate(axes):
+        ax.plot(t[zm], log[i][zm], color="black", lw=1.4, label="logged")
+        ax.plot(t[zm], rec[i][zm], color="tab:red", lw=1.0, ls="--", label="recreated")
+        if gaps is not None:
+            for s, e in zip(*gaps):
+                if e >= z0 and s <= z1:
+                    ax.axvspan(s, e, color="orange", alpha=0.25)
+        ax.set_ylabel(f"{AX[i]}  [{ylabel}]")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="upper right", fontsize=8)
+    axes[-1].set_xlabel("time [s, FMU boot]")
+    fig.suptitle(title + "  (gap-free zoom; orange = FIFO dropouts)")
+    fig.tight_layout()
+    aiv.save_fig(fig, outpath)
+
+
+def plot_psd(traces, fs, t, title, ylabel, outpath, lpf_kind="gyro", annotate_idx=0, notches=()):
+    """House-style flat-top PSD, matching analyze_imu_vibration.fft_* exactly:
+    linear axes 0..Nyquist, top-6 peak annotations on the primary trace, and
+    software-LPF / HW-DLPF / Nyquist reference lines (aiv.add_lpf_lines). Active gyro
+    notch centre(s) ± bandwidth are drawn from `notches` = [(freq, bw, label), ...].
+    traces: list of {label, color, lw, ls, data:(3,N)}, all sampled at `fs` over `t`."""
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    for i, ax in enumerate(axes):
+        for j, tr in enumerate(traces):
+            f, _, psd = aiv.direct_fft(tr["data"][i], fs, t=t)
+            ax.plot(f, psd, color=tr["color"], linewidth=tr["lw"],
+                    linestyle=tr.get("ls", "-"), label=tr["label"])
+            if j == annotate_idx:
+                aiv.annotate_top_peaks(ax, f, psd, n_peaks=6)
+        ax.set_ylabel(f"{AX[i].upper()} {ylabel}")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_xlim(0, fs / 2)
+        aiv.add_lpf_lines(ax, lpf_kind, fs)
+        for nf, bw, lbl in notches:            # active notch centre + bandwidth
+            ax.axvline(nf, color="#993556", ls="--", lw=1.3, label=lbl)
+            if bw > 0:
+                ax.axvspan(max(nf - bw / 2.0, 0.0), nf + bw / 2.0, color="#993556", alpha=0.12)
+        ax.legend(loc="upper right", fontsize=7)
+    axes[-1].set_xlabel("Frequency (Hz)")
+    fig.suptitle(title)
+    fig.tight_layout()
+    aiv.save_fig(fig, outpath)
+
+
+def plot_bode(curves, f, fs, title, outpath, marks=(), crossover=None):
+    """Magnitude (dB) + phase (deg) Bode of each filter chain/component vs log-frequency."""
+    fig, (axm, axp) = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
+    for c in curves:
+        H = chain_response(f, fs, c["b"], c["a"])
+        axm.semilogx(f, 20.0 * np.log10(np.abs(H) + 1e-12), color=c["color"],
+                     lw=c["lw"], ls=c.get("ls", "-"), label=c["label"])
+        axp.semilogx(f, np.degrees(np.unwrap(np.angle(H))), color=c["color"],
+                     lw=c["lw"], ls=c.get("ls", "-"))
+    if crossover:
+        axm.axvspan(crossover[0], crossover[1], color="#9FE1CB", alpha=0.30,
+                    label=f"crossover {crossover[0]:g}-{crossover[1]:g} Hz")
+        axp.axvspan(crossover[0], crossover[1], color="#9FE1CB", alpha=0.30)
+    for mf, lbl in marks:
+        axm.axvline(mf, color="#555555", ls=":", lw=0.8)
+        axp.axvline(mf, color="#555555", ls=":", lw=0.8)
+        axm.annotate(lbl, (mf, 4.0), fontsize=7, color="#555555", rotation=90, va="top")
+    axm.axhline(-3.0, color="0.6", lw=0.6, ls=":")   # -3 dB reference
+    axm.set_ylabel("magnitude [dB]")
+    axm.set_ylim(-60, 6)
+    axm.grid(True, which="both", alpha=0.3)
+    axm.legend(loc="lower left", fontsize=8)
+    axp.set_ylabel("phase [deg]  (lag negative)")
+    axp.set_xlabel("frequency [Hz]")
+    axp.set_xlim(f[0], f[-1])
+    axp.grid(True, which="both", alpha=0.3)
+    fig.suptitle(title)
+    fig.tight_layout()
+    aiv.save_fig(fig, outpath)
+
+
+def plot_nichols(curves, f, fs, recon_idx, markers, crossover, floor, title, outpath):
+    """Nichols (gain dB vs phase deg), two panels (full + crossover zoom) — port of
+    refilter_gyro.py nichols_plot. Markers/crossover are drawn on the reconstructed curve."""
+    pg = [gp(chain_response(f, fs, c["b"], c["a"]), floor) for c in curves]
+    seg = (f >= crossover[0]) & (f <= crossover[1])
+    pr, gr = pg[recon_idx]
+    rc = curves[recon_idx]["color"]
+
+    def draw(ax, label_freqs, legend):
+        for (p, g), c in zip(pg, curves):
+            ax.plot(p, g, color=c["color"], lw=c["lw"], ls=c.get("ls", "-"), label=c["label"])
+        ax.plot(pr[seg], gr[seg], color=rc, lw=5, alpha=0.35, solid_capstyle="round",
+                label=f"crossover {crossover[0]:g}-{crossover[1]:g} Hz")
+        for fm in label_freqs:
+            i = int(np.argmin(np.abs(f - fm)))
+            ax.plot(pr[i], gr[i], "o", color=rc, ms=5, zorder=5)
+            ax.annotate(f"{fm:g} Hz", (pr[i], gr[i]), textcoords="offset points",
+                        xytext=(7, 5), fontsize=8, color="#0C447C")
+        ax.axhline(0, color="k", lw=0.4, alpha=0.3)
+        ax.grid(True, alpha=0.25)
+        if legend:
+            ax.legend(loc="lower right", fontsize=7)
+
+    fig, (axF, axZ) = plt.subplots(1, 2, figsize=(13.4, 6.6))
+    draw(axF, [m for m in markers if m >= 50], True)
+    axF.plot(-180, 0, "x", color="#A32D2D", ms=11, mew=2.2, zorder=6)
+    axF.annotate("(−180°, 0 dB)\nfilter only (not full loop)", (-180, 0),
+                 textcoords="offset points", xytext=(8, -6), fontsize=8, color="#A32D2D")
+    axF.axvline(-180, color="k", lw=0.4, alpha=0.3)
+    axF.set_ylim(floor, 8)
+    axF.set_xlabel("phase [deg]")
+    axF.set_ylabel("gain [dB]")
+    axF.set_title("full trajectory", fontsize=10)
+    draw(axZ, [m for m in markers if m <= 50], False)
+    axZ.set_xlim(-70, 5)
+    axZ.set_ylim(-12, 2)
+    axZ.set_xlabel("phase [deg]")
+    axZ.set_title("crossover region (where margin lives)", fontsize=10)
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    aiv.save_fig(fig, outpath)
+
+
+def write_filter_response(chains, fs, fois, outpath):
+    """Table of dB loss + phase (+ group delay) at the frequencies of interest, per chain.
+    Mirrors refilter_gyro.py phase_analysis with an added dB-loss column; echoes to stdout."""
+    import warnings
+    fo = np.array(fois, dtype=float)
+    resp = {}
+    for name, b, a in chains:
+        Hc = freqz(b, a, worN=fo, fs=fs)[1]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            gd = group_delay((b, a), w=fo, fs=fs)[1] / fs * 1e3
+        resp[name] = (Hc, gd)
+    names = [c[0] for c in chains]
+    L = [f"filter-chain frequency response (gyro)   fs={fs:.0f} Hz",
+         "per chain: dB = 20*log10|H| (negative = loss); phase [deg] (lag negative); gd = group delay [ms]",
+         "'null' = on a notch centre (phase undefined). d(phase) = reconstructed - original (+ = lag reduced)",
+         ""]
+    hdr = f"{'freq[Hz]':>9} |"
+    sub = f"{'':>9} |"
+    for nm in names:
+        hdr += f" {nm:^24} |"
+        sub += f" {'dB':>7} {'phase':>8} {'gd':>6} |"
+    if len(names) >= 2:
+        hdr += f" {'d(phase)':>9}"
+        sub += f" {'[deg]':>9}"
+    L += [hdr, sub, "-" * len(sub)]
+    for i, fhz in enumerate(fo):
+        row = f"{fhz:9.2f} |"
+        ph = {}
+        for nm in names:
+            Hc, gd = resp[nm]
+            mag = abs(Hc[i])
+            null = mag < 1e-5            # on a notch centre: phase & group delay undefined
+            db = max(20.0 * np.log10(mag + 1e-12), -99.0)
+            db_s = f"{db:7.1f}" if null else f"{db:7.2f}"
+            ph_s = f"{'null':>8}" if null else f"{np.degrees(np.angle(Hc[i])):8.2f}"
+            gd_s = f"{'--':>6}" if (null or not np.isfinite(gd[i])) else f"{gd[i]:6.2f}"
+            row += f" {db_s} {ph_s} {gd_s} |"
+            ph[nm] = None if null else np.degrees(np.angle(Hc[i]))
+        if len(names) >= 2:
+            po, prc = ph[names[0]], ph[names[1]]
+            row += f" {prc - po:+9.2f}" if (po is not None and prc is not None) else f" {'null':>9}"
+        L.append(row)
+    txt = "\n".join(L)
+    print("\n" + txt)
+    outpath.write_text(txt)
+
+
+# ---------- main ----------
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("ulog", nargs="?", default=None, help="Path to .ulg (overrides YAML 'log').")
+    p.add_argument("--config", default=None, help="YAML filter config (e.g. filter_tune.yaml).")
+    p.add_argument("--start", type=float, default=None, help="In-air window start (s, FMU boot).")
+    p.add_argument("--end", type=float, default=None, help="In-air window end (s, FMU boot).")
+    p.add_argument("--outdir", default=None, help="Output dir (default ./recreate_av_<stem>_plots).")
+    return p.parse_args()
+
+
+def load_cfg(path):
+    if not _HAS_YAML:
+        sys.exit("--config requires PyYAML: pip install pyyaml")
+    with open(path) as f:
+        return yaml.safe_load(f) or {}
+
+
+def resolve_params(cfg):
+    p = dict(PARAM_DEFAULTS)
+    for k in PARAM_KEYS:
+        if k in cfg:
+            p[k] = float(cfg[k])
+    return p
+
+
+def warn_param_ranges(p, fs, label="baseline"):
+    """Warn about values the FC could not actually use (outside PX4 param min/max),
+    and about notch bandwidths that are too wide to behave as a notch."""
+    for k, (lo, hi) in PARAM_RANGES.items():
+        if not (lo <= p[k] <= hi):
+            print(f"  WARN [{label}]: {k}={p[k]:g} is outside PX4's [{lo},{hi}] "
+                  f"— unreachable on the vehicle (FC clamps it).")
+    for nf in ("0", "1"):
+        bw = p[f"IMU_GYRO_NF{nf}_BW"]
+        if p[f"IMU_GYRO_NF{nf}_FRQ"] > 0 and bw > 0.1 * fs:
+            print(f"  WARN [{label}]: IMU_GYRO_NF{nf}_BW={bw:g} Hz is a large fraction of the "
+                  f"{fs:.0f} Hz sample rate — this is a broadband attenuator, not a notch "
+                  f"(it pulls down the whole spectrum; as BW→{fs/2:.0f} Hz it kills everything).")
+
+
+def main():
+    args = parse_args()
+    cfg = load_cfg(args.config) if args.config else {}
+
+    logpath = Path(args.ulog or cfg.get("log") or "")
+    if not logpath.exists():
+        sys.exit(f"ERROR: log not found: {logpath}")
+
+    params = resolve_params(cfg)
+    cand_cfg = cfg.get("candidate")
+    cand_params = resolve_params(cand_cfg) if cand_cfg else None
+
+    outdir = Path(args.outdir) if args.outdir else Path.cwd() / f"recreate_av_{logpath.stem}_plots"
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading {logpath} ...")
+    topics = ["sensor_gyro_fifo", "sensor_selection", "vehicle_angular_velocity",
+              "vehicle_land_detected", "vehicle_imu_status", "estimator_sensor_bias"]
+    ulog = ULog(str(logpath), message_name_filter_list=topics)
+    P = ulog.initial_parameters
+
+    # --- select the gyro the controller actually used ---
+    avail = [int(d.data["device_id"][0]) for d in aiv.all_instances(ulog, "sensor_gyro_fifo")
+             if "device_id" in d.data]
+    dev, dev_src = select_gyro_device(ulog, cfg)
+    if dev is None:
+        sys.exit("ERROR: could not determine the gyro device — this log has no sensor_selection, "
+                 "estimator_sensor_bias, or vehicle_imu_status.\n"
+                 f"       Set gyro_device_id in the YAML to one of the logged FIFOs: {avail}")
+    fifo = get_gyro_by_device(ulog, dev)
+    if fifo is None:
+        sys.exit(f"ERROR: gyro device_id={dev} (from {dev_src}) has no sensor_gyro_fifo. "
+                 f"Available FIFO device_ids: {avail}")
+
+    fs = 1e6 / float(np.median(fifo.data["dt"]))
+    print(f"Selected gyro device_id={dev} (via {dev_src})  (sensor_gyro_fifo multi_id={fifo.multi_id})  "
+          f"FIFO rate={fs:.1f} Hz")
+
+    # --- report YAML vs log's actual params ---
+    print("\nFilter params (YAML -> filtering with; log = on-aircraft value):")
+    for k in PARAM_KEYS:
+        log_v = P.get(k, "n/a")
+        print(f"  {k:18s} = {params[k]:8.3f}   (log: {log_v})")
+    warn_param_ranges(params, fs, "baseline")
+    if cand_params is not None:
+        warn_param_ranges(cand_params, fs, "candidate")
+
+    # --- expand FIFO to a per-sample series & filter the whole flight ---
+    t_s, gx, gy, gz = aiv.fifo_to_series(fifo)     # seconds (T_OFFSET=0), rad/s, scale applied
+    g = np.vstack([gx, gy, gz])
+    filt = np.vstack([filter_gyro_axis(g[i], fs, params) for i in range(3)])
+    accel = np.vstack([dgyro_axis(filt[i], fs, params["IMU_DGYRO_CUTOFF"]) for i in range(3)])
+    if cand_params is not None:
+        cfilt = np.vstack([filter_gyro_axis(g[i], fs, cand_params) for i in range(3)])
+
+    # --- logged signal & decimation to the controller publish instants ---
+    vav = aiv.get_topic(ulog, "vehicle_angular_velocity")
+    out_ts = vav.data["timestamp_sample"].astype(np.int64)
+    log_xyz = np.vstack([vav.data[f"xyz[{i}]"] for i in range(3)])
+    log_dxyz = np.vstack([vav.data[f"xyz_derivative[{i}]"] for i in range(3)])
+
+    t_us = np.rint(t_s * 1e6).astype(np.int64)
+    idx = match_index(t_us, out_ts)
+    match_err = np.abs(t_us[idx] - out_ts)
+    print(f"\nDecimation: {len(out_ts)} logged outputs, mean output rate "
+          f"{1e6/np.median(np.diff(out_ts)):.1f} Hz; "
+          f"timestamp match err max={match_err.max()} us, median={np.median(match_err):.0f} us")
+    filt_dec, accel_dec = filt[:, idx], accel[:, idx]
+
+    # --- full calibration -> body frame ---
+    cal_idx = find_cal_index(P, dev)
+    if cal_idx is not None:
+        offset = np.array([P[f"CAL_GYRO{cal_idx}_XOFF"], P[f"CAL_GYRO{cal_idx}_YOFF"],
+                           P[f"CAL_GYRO{cal_idx}_ZOFF"]])
+        cal_rot = P.get(f"CAL_GYRO{cal_idx}_ROT", -1)
+    else:
+        print(f"WARN: no CAL_GYROx_ID == {dev}; using zero offset, board rotation.")
+        offset, cal_rot = np.zeros(3), -1
+    board_rot = P.get("SENS_BOARD_ROT", 0)
+    R = calibration_rotation(P, cal_rot, board_rot)
+    bias = bias_at(ulog, dev, out_ts)
+
+    rec_xyz = R @ (filt_dec - offset[:, None]) - bias
+    rec_dxyz = R @ accel_dec
+
+    # --- validate rotation convention against a best-fit (Procrustes) ---
+    out_t = out_ts / 1e6
+    t0, t1 = (args.start, args.end)
+    if t0 is None or t1 is None:
+        w0, w1 = inflight_window(ulog)
+        t0 = t0 if t0 is not None else (w0 if w0 is not None else out_t[0])
+        t1 = t1 if t1 is not None else (w1 if w1 is not None else out_t[-1])
+    mask_out = (out_t >= t0) & (out_t <= t1)
+
+    # FIFO logging dropouts: the FC had continuous data, only the SD log dropped FIFO
+    # samples, so filtering across a gap rings. Score on continuous-data samples only.
+    gstart, gend = fifo_gap_intervals(fifo)
+    EXCL_S = 0.10
+    valid = mask_out & gap_valid_mask(out_t, gstart, gend, EXCL_S)
+    n_gaps_air = int(np.sum((gend >= t0) & (gstart <= t1)))
+    kept = valid.sum() / max(mask_out.sum(), 1) * 100.0
+    print(f"\nFIFO dropouts in-air: {n_gaps_air}; scoring on continuous-data samples only "
+          f"(excl. ±{EXCL_S}s around each gap → {kept:.1f}% of in-air samples).")
+
+    R_fit = procrustes_rotation((filt_dec - offset[:, None])[:, valid], (log_xyz + bias)[:, valid])
+    R_err = rotation_angle_deg(R, R_fit)
+    print(f"Rotation: SENS_BOARD_ROT={int(board_rot)}, CAL_GYRO{cal_idx}_ROT={int(cal_rot)};  "
+          f"analytic-vs-Procrustes-fit angle = {R_err:.2f} deg")
+
+    print(f"\nIn-air window {t0:.1f}-{t1:.1f}s — match (all-in-air incl. dropouts in parens):\n")
+    lines = [f"log: {logpath.name}",
+             f"gyro device_id={dev} (fifo multi_id={fifo.multi_id}), FIFO rate={fs:.1f} Hz",
+             f"output rate={1e6/np.median(np.diff(out_ts)):.1f} Hz, n_out={len(out_ts)}, "
+             f"ts match max={match_err.max()} us",
+             f"params: " + ", ".join(f"{k}={params[k]}" for k in PARAM_KEYS),
+             f"rotation SENS_BOARD_ROT={int(board_rot)} CAL_GYRO{cal_idx}_ROT={int(cal_rot)} "
+             f"offset={offset}, analytic-vs-fit={R_err:.2f}deg",
+             f"in-air {t0:.1f}-{t1:.1f}s; FIFO dropouts={n_gaps_air}; "
+             f"scored on {kept:.1f}% of samples (excl. ±{EXCL_S}s around gaps)", ""]
+    for name, rec, log in [("gyro xyz [rad/s]", rec_xyz, log_xyz),
+                           ("dgyro xyz_derivative [rad/s^2]", rec_dxyz, log_dxyz)]:
+        lines.append(name)
+        for i in range(3):
+            m = axis_metrics(rec[i][valid], log[i][valid])
+            ma = axis_metrics(rec[i][mask_out], log[i][mask_out])
+            line = (f"  {AX[i]}: NRMSE_ac={m['nrmse_ac']*100:6.3f}%  corr={m['corr']:.6f}  "
+                    f"rms_resid={m['rms_resid']:.3e}  maxerr={m['maxabs']:.2e}"
+                    f"   (all-in-air NRMSE_ac={ma['nrmse_ac']*100:.2f}%)")
+            lines.append(line)
+            print(line)
+        lines.append("")
+    (outdir / "recreate_match_metrics.txt").write_text("\n".join(lines))
+
+    # --- plots (deg/s, matching analyze_imu_vibration's vehicle_angular_velocity FFT style) ---
+    # Reference cutoff lines reflect this run's tuning (add_lpf_lines reads aiv.LPF_CUTOFFS).
+    aiv.LPF_CUTOFFS = {"gyro": {"IMU_GYRO_CUTOFF": params["IMU_GYRO_CUTOFF"],
+                                "IMU_DGYRO_CUTOFF": params["IMU_DGYRO_CUTOFF"]}}
+    zoom = gap_free_zoom(t0, t1, gstart, gend)
+    plot_timeseries(out_t, rec_xyz * RAD2DEG, log_xyz * RAD2DEG, zoom,
+                    f"{logpath.stem}: gyro vehicle_angular_velocity.xyz — recreated vs logged",
+                    "deg/s", outdir / "recreate_gyro_timeseries.png", gaps=(gstart, gend))
+    plot_timeseries(out_t, rec_dxyz * RAD2DEG, log_dxyz * RAD2DEG, zoom,
+                    f"{logpath.stem}: dgyro xyz_derivative — recreated vs logged",
+                    "deg/s²", outdir / "recreate_dgyro_timeseries.png", gaps=(gstart, gend))
+
+    # PSD: house-style flat-top FFT over the in-air window, at the output rate, in deg/s.
+    # Compares recreated vs logged (the raw FIFO spectrum is in imu_fft_gyro_*.png; its
+    # 99 Hz peak is ~250x larger and would blow this linear-y axis).
+    fs_o = 1e6 / float(np.median(np.diff(out_ts)))
+    tp = out_t[mask_out]
+
+    def trace(label, color, lw, ls, data3):
+        return {"label": label, "color": color, "lw": lw, "ls": ls,
+                "data": data3[:, mask_out] * RAD2DEG}
+
+    gyro_tr = [trace("logged", "steelblue", 0.9, "-", log_xyz),
+               trace("recreated (baseline)", "tab:red", 1.0, "--", rec_xyz)]
+    dgyro_tr = [trace("logged", "steelblue", 0.9, "-", log_dxyz),
+                trace("recreated (baseline)", "tab:red", 1.0, "--", rec_dxyz)]
+    if cand_params is not None:
+        caccel = np.vstack([dgyro_axis(cfilt[i], fs, cand_params["IMU_DGYRO_CUTOFF"]) for i in range(3)])
+        cand_xyz = R @ (cfilt[:, idx] - offset[:, None]) - bias
+        cand_dxyz = R @ caccel[:, idx]
+        gyro_tr.append(trace("recreated (candidate)", "tab:green", 1.0, "-", cand_xyz))
+        dgyro_tr.append(trace("recreated (candidate)", "tab:green", 1.0, "-", cand_dxyz))
+
+    notches = [(params[f"IMU_GYRO_NF{nf}_FRQ"], params[f"IMU_GYRO_NF{nf}_BW"],
+                f"NF{nf} {params[f'IMU_GYRO_NF{nf}_FRQ']:g}/{params[f'IMU_GYRO_NF{nf}_BW']:g} Hz")
+               for nf in ("0", "1") if params[f"IMU_GYRO_NF{nf}_FRQ"] > 0]
+    plot_psd(gyro_tr, fs_o, tp,
+             f"FFT PSD (flat-top) of vehicle_angular_velocity gyro — recreated vs logged, fs={fs_o:.0f} Hz",
+             "PSD (deg/s)²/Hz", outdir / "recreate_gyro_psd.png", notches=notches)
+    plot_psd(dgyro_tr, fs_o, tp,
+             f"FFT PSD (flat-top) of vehicle_angular_velocity dgyro — recreated vs logged, fs={fs_o:.0f} Hz",
+             "PSD (deg/s²)²/Hz", outdir / "recreate_dgyro_psd.png", notches=notches)
+
+    # --- Bode + Nichols of the gyro filter chains (refilter_gyro.py reference logic) ---
+    # Analytic transfer functions at the FIFO rate (where PX4 actually designs the coefficients).
+    bn = cfg.get("bode_nichols", {}) or {}
+    crossover = bn.get("crossover_band_hz", [5.0, 10.0])
+    markers = [float(m) for m in bn.get("freq_markers_hz", [5.0, 10.0, 50.0, 99.4])]
+    floor = float(bn.get("gain_floor_db", -60.0))
+    fmin = float(bn.get("fmin_hz", 1.0))
+    fgrid = np.logspace(np.log10(fmin), np.log10(fs / 2.0), 3000)
+
+    orig_params = {k: float(P.get(k, PARAM_DEFAULTS[k])) for k in PARAM_KEYS}  # what actually flew
+    bo, ao = chain_ba(orig_params, fs)
+    br, ar = chain_ba(params, fs)
+    curves = [
+        {"label": f"original (LPF {orig_params['IMU_GYRO_CUTOFF']:g} Hz{notch_suffix(orig_params)})",
+         "color": "#888880", "lw": 1.6, "ls": "-", "b": bo, "a": ao},
+        {"label": f"reconstructed (LPF {params['IMU_GYRO_CUTOFF']:g} Hz{notch_suffix(params)})",
+         "color": "#185FA5", "lw": 1.9, "ls": "-", "b": br, "a": ar},
+    ]
+    recon_idx = 1
+    chains = [("original", bo, ao), ("reconstructed", br, ar)]
+    if cand_params is not None:
+        bc, ac = chain_ba(cand_params, fs)
+        curves.append({"label": f"candidate (LPF {cand_params['IMU_GYRO_CUTOFF']:g} Hz{notch_suffix(cand_params)})",
+                       "color": "tab:green", "lw": 1.5, "ls": "-", "b": bc, "a": ac})
+        chains.append(("candidate", bc, ac))
+    # component filters of the reconstructed chain: Butterworth alone + each enabled notch alone
+    bb = butter2_coeffs(fs, params["IMU_GYRO_CUTOFF"])
+    if bb is not None:
+        curves.append({"label": f"2nd-order Butterworth ({params['IMU_GYRO_CUTOFF']:g} Hz)",
+                       "color": "#0F6E56", "lw": 1.3, "ls": "--", "b": bb[0], "a": bb[1]})
+    for nf in ("0", "1"):
+        nb = notch_coeffs(fs, params[f"IMU_GYRO_NF{nf}_FRQ"], params[f"IMU_GYRO_NF{nf}_BW"])
+        if nb is not None:
+            curves.append({"label": f"notch NF{nf} ({params[f'IMU_GYRO_NF{nf}_FRQ']:g}/{params[f'IMU_GYRO_NF{nf}_BW']:g} Hz)",
+                           "color": "#993556", "lw": 1.3, "ls": "--", "b": nb[0], "a": nb[1]})
+
+    marks = [(params["IMU_GYRO_CUTOFF"], "cutoff")]
+    for nf in ("0", "1"):
+        if params[f"IMU_GYRO_NF{nf}_FRQ"] > 0:
+            marks.append((params[f"IMU_GYRO_NF{nf}_FRQ"], f"NF{nf}"))
+
+    plot_bode(curves, fgrid, fs,
+              f"{logpath.stem}: gyro filter Bode — reconstructed vs original (fs={fs:.0f} Hz)",
+              outdir / "recreate_gyro_bode.png", marks=marks, crossover=crossover)
+    plot_nichols(curves, fgrid, fs, recon_idx, markers, crossover, floor,
+                 f"{logpath.stem}: gyro filter Nichols — reconstructed vs original",
+                 outdir / "recreate_gyro_nichols.png")
+
+    foi_set = set(markers) | {params["IMU_GYRO_CUTOFF"]}
+    for nf in ("0", "1"):
+        if params[f"IMU_GYRO_NF{nf}_FRQ"] > 0:
+            foi_set.add(params[f"IMU_GYRO_NF{nf}_FRQ"])
+    fois = sorted(x for x in foi_set if 0 < x < fs / 2.0)
+    write_filter_response(chains, fs, fois, outdir / "recreate_filter_response.txt")
+
+    print(f"\nWrote plots + metrics to {outdir}/")
+    print(f"Reopen interactively: python3 /home/choudhury/tools/dev/imu_vibe/show_figure.py "
+          f"{outdir}/recreate_gyro_psd.pkl.gz")
+
+
+if __name__ == "__main__":
+    main()

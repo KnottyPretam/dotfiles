@@ -1,0 +1,76 @@
+# `actuator_outputs` instances: SITL vs flight test
+
+Why a flight log shows `actuator_outputs_2` but a SITL log only shows `actuator_outputs_0`,
+and how to line up the chirp across the two. Tool: [`output_map.py`](output_map.py).
+
+## The architecture
+
+`actuator_outputs` is a **multi-instance** topic with **one instance per output *driver*** (each
+`MixingOutput`), numbered in the order drivers start/advertise (uORB
+`orb_advertise_multi_queue`; `src/lib/mixer_module/mixer_module.cpp`,
+`platforms/common/uORB/PublicationMulti.hpp`). It is **not** a logging setting.
+
+- **SITL** runs a single output driver, `pwm_out_sim` — a `ModuleBase` singleton that can't be
+  started twice (`src/modules/simulation/pwm_out_sim/PWMSim.cpp`). So SITL has **only
+  `actuator_outputs_0`** (PWM-µs; servos on `output[0–7]`, motors on `output[8–9]`, per the SITL
+  airframe's `PWM_MAIN_FUNC*`), plus a normalized `actuator_outputs_sim` that feeds gazebo.
+- **Flight hardware** runs several output drivers (one per bus), so it has `actuator_outputs_0`,
+  `_1`, `_2`, … — one per bus, each with its own channel order and units.
+- The chirp is **instance-independent**: `control_allocator` publishes single-instance
+  **`actuator_motors`** (`Motor1–12`) and **`actuator_servos`** (`Servo1–8`) *before* any per-bus
+  mapping. Every `actuator_outputs_N[ch]` is one of those, re-mapped/scaled for one bus via that
+  driver's `<PREFIX>_FUNCn`. These two topics are present in **every** log → the canonical layer to
+  compare on.
+
+The logger keeps up to 3 instances (`logged_topics.cpp`: `add_topic_multi("actuator_outputs", 100, 3)`),
+so flight logs show `_0/_1/_2` and SITL shows only `_0`.
+
+## Validated finding — `OD1A064_rpyChirp.ulg`
+
+`output_map.py --ulog` on the provided flight log (correlating each output channel to the allocator
+functions):
+
+| flight topic | driver (`*_FUNC*`) | carries | correlation |
+|---|---|---|---|
+| `actuator_outputs_1[0–1]` | `UAVCAN_EC` (`101/102`) | **the 2 motors** (Motor1/2) | 1.00 |
+| `actuator_outputs_2[0–7]` | `UAVCAN_SV` (`201,202,203,207,204,205,206,208`) | **the 6 swashplate + 2 elevon servos** (Servo1–8) | 0.96–0.996 |
+
+So **`actuator_outputs_2` = the swashplate/elevon servos** (the cyclic/collective chirp outputs);
+`actuator_outputs_1` = the motors. (No `_0` in this log — instance 0 had no active/logged publisher.)
+This log's `CA_CHIRP_*` params are empty → its roll/pitch/yaw chirp used a different mechanism than the
+new `CA_CHIRP` feature, so compare by **function + signal shape**, not identical command.
+
+## SITL ↔ flight mapping (by function)
+
+| function | flight log | SITL log |
+|---|---|---|
+| Servo1–8 (swash 201–206, elevons 207–208) | `actuator_outputs_2[ch]` (UAVCAN_SV order) **&** `actuator_servos[0–7]` | `actuator_outputs_0[0–7]` (PWM_MAIN order) **&** `actuator_servos[0–7]` |
+| Motor1–2 (101/102) | `actuator_outputs_1[0–1]` (UAVCAN_EC) **&** `actuator_motors[0–1]` | `actuator_outputs_0[8–9]` **&** `actuator_motors[0–1]` |
+
+`actuator_servos`/`actuator_motors` are function-indexed and identical in meaning across both → use
+them (or `actuator_outputs_2` ↔ `actuator_outputs_0`, aligned by function) to compare the chirp.
+
+## Using `output_map.py`
+
+```bash
+# identify what each actuator_outputs instance/channel carries (any log)
+python3 Tools/chirp_sysid/output_map.py --ulog <flight_or_sitl>.ulg
+
+# compare the same physical actuator across a SITL and a flight log
+python3 Tools/chirp_sysid/output_map.py --compare <sitl>.ulg <flight>.ulg --function Servo3 --plot cmp.png
+```
+
+`--ulog` prints, per instance/channel, the best-matching allocator function (by correlation) and
+dumps the nonzero `*_FUNC*` params as the **authoritative** map. `--compare` aligns by function via
+`actuator_servos`/`actuator_motors` and (optionally) writes a normalized overlay. Runs on the host
+(needs `pyulog`+`numpy`; `matplotlib` only for `--plot`) — the flight log need not be under the
+container mount.
+
+## Caveats
+- Values are not numerically equal across SITL vs flight (sim PWM-µs vs UAVCAN servo units vs ESC
+  units); compare normalized shape / frequency content, by function.
+- The swashplate is symmetric, so left/right servos are near-identical signals — the specific Servo
+  index within such a group is ambiguous by correlation; the `*_FUNC*` table gives the exact
+  per-channel mapping.
+- In SITL, `actuator_servos`/`actuator_motors` are logged ~10 Hz (aliased above ~5 Hz), but
+  `actuator_outputs_0` is ~235 Hz — use `actuator_outputs_0` for high-frequency analysis.

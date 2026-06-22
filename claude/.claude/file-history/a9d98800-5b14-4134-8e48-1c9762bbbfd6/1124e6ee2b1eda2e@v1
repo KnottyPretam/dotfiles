@@ -1,0 +1,27 @@
+#ifndef MS_GIMBALCONTROL_H
+#define MS_GIMBALCONTROL_H
+
+#include "kw_component.h"
+#include "ms_colibri_command_interface.h"
+#include "ms_globals.h"
+
+class ms_gimbalControl : public kw_component
+{
+public: 
+    ms_gimbalControl(const std::string& componentName);
+    ~ms_gimbalControl();
+
+    void createComponent(kw_observer* _outputObserver);
+
+    void mainThread(); // Runs a thread for this component
+
+    void rotation_test(void);
+
+    int direction = 1;
+
+
+protected:
+
+};
+
+#endif

@@ -1,0 +1,76 @@
+# Versatile sys-ID wrapper: roll/pitch/yaw, saved figures, ULog→MAT, shell driver
+
+## Context
+
+`/home/choudhury/tools/dev/sysID_wrapper/` holds one MATLAB script,
+`run_system_id_and_gain_design.m`. It does chirp system-identification of **one hardcoded axis
+(pitch = `rpy(:,2)`)** from a **hardcoded `.mat`**, fits a transfer function, designs cascaded
+rate+attitude gains, and plots Bode/coherence/PSD/loop-gain/step/**Nichols**. It never saves
+figures and can't be retargeted without editing source.
+
+Goal: turn this into a repeatable tool that (1) runs roll/pitch/yaw and saves all figures,
+(2) keeps the Nichols plots, (3) builds the input `.mat` from a ULog by replicating Thunderball's
+logic and saves that `.mat`, and (4) is driven by a shell wrapper accepting **either** a `.mat`
+or a `.ulg`.
+
+### Decisions (confirmed with user)
+- **Mat-gen:** self-contained copy of Thunderball's logic into the tool (no runtime dependency on the Thunderball repo).
+- **Output:** match the existing `output/<logname>_<timestamp>/` convention (figures/, csv/, the .mat, margins.txt, run.log).
+- **Tuning:** one shared target set for all three axes (matches the current script).
+- Defaults: keep inner+outer open-loop Nichols (saved per axis); figures saved as **PNG + .fig**; axis labels Roll/Pitch/Yaw (rate symbols P/Q/R).
+
+### Facts that drive the design (verified)
+- The script **already has Nichols** (`nichols_annotated` inner `Li` + outer `Lo`, lines 174–231) — only needs to run per-axis and be saved.
+- Axis = column of `rpy`: roll/pitch/yaw = 1/2/3 (script hardcodes `(:,2)` at lines 40 & 44).
+- The `.mat` the script loads is a struct **`d`** whose topics carry `.timestamp` (µs) and a derived **`.rpy`** Nx3. The `.rpy` fields are built in **`RunPlots.m` lines 90–125**, NOT in `ReadData.m`. `ReadData.m` only does `ulog2csv`→`readtable`. So a faithful converter must run those derivation blocks.
+- Helper figures use plain `figure('Name',…)` (no dock, no `close all`): `estimate_freq_response.m` → "PSD Calc -- Time/Freq Domain"; `compute_attitude_control_gains.m` → "Loop-Gain Bode", "Closed-Loop Bode", "Closed-Loop Step Response". ⇒ "save every open figure, then `close all`" captures all 9 figs/axis **without editing `sysID_tool`**.
+- Headless hazards are only the script header lines 4–5 (`'docked'` + `addToolbarExplorationButtons`); must be removed/guarded and figures created `'Visible','off'`.
+- Env OK: `matlab` at `/usr/local/bin/matlab`; pyulog (`ulog2csv`, `ulog_params`, …) on PATH at `~/.local/bin`; `MathUs.m` is self-contained and vendorable.
+- Runtime still depends on `/home/choudhury/repos/sysID_tool` (already `addpath`-ed by the script) — unchanged, not vendored.
+
+## Implementation
+
+All files created in `/home/choudhury/tools/dev/sysID_wrapper/`.
+
+### 1. Modify `run_system_id_and_gain_design.m` → a function
+`function results = run_system_id_and_gain_design(mat_path, out_dir, opts)`
+- `opts` defaults: `axes={'roll','pitch','yaw'}`, `wc_inner_Hz=3`, `wc_outer_Hz=1`, `PM_target_deg=60`, `coh_cutoff=0.8`, `freq_init_Hz=0.01`, `freq_end_Hz=5.5`, `visible=false`, `formats={'png','fig'}`.
+- Header made headless-safe: keep line-width/font/white-bg; drop docked + toolbar create-fcn; `set(groot,'DefaultFigureVisible','off')` with an `onCleanup` to restore. Keep `addpath` to sysID_tool + Utilities.
+- Load once: `d = load(mat_path).d`.
+- Loop axes; **wrap each axis in try/catch** so a weak/low-coherence axis (e.g. yaw) logs its error and still saves its figures without killing the run. Per axis (column `k`):
+  - Extract `command_*` from `d.vehicle_torque_setpoint_0` and `measured_*` from `d.vehicle_angular_velocity_0` using `rpy(:,k)`; interp + NaN-drop (current lines 39–55, parameterized by `k`).
+  - Run the existing pipeline (lines 59–209): detrend → `estimate_freq_response` → coherence cutoff (`opts.coh_cutoff`) → `estimate_tf_from_freq_response` → `compute_attitude_control_gains` → reconstruct `Li`/`Lo` → `nichols_annotated`. Axis-dependent figure names/titles/ylabels (e.g. "Pitch — Plant Bode", "Q (deg/s)").
+  - `save_all_figures(fullfile(out_dir,'figures',axis), opts.formats)` then `close all`.
+  - Collect `{num,den,tau,Kp_rate,Ki_rate,Kp_attitude,GM_dB,PM_deg}` into `results.(axis)`.
+- After loop: write `out_dir/margins.txt` (per-axis tf + gains + GM/PM) and `out_dir/results.mat` (`results`).
+- Subfunctions: `analyze_axis`, `save_all_figures` (iterate `findall(groot,'Type','figure')`, name from `fig.Name` else `figure_<n>`, `exportgraphics(...,'Resolution',150)` for PNG + `savefig` for .fig, with a sanitizer), keep `nichols_annotated`.
+- The disabled `if 0` simulation branch (lines 17–27) is dropped (incompatible with the axis loop; `generate_simulated_sys_id_data` still exists in sysID_tool if ever needed).
+
+### 2. New `MathUs.m` — vendored verbatim
+Copy `/home/choudhury/repos/kwx/Thunderball/UTILS/MathUs.m` unchanged (self-contained `classdef`). Provides `QuatToEuler`, `QuatRotB`/`QuatMult`, `EulerToQuat`, `RebaseTimeScale` used by the rpy blocks.
+
+### 3. New `ulog_to_mat.m` — self-contained converter (`mat_path = ulog_to_mat(ulg_path, run_dir)`)
+Replicates Thunderball's mat-gen, minimal subset:
+- `csvdir = run_dir/csv`; `system('ulog2csv -o "<csvdir>" "<ulg>"')`; also `ulog_params` → `run_dir/params.prm` (matches prior art).
+- Read `<csvdir>/<name>_*.csv` into `d.(topic)` via `readtable` (ReadData.m lines 18–38 logic, incl. the `msg_name` prefix/suffix strip), then `d = orderfields(d)`.
+- Run **RunPlots.m lines 90–125 verbatim** (the five `try` rpy-derivation blocks: vehicle_attitude_0, vehicle_angular_velocity_0, vehicle_rates_setpoint_0, vehicle_torque_setpoint_0, vehicle_attitude_setpoint_0). Deliberately **omit** the time-base section (62–78) and all position/esc/swash derivations — sys-ID doesn't use them, and omitting the time base removes RunPlots' hard `actuator_outputs_2` requirement.
+- Guard: if `vehicle_angular_velocity_0.rpy` / `vehicle_torque_setpoint_0.rpy` weren't built (e.g. log lacks `vtol_vehicle_status_0`, which the blocks need), error with a clear message.
+- `mat_path = run_dir/<name>.mat`; `save(mat_path,'d')`.
+
+### 4. New `run_sysid.m` — orchestrator (`run_sysid(input_path, run_dir, opts)`)
+- `addpath` the tool dir. If ext is `.ulg/.ulog` → `mat_path = ulog_to_mat(input_path, run_dir)`; if `.mat` → `mat_path = input_path`. Else error.
+- `run_system_id_and_gain_design(mat_path, run_dir, opts)`.
+
+### 5. New `run_sysid.sh` — shell wrapper
+- Usage: `run_sysid.sh <file.mat|file.ulg> [out_base_dir]`. `set -euo pipefail`.
+- Resolve absolute paths (`realpath`) and the script's own dir (to find the `.m` files regardless of cwd). Validate the file exists and ext ∈ {mat,ulg,ulog}.
+- `out_base = ${2:-<input_dir>/output}`; `rundir="$out_base/<name>_$(date +%Y%m%d_%H%M%S)"`; `mkdir -p`.
+- `export PATH="$HOME/.local/bin:$PATH"` (ensure `ulog2csv`); `MATLAB="${MATLAB:-matlab}"`.
+- `"$MATLAB" -batch "addpath('$SCRIPT_DIR'); run_sysid('$input','$rundir')" 2>&1 | tee "$rundir/run.log"`; propagate MATLAB's exit code (PIPESTATUS); print the output location.
+- Iteration tip (documented in usage): a first ULog run writes `<name>.mat` into the rundir; pass that `.mat` on later runs to skip re-extraction.
+
+## Verification
+1. **Mat fast-path:** `./run_sysid.sh /home/choudhury/analysis/flight_tests/oddjob/oddjob_chirps_05-19-26/flightLogs/OD1A053_rpyChirp_PA60.mat` → confirm `output/OD1A053_rpyChirp_PA60_<ts>/figures/{roll,pitch,yaw}/` each contain the 9 PNG+.fig (incl. the two Nichols), plus `margins.txt`, `results.mat`, `run.log`.
+2. **Pitch cross-check:** compare the new pitch Bode/gains against the original script's output for the same log (same math ⇒ should match within numerical noise).
+3. **ULog full-path:** `./run_sysid.sh .../OD1A053_rpyChirp_PA60.ulg` → confirm csv extracted under rundir/csv, `<name>.mat` saved, and in MATLAB `d.vehicle_angular_velocity_0.rpy` & `d.vehicle_torque_setpoint_0.rpy` are Nx3; then same figure/results outputs.
+4. **Re-run on generated mat** to confirm the fast iteration path.

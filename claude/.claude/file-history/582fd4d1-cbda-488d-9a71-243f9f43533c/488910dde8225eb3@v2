@@ -1,0 +1,29 @@
+---
+name: px4-notes-workflow
+description: "How the user wants PX4 deep-dive reference notes authored (format, tooling, conventions)"
+metadata: 
+  node_type: memory
+  type: project
+  originSessionId: 582fd4d1-cbda-488d-9a71-243f9f43533c
+---
+
+The user maintains a PX4 knowledge base at `~/knightwerx-vault/px4-notes/` and repeatedly asks for
+source-grounded deep-dive notes on PX4 subsystems (EKF2, IMU pipeline, multicopter control, etc.).
+
+Each note is delivered as **both `.md` and `.html`**, named `topic_YYYY-MM-DD.ext`, plus any
+**hand-authored `.svg`** block/pipeline diagrams named `topic_YYYY-MM-DD_<diagram>.svg`.
+
+House style (match existing notes, esp. `imu_clarification_2026-05-14.*`):
+- Lead with a `>` blockquote provenance header: document date, source repo, local path, **branch**,
+  **HEAD commit**, git describe.
+- TL;DR, then numbered sections, dense `file:line` tables, a parameter reference, a file reference.
+- Avoid `$...$` math (no MathJax) — use Unicode symbols + code/`pre` blocks.
+
+**Why:** it's a recurring deliverable with a consistent, exacting format and a strong correctness bar.
+
+**How to apply:** generate HTML with `pandoc <md> -s --toc --metadata title="…" -o <html>`. Author SVGs
+by hand/python (see [[px4-repo-environment]] — graphviz is NOT installed; inkscape validates them).
+Embed git provenance *inside* the note (commit `791030d721`, branch `hotfix` as of 2026-05-25) — do not
+commit to the PX4 repo. For EKF2 default values cite `ekf2_params.c` (the `common.h` `parameters` struct
+initializers are placeholders overwritten at boot). Prior EKF2 notes:
+`ekf2_estimator_pipeline_2026-05-25.*` (full pipeline) and `ekf2_height_ref_baro_2026-05-21.*` (height bias).

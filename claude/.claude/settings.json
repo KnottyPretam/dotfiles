@@ -1,0 +1,21 @@
+{
+  "enabledPlugins": {
+    "mempalace@mempalace": true,
+    "review-loop@hamel-review": true
+  },
+  "extraKnownMarketplaces": {
+    "mempalace": {
+      "source": {
+        "source": "github",
+        "repo": "MemPalace/mempalace"
+      }
+    },
+    "hamel-review": {
+      "source": {
+        "source": "github",
+        "repo": "hamelsmu/claude-review-loop"
+      }
+    }
+  },
+  "effortLevel": "xhigh"
+}

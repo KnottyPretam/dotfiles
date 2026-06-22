@@ -1,0 +1,441 @@
+function run_sysid(ulg_path, out_dir, config_json_path)
+% Top-level driver: ULG -> per-mode sysID -> margin report + plots.
+%
+% Usage:
+%   run_sysid('/path/to/log.ulg')                            % default cfg.regime = 'mc' (hover)
+%   run_sysid('/path/to/log.ulg', '/path/outdir')            % explicit outdir
+%   run_sysid('/path/to/log.ulg', '/path/outdir', '/cfg.json') % cfg overrides from JSON
+%
+% Edit the cfg block below to change regime ('mc' | 'fw' | 'both') or other knobs.
+% Whitelisted cfg knobs (wc_inner_Hz, wc_outer_Hz, PM_target_deg) can also be
+% overridden via a JSON sidecar — see run_sysid.sh for the YAML-driven path.
+
+% ===== Configuration =====
+cfg.axes                = {'roll','pitch','yaw'};
+cfg.regime              = 'mc';        % 'mc' (default, hover), 'fw' (cruise), or 'both'
+cfg.fmin_Hz             = 0.05;
+cfg.fmax_Hz             = 10;          % clamped to 0.4*fs at runtime
+cfg.coh_cutoff          = 0.6;
+cfg.np                  = 2;           % rate-plant denominator order
+cfg.nz                  = 0;           % rate-plant numerator order
+cfg.min_segment_s       = 10;          % skip mode if no contiguous segment >= this
+cfg.PM_target_deg       = 60;
+cfg.wc_inner_Hz         = 3;
+cfg.wc_outer_Hz         = 1;
+% =========================
+
+if nargin >= 3 && ~isempty(config_json_path)
+    if ~isfile(config_json_path)
+        error('config JSON not found: %s', config_json_path);
+    end
+    ovr = jsondecode(fileread(config_json_path));
+    cfg = apply_overrides(cfg, ovr, {'wc_inner_Hz','wc_outer_Hz','PM_target_deg'});
+    fprintf('[run_sysid] cfg overrides: wc_inner=%g wc_outer=%g PM=%g\n', ...
+            cfg.wc_inner_Hz, cfg.wc_outer_Hz, cfg.PM_target_deg);
+end
+
+here = fileparts(mfilename('fullpath'));
+addpath(here);
+addpath(fullfile(here, 'utils'));
+addpath('/home/choudhury/repos/sysID_tool');
+addpath('/home/choudhury/repos/sysID_tool/Utilities');
+
+if nargin < 2 || isempty(out_dir)
+    [~, base, ~] = fileparts(ulg_path);
+    out_dir = fullfile(pwd, 'output', [base '_' datestr(now,'yyyymmdd_HHMMSS')]);
+end
+if ~isfolder(out_dir); mkdir(out_dir); end
+fig_root = fullfile(out_dir, 'figures');
+
+set(0, 'DefaultFigureVisible', 'off');
+
+fprintf('[run_sysid] ulg=%s\n[run_sysid] out=%s\n[run_sysid] regime=%s\n', ...
+        ulg_path, out_dir, cfg.regime);
+
+% --- Stage 1: convert ULG ---
+[D, prm_path, ~] = ulg_to_csv(ulg_path, out_dir);
+params = parse_px4_params(prm_path);
+D = derive_signals(D);
+
+if ~isfield(D, 'vehicle_angular_velocity_0')
+    error('vehicle_angular_velocity_0 missing from log; cannot run sysID');
+end
+
+base_t  = D.vehicle_angular_velocity_0.t;
+vs_base = D.vehicle_angular_velocity_0.vtol_state;
+
+switch lower(cfg.regime)
+    case 'mc';   regimes = {'mc'};
+    case 'fw';   regimes = {'fw'};
+    case 'both'; regimes = {'mc','fw'};
+    otherwise; error('unknown regime: %s', cfg.regime);
+end
+
+seg_meta.mc = find_segments(base_t, vs_base, 3, cfg.min_segment_s);
+seg_meta.fw = find_segments(base_t, vs_base, 4, cfg.min_segment_s);
+
+results = [];
+gain_info = struct();
+plants = struct();
+
+for r = 1:numel(regimes)
+    mode = regimes{r};
+    seg = seg_meta.(mode);
+    fig_dir = fullfile(fig_root, mode);
+    if ~isfolder(fig_dir); mkdir(fig_dir); end
+
+    if isempty(seg.list)
+        fprintf('[%s] no segment >= %.1fs (total %.1fs)\n', upper(mode), cfg.min_segment_s, seg.total_s);
+        for ax = 1:numel(cfg.axes)
+            for src = {'logged','retuned'}
+                for ln = {'rate','attitude'}
+                    results = append_result(results, mode, cfg.axes{ax}, ln{1}, src{1}, [], ...
+                        sprintf('no segment >= %.1fs', cfg.min_segment_s));
+                end
+            end
+        end
+        save_timeline(D, seg, mode, fig_dir);
+        continue;
+    end
+
+    t_seg_t   = base_t(seg.selected_idx(1):seg.selected_idx(2));
+    dt        = median(diff(t_seg_t));
+    fs        = 1/dt;
+    fmax_use  = min(cfg.fmax_Hz, 0.4*fs);
+    if fmax_use < cfg.fmax_Hz
+        warning('[%s] fmax clamped from %.2f to %.2f Hz (0.4*fs)', mode, cfg.fmax_Hz, fmax_use);
+    end
+    fprintf('[%s] segment [%.1f - %.1f]s, dt=%.4f s, fs=%.1f Hz\n', ...
+            upper(mode), t_seg_t(1), t_seg_t(end), dt, fs);
+
+    make_angular_accel_fft(D, t_seg_t, fs, fig_dir, mode);
+
+    gain_info.(mode) = [];
+
+    for ax = 1:numel(cfg.axes)
+        ax_name = cfg.axes{ax};
+        fprintf('  [%s/%s] identifying...\n', mode, ax_name);
+
+        [P_rate, P_att, src_topic] = identify_axis(D, t_seg_t, ax, dt, cfg, fmax_use);
+        if isempty(src_topic)
+            results = append_result(results, mode, ax_name, 'rate',     'logged',  [], 'no torque/control topic');
+            results = append_result(results, mode, ax_name, 'attitude', 'logged',  [], 'no torque/control topic');
+            results = append_result(results, mode, ax_name, 'rate',     'retuned', [], 'no torque/control topic');
+            results = append_result(results, mode, ax_name, 'attitude', 'retuned', [], 'no torque/control topic');
+            continue;
+        end
+
+        [C_rate, C_att, info_g] = build_controller_tf(params, mode, ax_name);
+        gain_info.(mode) = append_gain_info(gain_info.(mode), info_g);
+
+        plants.(mode).(ax_name).rate         = pack_plant(P_rate);
+        plants.(mode).(ax_name).att          = pack_plant(P_att);
+        plants.(mode).(ax_name).logged_gains = info_g.gains;
+        plants.(mode).(ax_name).missing      = info_g.missing;
+
+        % --- Rate loop (logged) ---
+        if P_rate.ok && ~isempty(C_rate)
+            L_rate = analyze_loop(P_rate.tf_pade, C_rate, cfg.fmin_Hz, fmax_use);
+            if L_rate.ok
+                make_plots(P_rate, L_rate, fig_dir, mode, ax_name, 'rate', cfg.fmin_Hz, fmax_use);
+                results = append_result(results, mode, ax_name, 'rate', 'logged', row_from(L_rate), '');
+            else
+                results = append_result(results, mode, ax_name, 'rate', 'logged', [], L_rate.reason);
+            end
+        else
+            if ~P_rate.ok
+                r0 = ['plant: ' P_rate.reason];
+            else
+                r0 = 'C_rate empty (missing gains)';
+            end
+            results = append_result(results, mode, ax_name, 'rate', 'logged', [], r0);
+        end
+
+        % --- Attitude loop (logged): G_att = T_rate_closed / s ---
+        if P_rate.ok && ~isempty(C_rate) && ~isempty(C_att)
+            T_rate = feedback(series(C_rate, P_rate.tf_pade), 1);
+            G_att_outer = T_rate * tf(1, [1 0]);
+            L_att = analyze_loop(G_att_outer, C_att, cfg.fmin_Hz, fmax_use);
+            if L_att.ok
+                make_plots(P_att, L_att, fig_dir, mode, ax_name, 'attitude', cfg.fmin_Hz, fmax_use);
+                results = append_result(results, mode, ax_name, 'attitude', 'logged', row_from(L_att), '');
+            else
+                results = append_result(results, mode, ax_name, 'attitude', 'logged', [], L_att.reason);
+            end
+        else
+            if isempty(C_att)
+                results = append_result(results, mode, ax_name, 'attitude', 'logged', [], 'C_att empty (missing gain)');
+            else
+                results = append_result(results, mode, ax_name, 'attitude', 'logged', [], 'no rate plant');
+            end
+        end
+
+        % --- Retune comparison ---
+        if P_rate.ok
+            try
+                pre_figs = findall(0, 'Type', 'figure');
+                cmd = sprintf(['[Kp_rate_r, Ki_rate_r, Kp_att_r, ~, ~] = ' ...
+                               'compute_attitude_control_gains(P_rate.num, P_rate.den, P_rate.tau, %g, %g, %g);'], ...
+                               cfg.PM_target_deg, cfg.wc_inner_Hz, cfg.wc_outer_Hz);
+                evalc(cmd);
+                close(setdiff(findall(0,'Type','figure'), pre_figs));
+
+                s_ = tf('s');
+                C_rate_r = Kp_rate_r + Ki_rate_r/s_;
+                L_rate_r = analyze_loop(P_rate.tf_pade, C_rate_r, cfg.fmin_Hz, fmax_use);
+                if L_rate_r.ok
+                    results = append_result(results, mode, ax_name, 'rate', 'retuned', row_from(L_rate_r), '');
+                else
+                    results = append_result(results, mode, ax_name, 'rate', 'retuned', [], L_rate_r.reason);
+                end
+
+                T_rate_r = feedback(series(C_rate_r, P_rate.tf_pade), 1);
+                G_att_r  = T_rate_r * tf(1, [1 0]);
+                C_att_r  = tf(Kp_att_r, 1);
+                L_att_r  = analyze_loop(G_att_r, C_att_r, cfg.fmin_Hz, fmax_use);
+                if L_att_r.ok
+                    results = append_result(results, mode, ax_name, 'attitude', 'retuned', row_from(L_att_r), '');
+                else
+                    results = append_result(results, mode, ax_name, 'attitude', 'retuned', [], L_att_r.reason);
+                end
+            catch err
+                close(setdiff(findall(0,'Type','figure'), pre_figs));
+                results = append_result(results, mode, ax_name, 'rate',     'retuned', [], err.message);
+                results = append_result(results, mode, ax_name, 'attitude', 'retuned', [], err.message);
+            end
+        else
+            results = append_result(results, mode, ax_name, 'rate',     'retuned', [], 'no plant');
+            results = append_result(results, mode, ax_name, 'attitude', 'retuned', [], 'no plant');
+        end
+
+        close(findall(0, 'Type', 'figure'));
+    end
+
+    save_timeline(D, seg, mode, fig_dir);
+end
+
+% --- Save and report ---
+save(fullfile(out_dir, 'results.mat'), 'results', 'cfg', 'gain_info', 'seg_meta', '-v7.3');
+
+plants.cfg = struct('fmin_Hz', cfg.fmin_Hz, ...
+                    'fmax_Hz', cfg.fmax_Hz, ...
+                    'axes',    {cfg.axes}, ...
+                    'regime',  cfg.regime);
+save(fullfile(out_dir, 'plants.mat'), 'plants', '-v7.3');
+
+meta.ulg               = ulg_path;
+meta.timestamp         = datestr(now, 'yyyy-mm-dd HH:MM:SS');
+meta.regime            = cfg.regime;
+meta.fmin              = cfg.fmin_Hz;
+meta.fmax              = cfg.fmax_Hz;
+meta.coh_cutoff        = cfg.coh_cutoff;
+meta.min_seg_s         = cfg.min_segment_s;
+meta.deflection_source = 'vehicle_torque_setpoint_0 (with virtual_mc/virtual_fw/actuator_controls_0 fallbacks)';
+meta.vtol_summary      = sprintf('VTOL state totals: MC=%.1fs FW=%.1fs (min segment %.1fs)', ...
+                                 seg_meta.mc.total_s, seg_meta.fw.total_s, cfg.min_segment_s);
+meta.segments          = seg_meta;
+meta.gain_info         = gain_info;
+
+write_margin_report(fullfile(out_dir, 'margins.txt'), results, meta);
+fprintf('[run_sysid] done. outdir=%s\n', out_dir);
+end
+
+
+% ====================== helpers ======================
+
+function seg = find_segments(t, vtol_state, target, min_s)
+sl = segment_by_vtol_state(t, vtol_state, target, min_s);
+seg.list = zeros(size(sl,1), 2);
+seg.total_s = 0;
+seg.selected = [NaN NaN];
+seg.selected_idx = [NaN NaN];
+if ~isempty(sl)
+    for k = 1:size(sl,1)
+        seg.list(k,:) = [t(sl(k,1)), t(sl(k,2))];
+        seg.total_s = seg.total_s + (t(sl(k,2)) - t(sl(k,1)));
+    end
+    durs = diff(seg.list, 1, 2);
+    [~, j] = max(durs);
+    seg.selected = seg.list(j,:);
+    seg.selected_idx = sl(j,:);
+end
+end
+
+function [P_rate, P_att, u_topic] = identify_axis(D, t_seg, ax_idx, dt, cfg, fmax)
+P_rate = empty_id('not run');
+P_att  = empty_id('not run');
+
+src_topics = {'vehicle_torque_setpoint_0', 'vehicle_torque_setpoint_virtual_mc_0', ...
+              'vehicle_torque_setpoint_virtual_fw_0', 'actuator_controls_0_0'};
+u_topic = '';
+for s = 1:numel(src_topics)
+    if isfield(D, src_topics{s}) && isfield(D.(src_topics{s}), 'rpy')
+        u_topic = src_topics{s}; break;
+    end
+end
+if isempty(u_topic); return; end
+
+t_u  = D.(u_topic).t;
+u_   = D.(u_topic).rpy(:, ax_idx);
+t_av = D.vehicle_angular_velocity_0.t;
+y_av = D.vehicle_angular_velocity_0.rpy(:, ax_idx);
+t_at = D.vehicle_attitude_0.t;
+y_at = D.vehicle_attitude_0.rpy(:, ax_idx);
+
+t_grid = (t_seg(1):dt:t_seg(end))';
+u_grid       = interp_safe(t_u,  u_,   t_grid);
+y_rate_grid  = interp_safe(t_av, y_av, t_grid);
+y_att_grid   = interp_safe(t_at, y_at, t_grid);
+
+% Shift to start at 0 — keeps the cubic-fit Vandermonde matrix well-conditioned
+% inside nonlinear_detrend, and estimate_freq_response only uses relative time.
+t_zero = t_grid - t_grid(1);
+
+u_grid      = nonlinear_detrend(u_grid,      t_zero);
+y_rate_grid = nonlinear_detrend(y_rate_grid, t_zero);
+y_att_grid  = nonlinear_detrend(y_att_grid,  t_zero);
+
+P_rate = identify_plant(u_grid, y_rate_grid, t_zero, cfg.fmin_Hz, fmax, cfg.np,   cfg.nz, cfg.coh_cutoff);
+P_att  = identify_plant(u_grid, y_att_grid,  t_zero, cfg.fmin_Hz, fmax, cfg.np+1, cfg.nz, cfg.coh_cutoff);
+end
+
+function y = interp_safe(t_src, x_src, t_dst)
+[t_src, ix] = unique(t_src, 'stable');
+x_src = x_src(ix);
+y = interp1(t_src, x_src, t_dst, 'linear', 'extrap');
+end
+
+function P = empty_id(reason)
+P = struct('freq',[],'mag_dB',[],'phase',[],'coh',[], ...
+           'freq_gated',[],'mag_gated',[],'phase_gated',[],'coh_gated',[], ...
+           'num',[],'den',[],'tau',NaN,'tf',[],'tf_pade',[],'ok',false,'reason',reason);
+end
+
+function row = row_from(L)
+row.GM_dB   = L.GM_dB;
+row.PM_deg  = L.PM_deg;
+row.wc_Hz   = L.wc_Hz;
+row.VM      = L.VM;
+row.DGM_dB  = L.DGM_dB;
+row.DPM_deg = L.DPM_deg;
+end
+
+function results = append_result(results, mode, ax_name, loop, source, row, reason)
+r.mode = mode; r.axis = ax_name; r.loop = loop; r.source = source;
+r.row = row; r.reason = reason;
+if isempty(results); results = r; else; results(end+1) = r; end
+end
+
+function arr = append_gain_info(arr, info_g)
+if isempty(arr); arr = info_g; else; arr(end+1) = info_g; end
+end
+
+function S = pack_plant(P)
+S = struct('tf', P.tf, 'tf_pade', P.tf_pade, ...
+           'num', P.num, 'den', P.den, 'tau', P.tau, ...
+           'ok', P.ok, 'reason', P.reason);
+end
+
+function cfg = apply_overrides(cfg, ovr, keys)
+for k = 1:numel(keys)
+    if isfield(ovr, keys{k}) && isnumeric(ovr.(keys{k})) && isfinite(ovr.(keys{k}))
+        cfg.(keys{k}) = ovr.(keys{k});
+    end
+end
+end
+
+function make_angular_accel_fft(D, t_seg, fs, fig_dir, mode)
+% Discrete FFT of vehicle angular acceleration (per body axis) over the analysis
+% segment, 0-50 Hz, linear scale. PX4 fuses angular acceleration onto
+% vehicle_angular_velocity as the xyz_derivative_* fields (filtered at
+% IMU_DGYRO_CUTOFF and consumed by the rate-loop D term).
+
+if ~isfield(D, 'vehicle_angular_velocity_0'); return; end
+av = D.vehicle_angular_velocity_0;
+if ~isfield(av, 'xyz_derivative_0_') || ~isfield(av, 't')
+    warning('[%s] xyz_derivative_* not present in vehicle_angular_velocity_0; skipping FFT plot', mode);
+    return;
+end
+
+xyz_d = [av.xyz_derivative_0_, av.xyz_derivative_1_, av.xyz_derivative_2_];
+t_src = av.t;
+
+% Body-frame -> rpy following derive_signals.m's convention for the active mode.
+if strcmpi(mode, 'fw')
+    xyz_d = [-xyz_d(:,3), xyz_d(:,2), xyz_d(:,1)];
+end
+
+dt = 1/fs;
+t_grid = (t_seg(1):dt:t_seg(end))';
+[t_u, ix] = unique(t_src, 'stable');
+xyz_d = xyz_d(ix, :);
+ang_acc = interp1(t_u, xyz_d, t_grid, 'linear', 'extrap');
+
+n = numel(t_grid);
+ang_acc = ang_acc - mean(ang_acc, 1);
+w = hann(n);
+Y = fft(ang_acc .* w, [], 1);
+
+half = 1:floor(n/2)+1;
+f = (0:n-1).' * (fs/n);
+f = f(half);
+mag = abs(Y(half, :)) * (2/sum(w));
+
+fmax_plot = min(50, fs/2);
+mask = f <= fmax_plot;
+
+axes_names = {'roll','pitch','yaw'};
+fig = figure('Name', ['Ang-Accel-FFT-' mode], 'Visible', 'off', 'Color', 'w', ...
+             'Position', [100 100 1000 800]);
+for ax = 1:3
+    subplot(3,1,ax);
+    plot(f(mask), mag(mask, ax), 'LineWidth', 1.0); grid on;
+    ylabel(sprintf('|FFT(%s)| (rad/s^2)', axes_names{ax}));
+    if ax == 1
+        title(sprintf('Angular acceleration FFT — %s segment, %.1f s, fs=%.1f Hz', ...
+                      upper(mode), t_seg(end)-t_seg(1), fs));
+    end
+    if ax == 3
+        xlabel('Frequency (Hz)');
+    end
+    xlim([0 fmax_plot]);
+end
+
+try
+    exportgraphics(fig, fullfile(fig_dir, 'angular_accel_fft.png'), 'Resolution', 200);
+catch err
+    warning('PNG save failed for angular_accel_fft: %s', err.message);
+end
+try
+    savefig(fig, fullfile(fig_dir, 'angular_accel_fft.fig'));
+catch err
+    warning('FIG save failed for angular_accel_fft: %s', err.message);
+end
+close(fig);
+end
+
+function save_timeline(D, seg_struct, mode, fig_dir)
+if ~isfolder(fig_dir); mkdir(fig_dir); end
+fig = figure('Name', ['Timeline-' mode], 'Visible', 'off', 'Color', 'w', ...
+             'Position', [100 100 1000 400]);
+t  = D.vehicle_angular_velocity_0.t;
+vs = D.vehicle_angular_velocity_0.vtol_state;
+plot(t, vs, 'b-'); hold on; grid on;
+ylim([-0.5 4.5]);
+ylabel('vtol\_state (0=undef 1=t2fw 2=t2mc 3=MC 4=FW)');
+xlabel('time (s)');
+title(sprintf('VTOL state — %s mode segments (total %.1fs)', upper(mode), seg_struct.total_s));
+yl = ylim;
+for j = 1:size(seg_struct.list, 1)
+    s = seg_struct.list(j, 1); e = seg_struct.list(j, 2);
+    patch([s e e s], [yl(1) yl(1) yl(2) yl(2)], [1 0.85 0.6], ...
+          'FaceAlpha', 0.3, 'EdgeColor', 'none');
+end
+try
+    exportgraphics(fig, fullfile(fig_dir, 'timeline.png'), 'Resolution', 200);
+    savefig(fig, fullfile(fig_dir, 'timeline.fig'));
+catch err
+    warning('timeline save failed: %s', err.message);
+end
+close(fig);
+end

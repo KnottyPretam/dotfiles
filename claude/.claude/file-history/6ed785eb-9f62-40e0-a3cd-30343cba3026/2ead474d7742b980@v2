@@ -1,0 +1,155 @@
+# Plan: In-place interactive updates + PNG/PKL save + clickable points for `px4_realtime_plot.py`
+
+## Context
+
+`px4_realtime_plot.py` is a single-file real-time PX4 telemetry plotter over MAVLink. It already
+creates up to four figure windows **once** at startup and reuses them — but on every ~1 Hz refresh,
+`_draw_ned()` / `_draw_att()` call `ax.clear()` and re-`plot()` every series from scratch
+(`px4_realtime_plot.py:424`, `:456`). Clearing the axes each second **resets the user's zoom/pan**
+and **destroys every line artist**, so the windows can't actually be inspected interactively and any
+attempt to click a data point would be wiped within a second. That is why it "feels like new plots."
+
+This change makes the windows truly update **in place** (persistent artists updated with
+`set_data`), keeps them **interactive** (zoom/pan persists; clicking a point drops a value label),
+and saves **exactly one PNG and one PKL per figure** (overwritten on the existing save triggers,
+never per-refresh).
+
+User decisions captured:
+- **Clicking → `mplcursors`** (new dependency) with **accumulating labels** (click to add multiple;
+  a key clears them all).
+- Saving stays on the current edge triggers (arm→disarm / link-drop / Ctrl-C), one file each,
+  overwritten — *not* per refresh.
+
+Backend confirmed at runtime is `gtk4agg` (a real interactive toolbar exists), and figure pickling
+does **not** crash with interactive callbacks attached (matplotlib drops callbacks on pickle).
+
+## Approach
+
+Refactor the drawing layer from **clear + replot** to **create-once + `set_data`**:
+
+1. **Create all persistent Line2D artists once** in `make_figures()`, build the legend once, attach
+   one `mplcursors` cursor per figure, and connect a "clear labels" key handler.
+2. **Each refresh, update artists with `set_data`** (no `ax.clear()`), hide absent series, and
+   autoscale **only while the user hasn't zoomed/panned**.
+3. **Save one PNG + one PKL per figure** on the existing triggers.
+
+### Data structure change
+
+`figs` changes from `{key: (fig, ax3)}` to `{key: (fig, ax3, artists, cursor)}`, where `artists` is a
+list of 3 per-row dicts of named Line2D handles:
+- NED figures (`position`, `velocity`): `{"ekf", "sig_hi", "sig_lo", "gps", "sp"}`
+- attitude figures (`attitude`, `attitude_rate`): `{"act", "sp"}`
+
+Keeping `cursor` in the tuple holds a live reference (so mplcursors isn't garbage-collected) and lets
+`save_figs` clear its annotations before pickling.
+
+### File: `px4_realtime_plot.py` (the only source file — single-module project)
+
+**Imports (`:37`–`:47`)**
+- Add `import pickle` with the stdlib imports.
+- Add `import mplcursors` near `matplotlib`/`numpy`/`pymavlink` (hard dependency, matching the
+  existing import style).
+
+**`make_figures(keys)` (`:357`–`:367`)** — now builds artists + legend + cursor:
+- Keep `plt.subplots(3,1,sharex=True)`, `suptitle`, `_label_axes()` (`:351`), `tight_layout()`.
+- For each row, create the empty persistent lines using the **same styles/labels currently used** in
+  `_draw_ned`/`_draw_att` (e.g. `ax.plot([], [], "C0-", lw=1.3, label="EKF")`, the two `"C0:"` σ
+  lines with the `r"$\pm 3\sigma$"` label on the first only, `"C1." ms=3 label="GPS"`,
+  `"C3--" lw=1.1 label="setpoint"`; for att: `"C0-" label="actual"`, `"C3--" label="setpoint"`).
+  Add small helpers `_build_ned_artists(ax3)` / `_build_att_artists(ax3)` returning the per-row dicts
+  (mirrors the existing `_draw_ned`/`_draw_att` split).
+- Build the legend **once** on row 0 (`ax3[0].legend(loc="upper right", fontsize=8, ncol=4|2)`),
+  matching the current `ncol` per figure type. (Minor behavior change: a legend entry for a series
+  that never receives data, e.g. GPS, will still show — acceptable; whole dead figures are already
+  filtered out by `active_figures()` at `:370`.)
+- Create one `mplcursors.cursor(clickable, multiple=True)` per figure, where `clickable` is the
+  data-bearing lines **excluding the two ±3σ lines** (ekf/gps/sp, or act/sp).
+- Connect a `key_press_event` handler (closure over that cursor) that, on key **`d`**, removes all of
+  that figure's selections (`for sel in list(cursor.selections): cursor.remove_selection(sel)`;
+  verify exact mplcursors API at implementation time). `d` is unbound in matplotlib's default keymap
+  (`c`/`v`/`s`/etc. are taken).
+- Return `figs[key] = (fig, ax3, artists, cursor)`.
+
+**`_draw_ned(ax3, artists, snap, kind)` (`:411`–`:442`)** — replace body, keep the math:
+- Keep kind→keys/labels selection and the `t_loc,t_cov,t_gps,t_sp` extraction.
+- Remove `ax.clear()`, per-frame `set_ylabel`/`grid`/`legend`/`set_xlabel` (now set once).
+- Per row, on the persistent handles: when data exists, `line.set_data(x, y); line.set_visible(True)`;
+  otherwise `line.set_data([], []); line.set_visible(False)`. Keep the ±3σ `np.isfinite` mask +
+  `np.interp` logic verbatim and feed it into `sig_hi`/`sig_lo`.
+- After updating the 3 rows, autoscale **only if the user hasn't navigated** (see helper below):
+  `ax.relim(visible_only=True); ax.autoscale_view()` per row.
+
+**`_draw_att(ax3, artists, snap, kind)` (`:445`–`:464`)** — same pattern; keep `rad2deg`
+conversion; `set_data` on `act`/`sp`; same autoscale guard.
+
+**New helper `_user_has_navigated(fig)`** (place near the draw functions):
+```python
+def _user_has_navigated(fig):
+    tb = getattr(fig.canvas, "toolbar", None)
+    ns = getattr(tb, "_nav_stack", None)
+    try:
+        return bool(ns and ns())   # empty nav stack -> falsy; after zoom/pan -> truthy; Home clears it
+    except Exception:
+        return False
+```
+This gives the desired UX: zoom/pan sticks, and the toolbar **Home** button re-enables auto-follow.
+Guarded so headless/`Agg` (`toolbar is None`) just autoscales.
+
+**`redraw(snap, figs)` (`:467`–`:475`)** — unpack the 4-tuple and pass `artists` through to the draw
+functions (dispatch unchanged).
+
+**`draw_all()` (`:577`–`:581`)** — fix the unpack: `for fig, *_ in figs.values(): fig.canvas.draw_idle()`.
+
+**`save_figs(figs, reason)` (`:486`–`:494`)** — add PKL alongside PNG, robustly:
+1. For each figure, `fig.savefig(<base>.png, dpi=140, bbox_inches="tight")` **first** (captures any
+   on-screen labels into the PNG).
+2. Clear each figure's mplcursors selections (mplcursors annotations are draggable and hold canvas
+   references; clearing avoids any draggable-annotation pickling issue and keeps the `.pkl` portable).
+3. `with open(<base>.pkl, "wb") as fh: pickle.dump(fig, fh)`.
+
+Fixed filenames from `FIGURE_FILENAMES` (`:478`), overwritten — **one PNG + one PKL per figure**.
+Triggers unchanged (`:610`, `:618`). `save_figs` needs access to each figure's cursor → it's in the
+4-tuple, so no signature change beyond unpacking.
+
+**Docstring (`:5`–`:32`)** — update minimally:
+- `:22` "Saves timestamped PNGs..." → reflect "one PNG + one pickled figure per plot, fixed
+  filenames, overwritten on each save trigger."
+- `:16`–`:18` "save PNGs" → "save PNG+PKL".
+- `:30` deps → add `mplcursors`.
+- Optionally note: click points to drop value labels (`d` clears them); `.pkl` reopens with
+  `pickle.load(...)` + `plt.show()`.
+
+### Reused existing pieces (do not rewrite)
+- `snapshot()` (`:385`) — unchanged; still the source of `snap`.
+- `_label_axes()` (`:351`), `FIGURE_SPECS` (`:339`), `FIGURE_FILENAMES` (`:478`),
+  `active_figures()` (`:370`) — unchanged.
+- The ±3σ `np.interp` masking and `rad2deg` conversion — preserved verbatim inside the new
+  `set_data` paths.
+- The main loop, threading, trigger logic, save triggers — untouched except the `draw_all` unpack.
+
+## Known limitations (intended, out of scope)
+- A reloaded `.pkl` reopens as a zoom/pan-able figure but **without** live click handlers (matplotlib
+  drops callbacks on pickle). Re-enabling clicking on a reloaded pkl would need a tiny loader that
+  re-attaches a cursor — not included unless requested.
+- mplcursors is a **hard import**; the script will require `pip install mplcursors` to start.
+
+## Verification
+
+Prerequisite: `pip install mplcursors`.
+
+1. **Headless smoke (no vehicle), in `/tmp` only:** `MPLBACKEND=Agg`, `import px4_realtime_plot as P`;
+   `figs = P.make_figures(("position","attitude"))`; build a fake `snap` matching the keys in
+   `snapshot()` (`:390`–`:407`) including empty + NaN arrays; `P.redraw(snap, figs)`; assert
+   data-bearing lines have the expected `len(get_xdata())` and absent series are `not get_visible()`.
+   Then `P.save_figs(figs, "smoke")` in a temp CWD and assert `position_ned.png` **and**
+   `position_ned.pkl` exist and `pickle.load(...)` round-trips. Confirms create-once + set_data +
+   PNG/PKL save without hardware.
+2. **Synthetic MAVLink replay (optional, higher fidelity):** a loopback `udpout:127.0.0.1:14551`
+   sender emitting `HEARTBEAT` (toggling `MAV_MODE_FLAG_SAFETY_ARMED` to fire the disarm save edge),
+   `LOCAL_POSITION_NED`(+`_COV`), `GPS_RAW_INT`, `ATTITUDE`, `ATTITUDE_TARGET`; run the real script
+   `--trigger arm` against it. Validates the reader thread, discovery, refresh loop, and that disarm
+   writes exactly one PNG + one PKL per figure (and overwrites them on the next disarm).
+3. **Manual interactive acceptance (with display, `gtk4agg`):** confirm (a) zoom/pan **persists**
+   across refreshes; (b) toolbar **Home** re-enables auto-follow; (c) clicking points **drops value
+   labels that accumulate**, and pressing **`d`** clears them; (d) on disarm exactly one `*.png` +
+   one `*.pkl` per figure are written and overwritten next time.

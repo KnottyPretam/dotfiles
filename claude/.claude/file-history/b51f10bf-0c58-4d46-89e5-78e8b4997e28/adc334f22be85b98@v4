@@ -1,0 +1,51 @@
+services:
+  px4_dev:
+    image: gitlab.knightwerx.com:5050/kwgit/px4/px4-autopilot/knightwerx_gazebo:v1.0.3
+    container_name: px4_${PX4_CONTAINER_SUFFIX:-dev}
+    user: px4
+    privileged: true
+    network_mode: bridge
+
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # Bridge networking + no published ports => SITL's MAVLink (14540/14550/14580
+    # etc.) lives ONLY inside the container and never binds host ports. The whole
+    # host 145xx range stays free for real flight test / HIL.
+    #
+    # DO NOT switch to `network_mode: host` and DO NOT publish 145xx on the host,
+    # or you'll collide with flight test / HIL. If you need to reach the container's
+    # MAVLink from the host (e.g. QGC), publish on a SHIFTED host range (2xxxx ->
+    # container 145xx) so the real 145xx ports remain untouched:
+    # ports:
+    #   - "24550:14550/udp"   # host 24550 -> container 14550 (QGC / GCS link)
+    #   - "24560:14560/udp"   # host 24560 -> container 14560 (MAVProxy)
+    #   - "28570:18570/udp"   # host 28570 -> container 18570 (SITL offboard)
+    #   - "25600:5600/udp"    # host 25600 -> container 5600  (Gazebo video)
+
+    environment:
+      - UID=${UID:-1000}
+      - GID=${GID:-1000}
+      - DISPLAY=${DISPLAY:-:0}
+      - GST_UDP_PORT=5600
+      - GST_UDP_HOST=host.docker.internal
+      - GAZEBO_MASTER_URI=http://localhost:11345
+      - GAZEBO_MODEL_DATABASE_URI=http://models.gazebosim.org
+      - GAZEBO_MODEL_PATH=${PX4_HOST_REPO:?run via devcon.sh}/Tools/simulation/gazebo-classic/sitl_gazebo-classic/models:/usr/share/gazebo-11/models
+      - GAZEBO_RESOURCE_PATH=/usr/share/gazebo-11
+      - GAZEBO_PLUGIN_PATH=${PX4_HOST_REPO:?run via devcon.sh}/build/px4_sitl_default/build_gazebo-classic:/usr/lib/x86_64-linux-gnu/gazebo-11/plugins
+      - QT_X11_NO_MITSHM=1
+      - PATH=/opt/gcc-arm-11.2-2022.02-x86_64-arm-none-eabi/bin:/home/px4/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+    volumes:
+      - ${PX4_HOST_REPO:?run via devcon.sh}:${PX4_HOST_REPO:?run via devcon.sh}:rw
+      - ${HOME}/.ssh:/home/px4/.ssh:ro
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - /dev:/dev:rw
+      - ./px4_sitl_runner_requirements.txt:/tmp/px4_sitl_runner_requirements.txt:ro
+
+    working_dir: ${PX4_HOST_REPO:?run via devcon.sh}
+    command: >
+      bash -lc "if [ -s /tmp/px4_sitl_runner_requirements.txt ]; then pip install --user --no-warn-script-location --break-system-packages -r /tmp/px4_sitl_runner_requirements.txt; fi; exec sleep infinity"
+    stdin_open: true
+    tty: true

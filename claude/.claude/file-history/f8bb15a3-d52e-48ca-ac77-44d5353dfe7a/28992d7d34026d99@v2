@@ -1,0 +1,44 @@
+function mark_nichols_freqs(f_Hz, phase_deg, mag_dB, fmin_Hz, fmax_Hz, color, nmax)
+% Overlay sparse frequency markers + labels on the current Nichols axes.
+%
+% f_Hz, phase_deg, mag_dB : dense arrays of the already-plotted curve. Markers
+%   snap to the nearest sample so they sit exactly on the line (this dodges any
+%   phase-wrap mismatch from recomputing angle() at the marker frequencies).
+% fmin_Hz, fmax_Hz        : band to place markers within.
+% color                   : marker/text color (default 'k').
+% nmax                    : max number of markers (default 8) to avoid clutter.
+%
+% Marker frequencies are a 1-2-5-per-decade set clipped to [fmin,fmax] and
+% sub-sampled down to nmax if needed.
+
+if nargin < 6 || isempty(color); color = 'k'; end
+if nargin < 7 || isempty(nmax);  nmax = 8;    end
+
+f_Hz = f_Hz(:); phase_deg = phase_deg(:); mag_dB = mag_dB(:);
+cand = nice_freqs(fmin_Hz, fmax_Hz, nmax);
+
+hold on;
+for i = 1:numel(cand)
+    [~, idx] = min(abs(f_Hz - cand(i)));
+    plot(phase_deg(idx), mag_dB(idx), 'o', 'MarkerSize', 5, ...
+         'MarkerFaceColor', color, 'MarkerEdgeColor', color, ...
+         'HandleVisibility', 'off');
+    text(phase_deg(idx), mag_dB(idx), sprintf('  %s Hz', num2str(cand(i))), ...
+         'FontSize', 8, 'Color', color, 'VerticalAlignment', 'bottom', ...
+         'HandleVisibility', 'off');
+end
+end
+
+
+function fc = nice_freqs(fmin, fmax, nmax)
+mant = [1 2 5];
+fc = [];
+for k = floor(log10(max(fmin, eps))):ceil(log10(max(fmax, eps)))
+    fc = [fc, mant*10^k]; %#ok<AGROW>
+end
+fc = unique(fc(fc >= fmin & fc <= fmax));
+if numel(fc) > nmax
+    idx = unique(round(linspace(1, numel(fc), nmax)));
+    fc = fc(idx);
+end
+end

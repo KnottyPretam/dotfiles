@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -e
+export PX4_HOST_REPO="${PX4_HOST_REPO:-$PWD}"
+export PX4_CONTAINER_SUFFIX="${PX4_CONTAINER_SUFFIX:-$(basename "$PWD" | tr 'A-Z' 'a-z')}"
+COMPOSE_FILE="${HOME}/tools/dev/docker_runner/docker-compose.dev.yaml"
+PROJECT_NAME="px4_${PX4_CONTAINER_SUFFIX}"
+docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" up -d px4_dev
+exec docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" exec px4_dev bash

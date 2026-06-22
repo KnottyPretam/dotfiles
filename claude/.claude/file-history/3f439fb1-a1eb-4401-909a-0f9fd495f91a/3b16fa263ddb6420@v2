@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""Reconstruct NED position/velocity from the IMU the way PX4 EKF2 does it in its
+predict step (Ekf::predictState, src/modules/ekf2/EKF/ekf.cpp:253) but WITHOUT the
+Kalman/error-state correction -- i.e. pure strapdown dead-reckoning of the IMU.
+
+The reconstruction is overlaid against:
+  * the EKF's own NED estimate with +/-3 sigma bounds (estimator_states covariance diagonal),
+  * GPS converted into the same local NED frame.
+
+This shows how much the EKF is actually doing: GPS (RTK) is truth, the EKF estimate
+should sit inside its +/-3 sigma band, and the IMU-only trace should drift away.
+
+Mode implemented: full strapdown (attitude + velocity + position integrated from the
+IMU) with the EKF gyro/accel bias sampled once at init and held constant. Initialized
+from the EKF state at the first time the EKF solution/origin is valid, then run free.
+
+Outputs go into <cwd>/<out-dir>/ (default 'figures'): a PNG and a pickled matplotlib
+Figure (reopen later with pickle.load(...) + plt.show()).
+"""
+
+import argparse
+import os
+import pickle
+import sys
+
+import numpy as np
+
+# PX4 constants (src/lib/geo/geo.h)
+CONST_G = 9.80665           # CONSTANTS_ONE_G  [m/s^2]
+R_EARTH = 6371000.0         # CONSTANTS_RADIUS_OF_EARTH  [m]
+
+
+# --------------------------------------------------------------------------- #
+# ULog access helpers
+# --------------------------------------------------------------------------- #
+def get_dataset(ulog, name, multi_id=0):
+    for d in ulog.data_list:
+        if d.name == name and d.multi_id == multi_id:
+            return d
+    return None
+
+
+def require(ds, name):
+    if ds is None:
+        sys.exit(f"ERROR: required topic '{name}' not found in log")
+    return ds
+
+
+def vec3(ds, base):
+    """Stack 'base[0..2]' fields into an (N, 3) array."""
+    return np.column_stack([ds.data[f"{base}[{i}]"] for i in range(3)])
+
+
+def tsec(ds):
+    return np.asarray(ds.data["timestamp"], dtype=np.float64) * 1e-6
+
+
+# --------------------------------------------------------------------------- #
+# NED projection -- replicates PX4 MapProjection (azimuthal equidistant, src/lib/geo/geo.cpp)
+# --------------------------------------------------------------------------- #
+class MapProjection:
+    def __init__(self, ref_lat_deg, ref_lon_deg):
+        self.ref_lat = np.radians(ref_lat_deg)
+        self.ref_lon = np.radians(ref_lon_deg)
+        self.sin_lat = np.sin(self.ref_lat)
+        self.cos_lat = np.cos(self.ref_lat)
+
+    def project(self, lat_deg, lon_deg):
+        """(lat, lon) in degrees -> (north, east) in metres."""
+        lat = np.radians(np.asarray(lat_deg, dtype=np.float64))
+        lon = np.radians(np.asarray(lon_deg, dtype=np.float64))
+        sl, cl = np.sin(lat), np.cos(lat)
+        cd = np.cos(lon - self.ref_lon)
+        arg = np.clip(self.sin_lat * sl + self.cos_lat * cl * cd, -1.0, 1.0)
+        c = np.arccos(arg)
+        sinc = np.sin(c)
+        k = np.where(np.abs(c) > 1e-12, c / np.where(sinc == 0.0, 1.0, sinc), 1.0)
+        x = k * (self.cos_lat * sl - self.sin_lat * cl * cd) * R_EARTH
+        y = k * cl * np.sin(lon - self.ref_lon) * R_EARTH
+        return x, y
+
+
+# --------------------------------------------------------------------------- #
+# Quaternion helpers -- scalar-first [w, x, y, z], Hamilton product (PX4 matrix::Quatf)
+# --------------------------------------------------------------------------- #
+def quat_mult(q, r):
+    w0, x0, y0, z0 = q
+    w1, x1, y1, z1 = r
+    return np.array([
+        w0 * w1 - x0 * x1 - y0 * y1 - z0 * z1,
+        w0 * x1 + x0 * w1 + y0 * z1 - z0 * y1,
+        w0 * y1 - x0 * z1 + y0 * w1 + z0 * x1,
+        w0 * z1 + x0 * y1 - y0 * x1 + z0 * w1,
+    ])
+
+
+def quat_to_dcm(q):
+    """Body -> earth rotation matrix (matches PX4 Dcmf(Quatf))."""
+    w, x, y, z = q
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z),     2 * (x * z + w * y)],
+        [2 * (x * y + w * z),     1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y),     2 * (y * z + w * x),     1 - 2 * (x * x + y * y)],
+    ])
+
+
+def axis_angle_to_quat(v):
+    """Rotation vector -> quaternion (matches AxisAnglef -> Quatf)."""
+    theta = float(np.linalg.norm(v))
+    if theta < 1e-9:
+        q = np.array([1.0, 0.5 * v[0], 0.5 * v[1], 0.5 * v[2]])
+        return q / np.linalg.norm(q)
+    s = np.sin(0.5 * theta) / theta
+    return np.array([np.cos(0.5 * theta), s * v[0], s * v[1], s * v[2]])
+
+
+def qnorm(q):
+    return q / np.linalg.norm(q)
+
+
+# --------------------------------------------------------------------------- #
+# IMU delta source (abstraction so a future full-rate vehicle_imu just plugs in)
+# --------------------------------------------------------------------------- #
+def _deltas_from_sensor_combined(ulog):
+    d = require(get_dataset(ulog, "sensor_combined", 0), "sensor_combined")
+    t = tsec(d)
+    gyro = vec3(d, "gyro_rad")                 # rad/s, body FRD
+    accel = vec3(d, "accelerometer_m_s2")      # m/s^2, body FRD
+    # Integrate each sample over its own integration window (= predictState's
+    # delta_*_dt). Logging dropouts are spliced over rather than stretched: this
+    # keeps per-step attitude increments tiny, so a multi-second gap does not inject
+    # a huge one-step rotation that would leak gravity into the horizontal channels.
+    dt_ang = np.asarray(d.data["gyro_integral_dt"], dtype=np.float64) * 1e-6
+    dt_vel = np.asarray(d.data["accelerometer_integral_dt"], dtype=np.float64) * 1e-6
+    return t, gyro * dt_ang[:, None], accel * dt_vel[:, None], dt_ang, dt_vel
+
+
+def _deltas_from_vehicle_imu(ulog):
+    d = require(get_dataset(ulog, "vehicle_imu", 0), "vehicle_imu")
+    t = tsec(d)
+    dang = vec3(d, "delta_angle")              # rad (already integrated)
+    dvel = vec3(d, "delta_velocity")           # m/s (already integrated)
+    dt_ang = np.asarray(d.data["delta_angle_dt"], dtype=np.float64) * 1e-6
+    dt_vel = np.asarray(d.data["delta_velocity_dt"], dtype=np.float64) * 1e-6
+    return t, dang, dvel, dt_ang, dt_vel
+
+
+def get_imu_deltas(ulog, source):
+    """Return (label, t[s], dang[N,3], dvel[N,3], dt_ang[N], dt_vel[N])."""
+    if source == "auto":
+        vi = get_dataset(ulog, "vehicle_imu", 0)
+        rate = 0.0
+        if vi is not None:
+            t = tsec(vi)
+            rate = (len(t) - 1) / (t[-1] - t[0]) if len(t) > 1 else 0.0
+        source = "vehicle_imu" if rate > 50.0 else "sensor_combined"
+
+    if source == "vehicle_imu":
+        return ("vehicle_imu",) + _deltas_from_vehicle_imu(ulog)
+    return ("sensor_combined",) + _deltas_from_sensor_combined(ulog)
+
+
+# --------------------------------------------------------------------------- #
+# Initialization: t_init, NED origin, and seed state/bias from the EKF
+# --------------------------------------------------------------------------- #
+def find_init(ulog, inst):
+    elp = require(get_dataset(ulog, "estimator_local_position", inst),
+                  "estimator_local_position")
+    ref_lat = np.asarray(elp.data["ref_lat"], dtype=np.float64)
+    valid = np.isfinite(ref_lat) & (np.abs(ref_lat) > 1e-9)
+    if not valid.any():
+        sys.exit("ERROR: EKF local origin (ref_lat) is never valid in this log")
+    i0 = int(np.argmax(valid))
+    t_init = float(tsec(elp)[i0])
+    ref = (float(elp.data["ref_lat"][i0]),
+           float(elp.data["ref_lon"][i0]),
+           float(elp.data["ref_alt"][i0]))
+
+    es = require(get_dataset(ulog, "estimator_states", inst), "estimator_states")
+    te = tsec(es)
+    k = int(np.argmin(np.abs(te - t_init)))
+    q0 = qnorm(np.array([es.data[f"states[{i}]"][k] for i in range(0, 4)], dtype=np.float64))
+    v0 = np.array([es.data[f"states[{i}]"][k] for i in range(4, 7)], dtype=np.float64)
+    p0 = np.array([es.data[f"states[{i}]"][k] for i in range(7, 10)], dtype=np.float64)
+
+    b_gyro, b_accel, bias_src = _frozen_bias(ulog, inst, t_init, es, te, k)
+    return dict(t_init=t_init, ref=ref, q0=q0, v0=v0, p0=p0,
+                b_gyro=b_gyro, b_accel=b_accel, bias_src=bias_src)
+
+
+def _frozen_bias(ulog, inst, t_init, es, te, k):
+    """Gyro/accel bias in rate units [rad/s], [m/s^2], frozen at t_init."""
+    sb = get_dataset(ulog, "estimator_sensor_bias", inst) or \
+        get_dataset(ulog, "estimator_sensor_bias", 0)
+    if sb is not None and "gyro_bias[0]" in sb.data:
+        j = int(np.argmin(np.abs(tsec(sb) - t_init)))
+        b_gyro = np.array([sb.data[f"gyro_bias[{i}]"][j] for i in range(3)], dtype=np.float64)
+        b_accel = np.array([sb.data[f"accel_bias[{i}]"][j] for i in range(3)], dtype=np.float64)
+        return b_gyro, b_accel, "estimator_sensor_bias"
+    # Fallback: state stores integrated bias (delta_ang_bias [rad], delta_vel_bias [m/s]);
+    # divide by the average EKF step to get rate units (getGyroBias/getAccelBias, ekf.h).
+    dt_ekf = float(np.median(np.diff(te)))
+    b_gyro = np.array([es.data[f"states[{i}]"][k] for i in range(10, 13)], dtype=np.float64) / dt_ekf
+    b_accel = np.array([es.data[f"states[{i}]"][k] for i in range(13, 16)], dtype=np.float64) / dt_ekf
+    return b_gyro, b_accel, f"states/dt_ekf({dt_ekf*1e3:.2f}ms)"
+
+
+# --------------------------------------------------------------------------- #
+# Strapdown integration -- mirrors Ekf::predictState minus the Kalman update
+# --------------------------------------------------------------------------- #
+def strapdown(t, dang, dvel, dt_ang, dt_vel, init):
+    """Integrate from the EKF seed state at t_init to the end of the log."""
+    q = qnorm(init["q0"].copy())
+    v = init["v0"].astype(np.float64).copy()
+    p = init["p0"].astype(np.float64).copy()
+    b_gyro, b_accel = init["b_gyro"], init["b_accel"]
+
+    idx = np.where(t > init["t_init"])[0]
+    out_t = [init["t_init"]]
+    out_v = [v.copy()]
+    out_p = [p.copy()]
+    out_qn = [1.0]
+    for i in idx:
+        dta, dtv = float(dt_ang[i]), float(dt_vel[i])
+        dang_c = dang[i] - b_gyro * dta          # de-bias delta angle  (rate*dt_ang)
+        dvel_c = dvel[i] - b_accel * dtv         # de-bias delta velocity
+        q = qnorm(quat_mult(q, axis_angle_to_quat(dang_c)))   # q (x) dq
+        dvel_e = quat_to_dcm(q) @ dvel_c         # body -> earth
+        v_last = v.copy()
+        v = v + dvel_e
+        v[2] += CONST_G * dtv                    # +g on the Down axis
+        p = p + 0.5 * (v_last + v) * dtv         # trapezoidal position
+        out_t.append(t[i])
+        out_v.append(v.copy())
+        out_p.append(p.copy())
+        out_qn.append(float(np.linalg.norm(q)))
+    return (np.asarray(out_t), np.asarray(out_v),
+            np.asarray(out_p), np.asarray(out_qn))
+
+
+# --------------------------------------------------------------------------- #
+# GPS -> NED
+# --------------------------------------------------------------------------- #
+def gps_to_ned(ulog, proj, ref_alt):
+    g = get_dataset(ulog, "vehicle_gps_position", 0) or get_dataset(ulog, "sensor_gps", 0)
+    g = require(g, "vehicle_gps_position/sensor_gps")
+    t = tsec(g)
+    fix = np.asarray(g.data["fix_type"])
+    vvalid = np.asarray(g.data["vel_ned_valid"]).astype(bool)
+    lat = np.asarray(g.data["lat"], dtype=np.float64) * 1e-7
+    lon = np.asarray(g.data["lon"], dtype=np.float64) * 1e-7
+    alt = np.asarray(g.data["alt"], dtype=np.float64) * 1e-3
+    x, y = proj.project(lat, lon)
+    z = -(alt - ref_alt)                         # NED down (positive down)
+    vel = np.column_stack([g.data["vel_n_m_s"], g.data["vel_e_m_s"], g.data["vel_d_m_s"]])
+    return dict(t=t, pos=np.column_stack([x, y, z]), pos_ok=(fix >= 3),
+                vel=vel, vel_ok=(vvalid & (fix >= 3)))
+
+
+# --------------------------------------------------------------------------- #
+# EKF estimate + 3-sigma
+# --------------------------------------------------------------------------- #
+def ekf_estimate(ulog, inst):
+    es = require(get_dataset(ulog, "estimator_states", inst), "estimator_states")
+    te = tsec(es)
+    pos = np.column_stack([es.data[f"states[{i}]"] for i in range(7, 10)])
+    vel = np.column_stack([es.data[f"states[{i}]"] for i in range(4, 7)])
+    cov_p = np.column_stack([es.data[f"covariances[{i}]"] for i in range(7, 10)])
+    cov_v = np.column_stack([es.data[f"covariances[{i}]"] for i in range(4, 7)])
+    s3_p = 3.0 * np.sqrt(np.clip(cov_p, 0.0, None))
+    s3_v = 3.0 * np.sqrt(np.clip(cov_v, 0.0, None))
+    return dict(t=te, pos=pos, vel=vel, s3_pos=s3_p, s3_vel=s3_v)
+
+
+# --------------------------------------------------------------------------- #
+# Plot
+# --------------------------------------------------------------------------- #
+def _fit_ylim(ax, arrays):
+    lo, hi = np.inf, -np.inf
+    for a in arrays:
+        a = np.asarray(a)
+        if a.size:
+            lo = min(lo, np.nanmin(a))
+            hi = max(hi, np.nanmax(a))
+    if np.isfinite(lo) and np.isfinite(hi):
+        m = 0.1 * ((hi - lo) if hi > lo else 1.0)
+        ax.set_ylim(lo - m, hi + m)
+
+
+def make_figure(plt, ekf, gps, rec, t_init, t0, imu_label, full_scale, title):
+    fig, axes = plt.subplots(3, 2, figsize=(14, 10), sharex=True)
+    names = ["North", "East", "Down"]
+
+    for r in range(3):
+        for col, (key, s3key, ylab) in enumerate(
+                [("pos", "s3_pos", "pos [m]"), ("vel", "s3_vel", "vel [m/s]")]):
+            ax = axes[r, col]
+            est = ekf[key][:, r]
+            s3 = ekf[s3key][:, r]
+            ax.fill_between(ekf["t"] - t0, est - s3, est + s3,
+                            color="C0", alpha=0.20, lw=0, label="EKF $\\pm3\\sigma$")
+            ax.plot(ekf["t"] - t0, est, "C0", lw=1.0, label="EKF estimate")
+            ok = gps[f"{key}_ok"]
+            ax.plot(gps["t"][ok] - t0, gps[key][ok, r], ".", color="C1", ms=3,
+                    label="GPS")
+            ax.plot(rec["t"] - t0, rec[key][:, r], "C3", lw=1.0,
+                    label="IMU recon (no EKF)")
+            ax.axvline(t_init - t0, ls="--", color="k", lw=0.8, alpha=0.5)
+            ax.set_ylabel(f"{names[r]} {ylab}")
+            ax.grid(True, alpha=0.3)
+            if not full_scale:
+                _fit_ylim(ax, [est - s3, est + s3, gps[key][ok, r]])
+
+    axes[0, 0].set_title("NED Position")
+    axes[0, 1].set_title("NED Velocity")
+    axes[2, 0].set_xlabel("time [s]")
+    axes[2, 1].set_xlabel("time [s]")
+
+    handles, labels = axes[0, 0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="upper center", ncol=4, frameon=False,
+               bbox_to_anchor=(0.5, 0.945))
+    fig.suptitle(title, y=0.992, fontsize=9)
+    fig.tight_layout(rect=[0, 0, 1, 0.92])
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("ulog", help="path to the .ulg file")
+    ap.add_argument("--out-dir", default="figures",
+                    help="output directory created under the current working dir (default: figures)")
+    ap.add_argument("--imu-source", choices=["sensor_combined", "vehicle_imu", "auto"],
+                    default="sensor_combined",
+                    help="IMU topic to integrate (default: sensor_combined)")
+    ap.add_argument("--ekf-instance", type=int, default=0,
+                    help="estimator instance to use (default: 0, the primary)")
+    ap.add_argument("--full-scale", action="store_true",
+                    help="autoscale y to include the (diverging) IMU recon")
+    ap.add_argument("--show", action="store_true", help="display the figure interactively")
+    args = ap.parse_args()
+
+    ulog_path = os.path.abspath(os.path.expanduser(args.ulog))
+    if not os.path.isfile(ulog_path):
+        sys.exit(f"ERROR: log not found: {ulog_path}")
+
+    import matplotlib
+    if not args.show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from pyulog import ULog
+
+    print(f"Loading {ulog_path} ...")
+    ulog = ULog(ulog_path)
+    inst = args.ekf_instance
+
+    # IMU deltas
+    imu_label, t, dang, dvel, dt_ang, dt_vel = get_imu_deltas(ulog, args.imu_source)
+    span = float(t[-1] - t[0])
+    wall_gap = np.diff(t)                                  # inter-sample wall time
+    nominal = float(np.median(dt_vel))
+    dropped = wall_gap[wall_gap > 3 * nominal]             # logging dropouts
+    drop_time = float(dropped.sum() - len(dropped) * nominal) if len(dropped) else 0.0
+    print(f"IMU source: {imu_label}  ({len(t)} samples, ~{(len(t)-1)/span:.1f} Hz over {span:.1f}s)")
+    print(f"  integration window ~{nominal*1e3:.2f} ms; integrated time={float(dt_vel.sum()):.1f}s; "
+          f"max gap={wall_gap.max()*1e3:.0f} ms; dropout time={drop_time:.1f}s "
+          f"({100*drop_time/span:.0f}% of span, spliced over)")
+
+    # Init from EKF
+    init = find_init(ulog, inst)
+    print(f"Init at t={init['t_init']:.1f}s  (EKF origin "
+          f"lat={init['ref'][0]:.7f} lon={init['ref'][1]:.7f} alt={init['ref'][2]:.2f})")
+    print(f"  seed pos={np.round(init['p0'],3)} vel={np.round(init['v0'],3)} "
+          f"quat={np.round(init['q0'],4)}")
+    print(f"  frozen bias [{init['bias_src']}]: gyro={np.round(init['b_gyro'],5)} rad/s, "
+          f"accel={np.round(init['b_accel'],4)} m/s^2")
+
+    # Strapdown reconstruction
+    rt, rv, rp, rqn = strapdown(t, dang, dvel, dt_ang, dt_vel, init)
+    rec = dict(t=rt, pos=rp, vel=rv)
+
+    # EKF estimate + GPS in the shared NED frame
+    ekf = ekf_estimate(ulog, inst)
+    proj = MapProjection(init["ref"][0], init["ref"][1])
+    gps = gps_to_ned(ulog, proj, init["ref"][2])
+
+    # Diagnostics
+    t0 = float(ekf["t"][0])
+    ke = int(np.argmin(np.abs(ekf["t"] - rt[-1])))
+    drift = rp[-1] - ekf["pos"][ke]
+    print(f"||q|| over run: min={rqn.min():.4f} max={rqn.max():.4f}")
+    print(f"IMU-only drift vs EKF at t={rt[-1]:.0f}s: NED={np.round(drift,1)} m, "
+          f"|horiz|={np.hypot(drift[0],drift[1]):.1f} m, |vert|={abs(drift[2]):.1f} m")
+
+    # GPS-vs-EKF consistency (interp EKF onto GPS times) -- validates origin/projection
+    okp = gps["pos_ok"]
+    ep = np.column_stack([np.interp(gps["t"][okp], ekf["t"], ekf["pos"][:, r]) for r in range(3)])
+    rms_p = np.sqrt(np.mean((gps["pos"][okp] - ep) ** 2, axis=0))
+    okv = gps["vel_ok"]
+    ev = np.column_stack([np.interp(gps["t"][okv], ekf["t"], ekf["vel"][:, r]) for r in range(3)])
+    rms_v = np.sqrt(np.mean((gps["vel"][okv] - ev) ** 2, axis=0))
+    print(f"GPS vs EKF RMS: pos NED={np.round(rms_p,2)} m, vel NED={np.round(rms_v,3)} m/s")
+
+    # Figure
+    title = (f"{os.path.basename(ulog_path)}   —   IMU-only recon "
+             f"(src={imu_label}, full strapdown, EKF bias frozen)  vs  EKF (±3σ)  vs  GPS")
+    fig = make_figure(plt, ekf, gps, rec, init["t_init"], t0, imu_label,
+                      args.full_scale, title)
+
+    # Save PNG + pickled Figure under <cwd>/<out-dir>/
+    out_dir = os.path.join(os.getcwd(), args.out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+    base = os.path.splitext(os.path.basename(ulog_path))[0] + "_ned_reconstruction"
+    png_path = os.path.join(out_dir, base + ".png")
+    pkl_path = os.path.join(out_dir, base + ".fig.pkl")
+    fig.savefig(png_path, dpi=150)
+    with open(pkl_path, "wb") as f:
+        pickle.dump(fig, f)
+    print(f"Saved: {png_path}")
+    print(f"Saved: {pkl_path}")
+    print(f"  reopen: python3 -c \"import pickle,matplotlib.pyplot as plt; "
+          f"pickle.load(open('{pkl_path}','rb')); plt.show()\"")
+
+    if args.show:
+        plt.show()
+
+
+if __name__ == "__main__":
+    main()

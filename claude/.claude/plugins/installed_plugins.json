@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "plugins": {
+    "mempalace@mempalace": [
+      {
+        "scope": "user",
+        "installPath": "/home/choudhury/.claude/plugins/cache/mempalace/mempalace/3.3.3",
+        "version": "3.3.3",
+        "installedAt": "2026-04-30T12:26:08.968Z",
+        "lastUpdated": "2026-04-30T12:26:08.968Z",
+        "gitCommitSha": "fdfaf017abd54270fe44fe8faa5528c42e7d47f3"
+      }
+    ],
+    "review-loop@hamel-review": [
+      {
+        "scope": "user",
+        "installPath": "/home/choudhury/.claude/plugins/cache/hamel-review/review-loop/1.8.0",
+        "version": "1.8.0",
+        "installedAt": "2026-06-05T21:20:26.184Z",
+        "lastUpdated": "2026-06-05T21:20:26.184Z",
+        "gitCommitSha": "244f4c7bc15e98552af7cc5a67e70dfcdea9ab12"
+      }
+    ]
+  }
+}

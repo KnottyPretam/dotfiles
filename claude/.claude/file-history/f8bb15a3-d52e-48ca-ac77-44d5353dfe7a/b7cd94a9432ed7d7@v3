@@ -1,0 +1,235 @@
+# Plan: `compare_inputs` — verify whether torque-setpoint vs. rates-setpoint as the sysID input gives the same identified plant
+
+## Context
+
+`run_sysid.m:241-242` selects the identification input `u` from a fallback chain `{vehicle_torque_setpoint_0, vehicle_torque_setpoint_virtual_mc_0, vehicle_torque_setpoint_virtual_fw_0, actuator_controls_0_0}` — i.e., the **rate controller's output**. The output `y` is `vehicle_angular_velocity_0.rpy` — i.e., the gyro. So today's identification yields the **open-loop plant** `P_rate(s)` (vehicle dynamics from commanded torque to body rates).
+
+The user wants to verify whether substituting `u = vehicle_rates_setpoint_0.rpy` (the rate controller's *input* = the attitude controller's *output*) would produce the same identified TF.
+
+**Topology fact** (settled before measurement):
+
+```
+rates_setpoint ─→[+]─ err ─→ C_rate ─ torque_setpoint ─→ P_rate ─ rates ─┐
+                ↑                                                          │
+                └──────────────────────────────────────────────────────────┘
+```
+
+- `torque_setpoint → rates` identifies `P_rate` (the plant).
+- `rates_setpoint → rates` identifies `T_rate = C_rate·P_rate / (1 + C_rate·P_rate)` (the *closed-loop* rate transfer).
+
+These are mathematically different objects:
+- `P_rate` is integrator-like at low frequency (`|H| ∝ 1/ω`, near-infinite DC gain).
+- `T_rate` is low-pass-like in band (`|H| ≈ 1` at DC if the loop has integral action, rolling off above `wc`).
+
+The verification empirically confirms this in the user's data and quantifies the gap.
+
+User decisions (from clarification):
+- Permanent repo artifact (`compare_inputs.m` + `compare_inputs.sh`).
+- Fresh ULG via full pipeline (mirrors `run_sysid.sh`'s flow).
+- Output: per-axis overlay Bode (mag, phase, coherence) for both inputs, plus a text verdict.
+
+---
+
+## Files
+
+| Path | Action | Purpose |
+|---|---|---|
+| `compare_inputs.m` | new | MATLAB driver: ULG → CSV → identify P twice per axis → overlay Bode + verdict. |
+| `compare_inputs.sh` | new | Bash wrapper that mirrors `run_sysid.sh`. |
+
+No changes to existing files. No new helpers in `utils/` — the existing `identify_plant.m`, `derive_signals.m`, `ulg_to_csv.m`, `segment_by_vtol_state.m`, and `parse_px4_params.m` are reused as-is.
+
+---
+
+## Reused functions
+
+- `ulg_to_csv.m` — converts ULG → CSV + loads `D`.
+- `derive_signals.m` — adds `.t`, `.vtol_state`, `.rpy` to relevant topics (already includes `vehicle_rates_setpoint_0` at lines 70-81).
+- `segment_by_vtol_state.m` — to find the longest contiguous mc/fw segment.
+- `identify_plant.m` — called *twice* per (mode, axis), once with each `u`. Returns frequency response + TF fit.
+- The interpolation/detrending pattern from `run_sysid.m::identify_axis` (lines 251-272) — `interp_safe` + `nonlinear_detrend` on the time-aligned grid — gets re-used; the cleanest path is to duplicate the ~15 lines in `compare_inputs.m` rather than refactor.
+
+---
+
+## `compare_inputs.m` — sketch
+
+Signature: `compare_inputs(ulg_path, out_dir)` — mirrors `run_sysid.m` shape.
+
+Config: `cfg.regime = 'mc'` (default), `cfg.fmin_Hz = 0.05`, `cfg.fmax_Hz = 10`, `cfg.coh_cutoff = 0.6`, `cfg.np = 2`, `cfg.nz = 0`, `cfg.min_segment_s = 10`. Same defaults as `run_sysid.m` so the comparison is apples-to-apples.
+
+Main flow:
+
+```matlab
+function compare_inputs(ulg_path, out_dir)
+% Sanity check: does using vehicle_rates_setpoint as the sysID input yield
+% the same identified TF as using vehicle_torque_setpoint?
+% Expected: NO — torque is the plant input (identifies P_rate),
+% rates_setpoint is the plant input *to the closed rate loop* (identifies T_rate).
+
+% addpath + cfg + out_dir setup mirror run_sysid.m lines 24-37
+
+[D, ~, ~] = ulg_to_csv(ulg_path, out_dir);
+D = derive_signals(D);
+
+required = {'vehicle_angular_velocity_0','vehicle_rates_setpoint_0','vehicle_torque_setpoint_0'};
+for k = 1:numel(required)
+    if ~isfield(D, required{k}) || ~isfield(D.(required{k}), 'rpy')
+        error('missing topic or .rpy: %s', required{k});
+    end
+end
+
+base_t  = D.vehicle_angular_velocity_0.t;
+vs_base = D.vehicle_angular_velocity_0.vtol_state;
+
+% Pick mc segment (or fw with --regime fw via cfg toggle — defaulted to mc).
+sl = segment_by_vtol_state(base_t, vs_base, 3, cfg.min_segment_s);
+if isempty(sl); error('no MC segment >= %.1fs', cfg.min_segment_s); end
+[~, j] = max(sl(:,2)-sl(:,1));
+t_seg = base_t(sl(j,1):sl(j,2));
+dt    = median(diff(t_seg));
+fmax  = min(cfg.fmax_Hz, 0.4/dt);
+t_zero = (t_seg - t_seg(1));
+
+fig_dir = fullfile(out_dir, 'figures', 'mc');
+if ~isfolder(fig_dir); mkdir(fig_dir); end
+
+verdicts = {};
+for ax = 1:3
+    ax_name = cfg.axes{ax};
+
+    % Common output signal
+    y = interp_safe(D.vehicle_angular_velocity_0.t, ...
+                    D.vehicle_angular_velocity_0.rpy(:,ax), t_seg);
+    y = nonlinear_detrend(y, t_zero);
+
+    % Input A: torque_setpoint (current run_sysid choice)
+    u_A = interp_safe(D.vehicle_torque_setpoint_0.t, ...
+                      D.vehicle_torque_setpoint_0.rpy(:,ax), t_seg);
+    u_A = nonlinear_detrend(u_A, t_zero);
+    P_A = identify_plant(u_A, y, t_zero, cfg.fmin_Hz, fmax, cfg.np, cfg.nz, cfg.coh_cutoff);
+
+    % Input B: rates_setpoint (the alternative being verified)
+    u_B = interp_safe(D.vehicle_rates_setpoint_0.t, ...
+                      D.vehicle_rates_setpoint_0.rpy(:,ax), t_seg);
+    u_B = nonlinear_detrend(u_B, t_zero);
+    P_B = identify_plant(u_B, y, t_zero, cfg.fmin_Hz, fmax, cfg.np, cfg.nz, cfg.coh_cutoff);
+
+    plot_overlay(P_A, P_B, fig_dir, ax_name);
+    verdicts{end+1} = compute_verdict(P_A, P_B, ax_name, cfg);
+end
+
+write_verdict_report(fullfile(out_dir, 'compare_inputs.txt'), verdicts, ulg_path, cfg);
+fprintf('[compare_inputs] done. outdir=%s\n', out_dir);
+end
+```
+
+Helpers in the same file:
+
+- **`plot_overlay(P_A, P_B, fig_dir, axis_name)`** — single figure per axis, 3 subplots (mag dB, phase deg, coherence). Each subplot shows two curves (A: torque→rates, B: rates_sp→rates) plus measured-FRF dots in two colors. If `P_A.tf` and/or `P_B.tf` fit successfully, also overlay each TF's `freqresp` line. Save as `compare_<axis>_bode.png` + `.fig`. Style mirrors `make_plots.m::Bode` (lines 14-49).
+
+- **`compute_verdict(P_A, P_B, axis_name, cfg)`** — measures the gap on the joint-coherent band (where both `P_A.coh` and `P_B.coh` exceed `cfg.coh_cutoff` after interpolating both onto a common log-spaced frequency grid in `[fmin, fmax]`). Returns a struct:
+  ```
+  v.axis            = 'roll'
+  v.f_band          = [f_lo, f_hi]
+  v.mag_rms_dB      = RMS of (mag_A - mag_B) in dB on the joint band
+  v.mag_max_dB      = max |mag_A - mag_B| in dB
+  v.phase_rms_deg   = RMS of unwrapped phase diff on the joint band
+  v.coh_min         = min(P_A.coh, P_B.coh) on the joint band
+  v.A_DC_dB         = mag of P_A at the lowest joint-coherent frequency
+  v.B_DC_dB         = same for P_B (expected ~0 dB if B is closed-loop, very large if it's the plant)
+  v.verdict         = 'SAME' if mag_rms_dB<3 and phase_rms_deg<10, else 'DIFFER'
+  v.reason          = if DIFFER, a sentence: 'P_A identifies open-loop plant (DC gain X dB); P_B identifies closed-loop rate response (DC gain Y dB).'
+  ```
+
+- **`write_verdict_report(path, verdicts, ulg_path, cfg)`** — emits `compare_inputs.txt`:
+  ```
+  ULG: /path/to/log.ulg
+  Run: 2026-05-18 17:34:21
+  Topology check: u_A = vehicle_torque_setpoint_0.rpy, u_B = vehicle_rates_setpoint_0.rpy, y = vehicle_angular_velocity_0.rpy
+  Frequency band evaluated: 0.050–10.000 Hz   Coherence cutoff: 0.60
+
+  Axis    Band [Hz]       |Δmag| RMS    |Δmag| max    |Δphase| RMS    A(DC)   B(DC)   Verdict
+  roll    0.10–9.50       8.4 dB        12.3 dB       42.1 deg         -6 dB   +1 dB   DIFFER
+  pitch   ...
+  yaw     ...
+
+  Interpretation:
+    Input A (torque_setpoint -> rates) identifies the open-loop plant P_rate(s).
+    Input B (rates_setpoint  -> rates) identifies the closed-loop rate transfer T_rate(s)
+      = C_rate*P_rate / (1 + C_rate*P_rate).
+    These are different objects in the rate-control loop topology, so they should not
+    match in general. The verdict above quantifies the gap for this dataset.
+  ```
+
+- **`interp_safe`** and **`nonlinear_detrend`** — already exist in `run_sysid.m` (line 275) and `sysID_tool` respectively. I duplicate the 4-line `interp_safe` locally (same pattern as `run_sysid.m::identify_axis`) and call `nonlinear_detrend` from the path added at the top.
+
+---
+
+## `compare_inputs.sh` — sketch
+
+```bash
+#!/usr/bin/env bash
+# Sanity-check that vehicle_torque_setpoint vs. vehicle_rates_setpoint as the sysID input
+# do NOT give the same identified TF (the former identifies P_rate, the latter T_rate).
+#
+# Usage: ./compare_inputs.sh /path/to/log.ulg
+
+set -euo pipefail
+
+ulg="${1:?usage: compare_inputs.sh <path.ulg>}"
+if [[ ! -r "$ulg" || "$ulg" != *.ulg ]]; then
+    echo "not a readable .ulg: $ulg" >&2
+    exit 1
+fi
+
+ulg_abs="$(readlink -f "$ulg")"
+ts="$(date +%Y%m%d_%H%M%S)"
+base="$(basename "$ulg_abs" .ulg)"
+here="$(cd "$(dirname "$0")" && pwd)"
+cwd="$(pwd)"
+outdir="${cwd}/output/compare_inputs_${base}_${ts}"
+mkdir -p "$outdir"
+log="${outdir}/run.log"
+
+cd "$here"
+nohup matlab -batch "compare_inputs('${ulg_abs}','${outdir}')" > "$log" 2>&1 &
+pid=$!
+echo "PID=$pid"
+echo "log=$log"
+echo "outdir=$outdir"
+```
+
+Exact same structure as `run_sysid.sh`, only the wrapped MATLAB call and the output dir prefix differ.
+
+---
+
+## Output layout
+
+```
+<cwd>/output/compare_inputs_<base>_<ts>/
+├── params.prm
+├── csv/                        (full topic dump from ulog2csv)
+├── run.log
+├── compare_inputs.txt          (verdict table + interpretation)
+└── figures/mc/
+    ├── compare_roll_bode.png + .fig
+    ├── compare_pitch_bode.png + .fig
+    └── compare_yaw_bode.png + .fig
+```
+
+---
+
+## Verification (how the user checks the script itself does what it claims)
+
+1. **Topology assumption holds.** On any flight ULG, run `./compare_inputs.sh log.ulg`. Open `compare_inputs.txt`. For each axis, expect `Verdict = DIFFER` with a |Δmag| RMS substantially greater than 3 dB (typically 5-15 dB) — confirming the two inputs identify different TFs in this user's data, as predicted by loop topology.
+
+2. **Visual sanity on the Bode overlays.**
+   - Input A (`torque → rates`) should drop ~20 dB/decade at low frequencies (integrator-like) — the open-loop plant.
+   - Input B (`rates_sp → rates`) should sit near 0 dB at low frequencies and roll off above the rate-loop crossover — closed-loop tracking.
+   - Phase difference is large at low f and converges as both curves dive at high f.
+
+3. **Cross-check against the existing run.** Run `./run_sysid.sh log.ulg` on the same log. Confirm `compare_inputs_<...>/figures/mc/compare_<axis>_bode.png` Input-A curve matches the plant Bode from the corresponding `output/log_<...>/figures/mc/mc_<axis>_rate_bode.png`. (They use the same input/output choice and the same identification settings.)
+
+4. **Degenerate-case check.** If a ULG was logged without a rate-controller active (open-loop manual flight), Input A and Input B would converge (both are just the open-loop plant under a passthrough). On a normally-flown log this should *not* happen — the verdict should reliably be DIFFER.
+
+5. **No regressions to existing pipeline.** `run_sysid.m`, `replay_margins.m`, and their shells are untouched. Re-run `run_sysid.sh` on a known log and confirm `results.mat`, `plants.mat`, and `margins.txt` are byte-identical to a prior run on the same input.

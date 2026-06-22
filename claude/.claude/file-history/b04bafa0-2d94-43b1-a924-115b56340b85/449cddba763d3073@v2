@@ -1,0 +1,232 @@
+# px4_realtime_plot.py — trigger modes, active-only plots, attitude plots
+
+## Context
+
+`px4_realtime_plot.py` is a single-file real-time MAVLink plotter. Today it only
+refreshes/saves while the vehicle is **armed** (using arm state as a proxy for
+"SD logger recording"), plots only **Position NED** and **Velocity NED**, has no
+attitude plots, and reads message fields directly (`msg.x`) with no existence
+guards. It connects via `udpin:127.0.0.1:14551`, which correctly matches the
+`[UdpEndpoint plotter]` (127.0.0.1:14551, Mode=Normal) in
+`~/.config/mavlink-router/main.conf` — so the default is right.
+
+The user wants it to be useful beyond arm-gated capture (to mirror PX4's
+`SDLOG_MODE` "log from start" behavior), to avoid showing empty plots for sensors
+that aren't producing data, to add attitude / attitude-rate plots with setpoint
+overlays, and to be robust to missing message fields.
+
+**Confirmed decisions:** `--trigger arm/start/auto`; only-active **on by default**
+(`--show-all` to override); attitude in **degrees**.
+
+All changes land in one file: `/home/choudhury/tools/dev/px4_plotter/px4_realtime_plot.py`.
+
+---
+
+## Critical correctness note (verified against pymavlink 2.4.49)
+
+`ATTITUDE_TARGET.type_mask` bits:
+`BODY_ROLL_RATE_IGNORE=1`, `BODY_PITCH_RATE_IGNORE=2`, `BODY_YAW_RATE_IGNORE=4`,
+`THROTTLE_IGNORE=64`, **`ATTITUDE_IGNORE=128`**. The quaternion-ignore bit is
+**128, not 64** — PX4 routinely sets the throttle-ignore bit (64), so testing 64
+would wrongly blank the attitude setpoint on every message. Encode via the named
+enum constants so it can't drift.
+
+---
+
+## Changes (top-to-bottom, surgical)
+
+### 1. Constants (near lines 42–52)
+
+```python
+DISCOVERY_SECONDS  = 3.0     # only-active discovery window after stream setup
+HEARTBEAT_TIMEOUT  = 5.0     # 'start'/'auto' link-drop detection (s without HEARTBEAT)
+PARAM_READ_TIMEOUT = 3.0     # SDLOG_MODE read budget in 'auto'
+
+ATT_SP_IGNORE = {  # ATTITUDE_TARGET.type_mask (1 = ignore); NOTE att=128, not 64
+    "roll_rate":  mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_ROLL_RATE_IGNORE,
+    "pitch_rate": mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_PITCH_RATE_IGNORE,
+    "yaw_rate":   mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_BODY_YAW_RATE_IGNORE,
+    "att":        mavutil.mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE,  # 128
+}
+FIGURE_ORDER = ("position", "velocity", "attitude", "attitude_rate")
+```
+
+### 2. Helpers — safe field accessor + quaternion→euler (after `lla_to_ned`, ~line 64)
+
+```python
+def gf(msg, name, default=float("nan")):
+    """Safe field read: msg.<name> if present else default. The 'verify exists / else ignore' primitive."""
+    return getattr(msg, name, default)
+
+def quat_to_euler(q):
+    """Quaternion (w,x,y,z) -> (roll,pitch,yaw) rad; NaNs if missing/short/non-finite."""
+    if q is None or len(q) < 4:
+        return float("nan"), float("nan"), float("nan")
+    w, x, y, z = (float(v) for v in q[:4])
+    if not all(math.isfinite(v) for v in (w, x, y, z)):
+        return float("nan"), float("nan"), float("nan")
+    roll  = math.atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))
+    pitch = math.asin(max(-1.0, min(1.0, 2*(w*y - z*x))))   # clamp asin domain
+    yaw   = math.atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))
+    return roll, pitch, yaw
+```
+
+For control-flow fields (`fix_type`, `type_mask`, `base_mode`) call `gf(msg, name, 0)`
+so a missing field means "skip", not NaN-in-arithmetic.
+
+### 3. `Telemetry.__init__` (lines 70–95)
+
+- Bump deque size: `n = int(window_s * 25)` (was `*20`; gives headroom so ATTITUDE
+  at 20 Hz over the 300 s window doesn't clip at the boundary).
+- Add attitude actual + setpoint buffers, link-drop + activity tracking:
+
+```python
+self.t_att = deque(maxlen=n)
+self.att     = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}   # rad
+self.attrate = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}   # rad/s
+self.t_attsp = deque(maxlen=n)
+self.attsp     = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}
+self.attratesp = {k: deque(maxlen=n) for k in ("roll", "pitch", "yaw")}
+self.last_heartbeat: float | None = None   # link-drop detection
+self.seen: dict[str, int] = {}             # mtype -> count, for only-active
+```
+
+Store attitude in **radians**; convert to degrees only at draw time (mirrors the
+existing "store SI, format on draw" approach). `seen` is a monotonic counter (the
+correct "this vehicle produces msg X" signal — unlike `t_*` deques which roll over).
+
+### 4. `mavlink_reader` (lines 101–174)
+
+- Extend the `t0`-seeding tuple to include `"ATTITUDE", "ATTITUDE_TARGET"`.
+- At the top of the lock block: `tel.seen[mtype] = tel.seen.get(mtype, 0) + 1`.
+- HEARTBEAT branch: set `tel.last_heartbeat = t`; read base_mode via `gf(msg,"base_mode",0)`.
+- Retrofit `gf` into existing branches (minimal): LOCAL_POSITION_NED fields; GPS_RAW_INT
+  (`fix_type=int(gf(msg,"fix_type",0))`, then existing `<3: continue`); POSITION_TARGET
+  (`bm=int(gf(msg,"type_mask",0))`); HOME_POSITION only sets origin if lat/lon/alt finite.
+- LOCAL_POSITION_NED_COV: length+finiteness guard the array, keep sigma deques aligned
+  with `t_cov` by appending NaN when unavailable:
+
+```python
+elif mtype == "LOCAL_POSITION_NED_COV":
+    cov = gf(msg, "covariance", None)
+    tel.t_cov.append(t)
+    for k, idx in COV_DIAG_IDX.items():
+        if cov is not None and len(cov) > idx and math.isfinite(cov[idx]):
+            tel.sigma[k].append(math.sqrt(max(float(cov[idx]), 0.0)))
+        else:
+            tel.sigma[k].append(float("nan"))
+```
+
+- New branches:
+
+```python
+elif mtype == "ATTITUDE":
+    tel.t_att.append(t)
+    for k, f in (("roll","roll"),("pitch","pitch"),("yaw","yaw")):
+        tel.att[k].append(gf(msg, f))
+    for k, f in (("roll","rollspeed"),("pitch","pitchspeed"),("yaw","yawspeed")):
+        tel.attrate[k].append(gf(msg, f))
+
+elif mtype == "ATTITUDE_TARGET":
+    bm = int(gf(msg, "type_mask", 0))
+    tel.t_attsp.append(t)
+    if bm & ATT_SP_IGNORE["att"]:                 # 128 -> attitude ignored
+        r = p = y = float("nan")
+    else:
+        r, p, y = quat_to_euler(gf(msg, "q", None))
+    tel.attsp["roll"].append(r); tel.attsp["pitch"].append(p); tel.attsp["yaw"].append(y)
+    def keep_rate(key, val): return float("nan") if (bm & ATT_SP_IGNORE[key]) else val
+    tel.attratesp["roll"].append(keep_rate("roll_rate",  gf(msg, "body_roll_rate")))
+    tel.attratesp["pitch"].append(keep_rate("pitch_rate", gf(msg, "body_pitch_rate")))
+    tel.attratesp["yaw"].append(keep_rate("yaw_rate",   gf(msg, "body_yaw_rate")))
+```
+
+### 5. Stream rates (lines 319–326)
+
+Add `MAVLINK_MSG_ID_ATTITUDE: 20` and `MAVLINK_MSG_ID_ATTITUDE_TARGET: 10`. Leave
+existing rates unchanged (link is mavlink-router USB @2 Mbaud → local UDP, generous).
+
+### 6. Variable figure set — restructure `make_figures` / `redraw` / `snapshot` / `save_figs`
+
+Replace the two hardcoded figures with an insertion-ordered dict `figs: key -> (fig, axes)`.
+The existing position/velocity drawing logic is preserved, just parameterized.
+
+- `make_figures(keys)`: build only the requested figures from a `specs` table
+  (title + 3 y-labels per key); reuse a small `_label_axes(ax, ylabels)`.
+- `active_figures(seen, show_all)`: returns keys in `FIGURE_ORDER`.
+  `show_all` → all four. Else by predicate:
+  - `position`/`velocity`: any of `LOCAL_POSITION_NED`, `GPS_RAW_INT`,
+    `POSITION_TARGET_LOCAL_NED` seen (they share LOCAL_POSITION_NED, so appear together).
+  - `attitude`/`attitude_rate`: `ATTITUDE` or `ATTITUDE_TARGET` seen.
+- `redraw(snap, figs)`: dispatch — call `_draw_ned(axes,snap,"pos"/"vel")` and
+  `_draw_att(axes,snap,"att"/"rate")` only for keys present in `figs`.
+  - `_draw_ned` = the existing lines 245–283 body, parameterized; **add a NaN-safe
+    interp guard** for ±3σ (np.interp does not skip NaN):
+    `m = np.isfinite(sig); if m.sum()>=2: s = np.interp(t_loc, t_cov[m], sig[m]); ...`
+  - `_draw_att`: per component (roll/pitch/yaw) plot actual (`C0-`, "actual") and
+    setpoint (`C3--`, "setpoint"), each guarded by `.size`, values `* 180/math.pi`
+    (rad→deg), legend on axis 0.
+- `snapshot(tel)`: add `t_att/att/attrate/t_attsp/attsp/attratesp` using the existing
+  `A(d)=np.array(d,float)` and `- t0` pattern.
+- `save_figs(figs, reason)`: iterate present figures; filenames
+  `position_ned` / `velocity_ned` / `attitude_deg` / `attitude_rate_deg` + timestamp.
+
+### 7. `main()` (lines 299–373)
+
+- New argparse: `--trigger {arm,start,auto}` (default `arm`), `--show-all` (store_true).
+  Also fix the misleading `--device` help (it's a UDP endpoint, not a serial port) and
+  refresh the stale module docstring (drop "armed==logging"/SiK framing; describe trigger
+  modes). Fix the `127.0.01` → `127.0.0.1` typo in the default (one char; currently works
+  only by lenient OS parsing).
+- Sequence (order matters): connect → `wait_heartbeat()` → `set_stream_rates` →
+  **`resolve_trigger(args.trigger, conn)`** → `Telemetry()` → `reader.start()` →
+  discovery sleep (unless `--show-all`) → `active_figures` → `make_figures` →
+  `plt.ion()`/`show` → loop.
+- `read_sdlog_mode(conn)` + `resolve_trigger(trigger, conn)`: do the param read in the
+  **main thread BEFORE `reader.start()`** (only one socket consumer at a time — avoids
+  racing the reader). `param_request_read_send(sys, comp, b"SDLOG_MODE", -1)`, loop
+  `recv_match(type="PARAM_VALUE", ...)` until deadline, strip NUL from `param_id`.
+  Map: `0→arm`; `{1,2,4}→start`; `-1→warn+start`; timeout→warn+arm. **Observe only —
+  never write vehicle params.**
+- Discovery (only-active default): `time.sleep(DISCOVERY_SECONDS)` while the reader
+  fills buffers, snapshot `tel.seen` under the lock, `keys = active_figures(seen, False)`;
+  if empty, warn and fall back to all four. `--show-all` skips the wait and uses all four.
+- Unified arm/start loop (generalize the existing arm/disarm edge logic):
+
+```python
+active = armed_now if behavior == "arm" else (not link_down)   # link_down via last_heartbeat
+# active: refresh at REFRESH_HZ; on active->inactive edge: final redraw + save_figs(figs, reason)
+# 'saved_this_cycle' guards against re-saving while idle; resets on next active cycle.
+# reason = "disarm" (arm) / "link-drop" (start); Ctrl-C always does final redraw + save("ctrl-c").
+```
+
+`link_down = last_hb is not None and now-last_hb > HEARTBEAT_TIMEOUT` (None ⇒ active
+from the start in `start` mode).
+
+---
+
+## Edit sequencing
+
+Steps 1–5 compile independently. Steps 6 and 7 must land together (the
+`make_figures`/`redraw`/`save_figs` signatures change with their call sites).
+
+## Verification
+
+No git repo and no SITL/hardware assumed available, so verify in layers:
+
+1. **Static / import:** `python3 -m py_compile px4_realtime_plot.py`; `python3 px4_realtime_plot.py --help` shows `--trigger` and `--show-all`.
+2. **Quaternion unit check:** in a REPL, `quat_to_euler` on identity `(1,0,0,0)`→(0,0,0),
+   `(0.707,0.707,0,0)`→roll≈90°, pitch90, yaw90, and a gimbal-lock quat (asin clamped, no error).
+3. **Mask check:** confirm `ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE == 128` and that a
+   type_mask with bit 64 set (throttle ignore) still yields a plotted attitude setpoint.
+4. **End-to-end (preferred, if a vehicle/SITL + mavlink-router are running):**
+   - Default: `python3 px4_realtime_plot.py` → after ~3 s discovery, only figures for
+     active messages open; arm → plots refresh at 1 Hz; disarm → PNGs saved.
+   - `--show-all` → all four figures open immediately (some may be empty).
+   - `--trigger start` → plots refresh from connect regardless of arm; kill the link
+     (stop mavlink-router) → after ~5 s a "link-drop" save fires; Ctrl-C also saves.
+   - `--trigger auto` → prints the observed `SDLOG_MODE` and the chosen behavior.
+   - With attitude streams present, Attitude (deg) and Attitude rate (deg/s) figures show
+     actual + setpoint overlays.
+5. **Robustness:** confirm no crash when a source is absent (e.g. no GPS, no
+   ATTITUDE_TARGET) — those series/figures are simply skipped.

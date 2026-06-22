@@ -1,0 +1,249 @@
+#ifndef ms_colibri_command_interface_h
+#define ms_colibri_command_interface_h
+
+#pragma once
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+#include "kw_observer.h"
+
+// NextVision Colibri serial protocol (Rev 2.0.43, May 2025).
+// Drives the NightHawk/DragonEye/Raptor/Falcon/Starling/Raven/Condor camera+gimbal payloads.
+
+// ===== Event names dispatched by the interface =====
+#define mCOLIBRI_MESSAGE_ENCODED  "colibri_message_encoded"
+#define mCOLIBRI_ACK_FIXED        "colibri_ack_fixed"   // 20-byte slow-protocol ack
+#define mCOLIBRI_ACK_FULL         "colibri_ack_full"    // 64-byte fast-protocol full ack
+
+// ===== Wire constants =====
+constexpr uint8_t COLIBRI_HDR1 = 0xB0;
+constexpr uint8_t COLIBRI_HDR2 = 0x3B;
+
+// Slow-protocol header3 (19.2kbps, 20-byte ack at 20Hz)
+constexpr uint8_t COLIBRI_HDR3_PANTILT          = 0x77;
+constexpr uint8_t COLIBRI_HDR3_AUTOROLL         = 0x78;
+constexpr uint8_t COLIBRI_HDR3_AUTOROLL_YAW     = 0x79;
+constexpr uint8_t COLIBRI_HDR3_AUTOROLL_YAW_FB  = 0x7A;
+
+// Fast-protocol header3 (115.2kbps, 64-byte full ack at 100Hz)
+constexpr uint8_t COLIBRI_HDR3_FA_PANTILT         = 0xF7;
+constexpr uint8_t COLIBRI_HDR3_FA_AUTOROLL        = 0xF8;
+constexpr uint8_t COLIBRI_HDR3_FA_AUTOROLL_YAW    = 0xF9;
+constexpr uint8_t COLIBRI_HDR3_FA_AUTOROLL_YAW_FB = 0xFA;
+
+constexpr uint8_t COLIBRI_HDR3_GET_VERSION = 0x83;
+
+constexpr int COLIBRI_CMD_LEN       = 20;
+constexpr int COLIBRI_ACK_FIXED_LEN = 20;
+constexpr int COLIBRI_ACK_FULL_LEN  = 64;
+
+// Mode field — byte 3 bits [0..4]
+enum enColibriMode
+{
+    eCOL_MODE_PILOT       = 3,
+    eCOL_MODE_STOW        = 4,
+    eCOL_MODE_RATE        = 6,
+    eCOL_MODE_HOLD_LOS    = 7,
+    eCOL_MODE_PARK        = 8,
+    eCOL_MODE_BACKLOCK    = 9,
+    eCOL_MODE_GYRO_CAL    = 10,
+    eCOL_MODE_PILOT_90    = 14,
+    eCOL_MODE_FAST_SCAN   = 19,
+    eCOL_MODE_ENC_CAL     = 20,
+    eCOL_MODE_SET_ANGLE   = 24,
+    eCOL_MODE_FIX_YAW     = 25,
+    eCOL_MODE_STOW_YAW    = 26,
+    eCOL_MODE_MOTORS_OFF  = 28,
+    eCOL_MODE_NO_BIT      = 29,
+    eCOL_MODE_GYRO_FLASH  = 30,
+    eCOL_MODE_EPR         = 31,
+};
+
+enum enColibriChannel  { eCOL_CHAN_EO = 0, eCOL_CHAN_IR = 1 };
+enum enColibriProtocol { eCOL_PROTO_SLOW, eCOL_PROTO_FAST };
+
+// =================================================
+// Host -> Camera command (20 bytes) — Rev 43 §3.1
+// =================================================
+#pragma pack(push, 1)
+struct __colibri_message_command
+{
+    uint8_t header1;            // 0  = 0xB0
+    uint8_t header2;            // 1  = 0x3B
+    uint8_t header3;            // 2  = 0x77..0x7A (slow) or 0xF7..0xFA (fast)
+    uint8_t status;             // 3  IR/EO[7] Illum[6] Fusion[5] Mode[4:0]
+    uint8_t pointing;           // 4  StabOff[7] OsdTxt[6] OsdGfx[5] LRF[4] RollZOsd[3] ImgFrz[2] TRIG[1] RateFOVDep[0]
+    uint8_t thermal;            // 5  Type[7:6] NUC[5] Polarity[4] Gain/Lvl[3:0]
+    uint8_t safety;             // 6  Key[7:4]=0x5 NS[3] HPPI_HT[2] HPPI_ARM[1] CI_ARM[0]
+    uint8_t illuminator;        // 7  Reserved[7] CIFlash[6:5] Reserved[4:2] HPPI_OvrT[1] HPPI_Fire[0]
+    uint8_t focus;              // 8  Reserved[7:4] AutoFocus[3] FocusInf[2] FocusFar[1] FocusNear[0]
+    uint8_t correlator_index;   // 9  Reserved[7:6] CorrIndex[5:0]
+    uint8_t correlator_byte_0;  // 10
+    uint8_t correlator_byte_1;  // 11
+    uint8_t correlator_byte_2;  // 12
+    uint8_t correlator_byte_3;  // 13
+    uint8_t b14;                // 14 ZoomIN[7] ZoomOUT[6] PitchMid[5:4] RollMid[3:2] YawMid[1:0]
+    uint8_t pitch_msb;          // 15 Pitch/Tilt bits [11:4]
+    uint8_t roll_msb;           // 16 Pan/Roll  bits [11:4]
+    uint8_t yaw_msb;            // 17 Yaw       bits [11:4]
+    uint8_t b18;                // 18 Reserved[7:6] PitchLsb[5:4] RollLsb[3:2] YawLsb[1:0]
+    uint8_t checksum;           // 19
+};
+#pragma pack(pop)
+
+// =================================================
+// Camera -> Host fixed ack (20 bytes) — Rev 43 §4.1
+// =================================================
+#pragma pack(push, 1)
+struct __colibri_message_ack
+{
+    uint8_t header1;             // 0
+    uint8_t header2;             // 1
+    uint8_t header3;             // 2  echoes received header3
+    uint8_t status;              // 3  IR/EO[7] CI[6] PiP[5] Mode[4:0]
+    uint8_t lsb_supp;            // 4  RollLSB[7:6] PitchLSB[5:4] XLSB[3:2] YLSB[1:0]  (post-FW 1.280 14-bit extension)
+    uint8_t fov;                 // 5  FOV (zoom) report — FOV = 100 / 1.03^report
+    uint8_t vsync;               // 6  Num Vsyncs since last CMD
+    uint8_t pitch_msb;           // 7  Pitch/Tilt MSB
+    uint8_t roll_msb;            // 8  Roll/Pan MSB
+    uint8_t pitchroll_lsb;       // 9  Pitch LSB[7:4] Roll LSB[3:0]
+    uint8_t x_report_msb;        // 10
+    uint8_t y_report_msb;        // 11
+    uint8_t xy_lsb;              // 12 X LSB[7:4] Y LSB[3:0]
+    uint8_t status_temp;         // 13 OverTemp[7] Error[6] Correlator[5:0]
+    uint8_t correlator_byte_0;   // 14
+    uint8_t correlator_byte_1;   // 15
+    uint8_t correlator_byte_2;   // 16
+    uint8_t correlator_byte_3;   // 17
+    uint8_t correlator_byte_4;   // 18
+    uint8_t checksum;            // 19
+};
+#pragma pack(pop)
+
+// =================================================
+// Camera -> Host Full ACK (64 bytes) — Rev 43 §5
+// =================================================
+#pragma pack(push, 1)
+struct __colibri_message_full_ack
+{
+    uint8_t header1;             // 0
+    uint8_t header2;             // 1
+    uint8_t header3;             // 2
+    uint8_t status;              // 3  IR/EO[7] CI[6] SafetyKey[5] Mode[4:0]
+    uint8_t fov_msb;             // 4
+    uint8_t fov_lsb;             // 5
+    uint8_t mech_roll_msb;       // 6
+    uint8_t mech_roll_lsb;       // 7
+    uint8_t mech_pitch_msb;      // 8
+    uint8_t mech_pitch_lsb;      // 9
+    uint8_t elec_x_msb;          // 10
+    uint8_t elec_x_lsb;          // 11
+    uint8_t elec_y_msb;          // 12
+    uint8_t elec_y_lsb;          // 13
+    uint8_t los_rate_x_msb;      // 14
+    uint8_t los_rate_x_lsb;      // 15
+    uint8_t los_rate_y_msb;      // 16
+    uint8_t los_rate_y_lsb;      // 17
+    uint8_t correlator_value;    // 18 Correlator[5:0] CI_Fires[6] HPPI_Fires[7]
+    uint8_t accel_x_msb;         // 19
+    uint8_t accel_x_lsb;         // 20
+    uint8_t accel_y_msb;         // 21
+    uint8_t accel_y_lsb;         // 22
+    uint8_t accel_z_msb;         // 23
+    uint8_t accel_z_lsb;         // 24
+    uint8_t gyro_x_msb;          // 25
+    uint8_t gyro_x_lsb;          // 26
+    uint8_t gyro_y_msb;          // 27
+    uint8_t gyro_y_lsb;          // 28
+    uint8_t gyro_z_msb;          // 29
+    uint8_t gyro_z_lsb;          // 30
+    uint8_t compass_x_msb;       // 31
+    uint8_t compass_x_lsb;       // 32
+    uint8_t compass_y_msb;       // 33
+    uint8_t compass_y_lsb;       // 34
+    uint8_t compass_z_msb;       // 35
+    uint8_t compass_z_lsb;       // 36
+    uint8_t time_pps_msb;        // 37
+    uint8_t time_pps_lsb;        // 38
+    uint8_t sys_status_msb;      // 39
+    uint8_t sys_status_lsb;      // 40
+    uint8_t gimbal_temp_msb;     // 41
+    uint8_t gimbal_temp_lsb;     // 42 deg*100
+    uint8_t camera_id;           // 43 see Rev 43 §6 Cameras ID Table
+    uint8_t firmware_msb;        // 44
+    uint8_t firmware_lsb;        // 45
+    uint8_t mech_yaw_msb;        // 46
+    uint8_t mech_yaw_lsb;        // 47
+    uint8_t lrf_msb;             // 48 LRF range in meters (0x0000 / 0xFFFF if no valid range)
+    uint8_t lrf_lsb;             // 49
+    uint8_t time_tag_msb;        // 50 100us tick, wraps at 6.5s
+    uint8_t time_tag_lsb;        // 51
+    uint8_t ammo_count;          // 52
+    uint8_t corr_data_0;         // 53
+    uint8_t corr_data_1;         // 54
+    uint8_t corr_data_2;         // 55
+    uint8_t corr_data_3;         // 56
+    uint8_t corr_data_4;         // 57
+    uint8_t corr_data_5;         // 58
+    uint8_t corr_data_6;         // 59
+    uint8_t corr_data_7;         // 60
+    uint8_t corr_data_8;         // 61
+    uint8_t corr_data_9;         // 62
+    uint8_t checksum;            // 63
+};
+#pragma pack(pop)
+
+static_assert(sizeof(__colibri_message_command)  == COLIBRI_CMD_LEN,       "command size");
+static_assert(sizeof(__colibri_message_ack)      == COLIBRI_ACK_FIXED_LEN, "fixed ack size");
+static_assert(sizeof(__colibri_message_full_ack) == COLIBRI_ACK_FULL_LEN,  "full ack size");
+
+// ===== Wire encode/decode (defined in .cc) =====
+uint8_t colibri_checksum(const uint8_t* buf, int len);
+bool    colibri_command_encode  (const __colibri_message_command& m, uint8_t out[COLIBRI_CMD_LEN]);
+bool    colibri_fixed_ack_decode(__colibri_message_ack& m,           const uint8_t in[COLIBRI_ACK_FIXED_LEN]);
+bool    colibri_full_ack_decode (__colibri_message_full_ack& m,      const uint8_t in[COLIBRI_ACK_FULL_LEN]);
+
+class ms_colibri_command_interface
+{
+public:
+    ms_colibri_command_interface();
+    ~ms_colibri_command_interface();
+
+    void input_message(uint8_t* data, int length);
+    void send_message(const __colibri_message_command& cmd);
+
+    void addObserver(const std::string& messageName, kw_observer* observer);
+    void addOutputObserver(kw_observer* observer);
+    void notify(const std::string& name, void* data);
+
+    void set_protocol(enColibriProtocol p) { protocol_mode = p; }
+    enColibriProtocol get_protocol() const { return protocol_mode; }
+
+    // Cached state from the most recent Full ACK
+    double get_gimbal_az_deg()   const;
+    double get_gimbal_el_deg()   const;
+    double get_gimbal_roll_deg() const;
+    double get_fov_deg()         const;
+
+    const __colibri_message_full_ack& last_full_ack()  const { return cached_full_ack; }
+    const __colibri_message_ack&      last_fixed_ack() const { return cached_fixed_ack; }
+
+protected:
+    int expected_message_length(uint8_t header3) const;
+
+    std::unordered_map<std::string, std::vector<kw_observer*>> observers;
+    kw_observer* outputObserver = nullptr;
+    std::mutex   observersMutex;
+
+    enColibriProtocol protocol_mode = eCOL_PROTO_FAST;
+
+    uint8_t rx_buffer[256];
+    int     rx_index = 0;
+
+    __colibri_message_full_ack cached_full_ack{};
+    __colibri_message_ack      cached_fixed_ack{};
+};
+
+#endif

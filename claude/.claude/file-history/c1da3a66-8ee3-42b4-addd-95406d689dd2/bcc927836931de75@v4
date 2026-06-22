@@ -1,0 +1,89 @@
+# YAML-driven config + per-axis time-slicing for the sys-ID wrapper
+
+## Context
+`OD1A053_rpyChirp_PA60.ulg` is one log containing roll, pitch and yaw chirps at *different times*.
+Today each axis is identified from the **whole** series, so every axis sees all three chirps —
+messy FRFs. We want to (a) drive the run from a **YAML config** (ulg path, freq sweep limits,
+coherence cutoff, and the per-axis chirp time windows), and (b) add a **time-slicing option,
+default ON**, that restricts each axis's data to its own chirp window so the per-axis plots come
+from clean, single-chirp segments.
+
+Current state: `sysID_wrapper.sh` takes a `.mat`/`.ulg` arg with hardcoded `opts`; there is **no
+YAML support**. `yq` is absent but `python3`+PyYAML is present, and MATLAB has `jsondecode` —
+so the shell converts YAML→JSON (python) and MATLAB reads the JSON. The analysis input is
+currently the **attitude setpoint** (`run_system_id_and_gain_design.m:135-136`, prior user edit);
+time-slicing is orthogonal and that input choice is left unchanged.
+
+### Decisions / assumptions
+- YAML is the entry point: `sysID_wrapper.sh <config.yaml>`. Direct `.ulg`/`.mat` args still work
+  (no slicing, defaults) for back-compat.
+- `time_slice` defaults **true**. When true and a window exists for an axis, that axis is windowed;
+  if no window is given for an axis it uses the full series.
+- Slice times are **absolute avionics/boot seconds** = `timestamp*1e-6` (the frame Thunderball
+  'avionics' time-series plots use, where the user read 685–755 s). Sliced before the per-axis
+  time re-zero. An overview figure (below) lets the user confirm the windows land on the chirps.
+
+## Implementation
+
+### 1. New YAML config for this test (next to the ulg)
+`/home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26/OD1A053_rpyChirp_PA60_sysid.yaml`:
+```yaml
+ulg_path: /home/choudhury/analysis/flight_tests/oddjob/oddjob_vibeAnalysis_05-28-26/OD1A053_rpyChirp_PA60.ulg
+freq_init_Hz: 0.01
+freq_end_Hz:  5.5
+coh_cutoff:   0.8
+# retune targets (optional; omit to use defaults 3 / 1 / 60)
+# wc_inner_Hz: 3
+# wc_outer_Hz: 1
+# PM_target_deg: 60
+time_slice: true                 # per-axis chirp windowing (default on)
+slice_roll:  [695, 725]
+slice_pitch: [685, 695]
+slice_yaw:   [735, 755]
+```
+
+### 2. `sysID_wrapper.sh` — accept a YAML config
+- Extend the extension switch to `yaml|yml`. In YAML mode:
+  - `ulg=$(python3 -c 'import yaml,sys;print(yaml.safe_load(open(sys.argv[1]))["ulg_path"])' "$cfg")`
+    (resolve relative to the yaml's dir; `realpath`; existence check). Used for rundir naming.
+  - Write `"$rundir/config.json"` via `python3 -c 'import yaml,json,sys;json.dump(yaml.safe_load(open(sys.argv[1])),open(sys.argv[2],"w"))'`, and `cp "$cfg" "$rundir/"` for provenance.
+  - Launch: `matlab -batch "addpath('$SCRIPT_DIR'); run_sysid('$ulg','$rundir', sysid_opts_from_json('$rundir/config.json'))"`.
+- `.ulg`/`.mat`/`.ulog` modes unchanged (`run_sysid('$input','$rundir')`).
+
+### 3. New `sysid_opts_from_json.m`
+`opts = sysid_opts_from_json(jsonpath)` → `c = jsondecode(fileread(jsonpath))`; copy through
+`freq_init_Hz, freq_end_Hz, coh_cutoff, wc_inner_Hz, wc_outer_Hz, PM_target_deg` when present;
+`opts.time_slice = logical(c.time_slice)` (default true); build `opts.slices.{roll,pitch,yaw}` =
+`[t0 t1]` from `slice_roll/slice_pitch/slice_yaw` (only those present). Uses only built-in
+`jsondecode` (no toolbox, no python in MATLAB). `run_sysid.m` already forwards `opts` unchanged.
+
+### 4. `run_system_id_and_gain_design.m` — apply the slicing
+- Defaults: `opts.time_slice` (default true), `opts.slices` (default empty struct).
+- In the axis loop, compute `win = []`; if `opts.time_slice && isfield(opts.slices, ax_key)` →
+  `win = opts.slices.(ax_key)`. Pass to `analyze_axis(d, A, opts, gax, win)`.
+- In `analyze_axis`, right after the NaN-drop and **before** the `chirp_time_s - chirp_time_s(1)`
+  re-zero (≈line 149/152): if `~isempty(win)`, mask `chirp_time_s>=win(1) & <=win(2)` (absolute
+  seconds), apply to `chirp_time_s/dele_total/q_rps`, error if `< ~10` samples, and `fprintf` the
+  window + sample count. Note the window in the time-domain figure title and store `res.slice=win`.
+- `write_margins`: add a `time slice: <t0>-<t1> s` line per axis (or `(full series)`).
+- **Overview figure** (verifies windows): a `plot_slice_overview` helper — full
+  `vehicle_angular_velocity_0` rpy (deg/s) vs absolute time with the three windows shaded — saved
+  once to `<out_dir>/figures/Time_Slices_Overview.png|.fig` when slicing is on.
+
+**Unchanged:** estimate_freq_response, the TF fit, gain design, current/retune margins,
+`closed_loop_bw`, per-axis figure structure, and the (attitude-setpoint) input.
+
+## Files
+- New: `OD1A053_rpyChirp_PA60_sysid.yaml` (next to the ulg); `sysid_opts_from_json.m` (tool dir).
+- Modify: `sysID_wrapper.sh` (YAML mode); `run_system_id_and_gain_design.m` (slicing + overview + margins note).
+- Unchanged: `run_sysid.m`, `ulog_to_mat.m`, `MathUs.m`.
+
+## Verification
+- `sysID_wrapper.sh .../OD1A053_rpyChirp_PA60_sysid.yaml` → completes r/p/y; `config.json` + copied
+  yaml in the rundir; `run.log` shows `[Roll] time slice 695-725 s -> N samples` etc.
+- `figures/Time_Slices_Overview.png`: the three shaded windows sit on the three chirps (confirms the
+  absolute-time assumption). Per-axis `*_Time_Domain_Data.png` spans only its window.
+- `margins.txt` shows the per-axis slice; identification numbers differ from a full-series run.
+- Back-compat: passing the `.ulg` directly still runs (full series, no slicing).
+- Fast iteration: the `.mat` already exists beside the ulg; pointing `ulg_path` at it skips the
+  ~1-min re-extraction.

@@ -1,0 +1,196 @@
+"""Rebuild the EKF IMU input (delta-angle / delta-velocity in body FRD) from the
+raw high-rate FIFO, the way PX4 firmware does (integrate over IMU_INTEG_RATE
+windows with coning, then calibrate). Needed because vehicle_imu is logged
+decimated (~2 Hz) and cannot drive a 100 Hz filter.
+
+Lifted verbatim from ekf_ned_reconstruction.py -- already validated against the
+logged vehicle_imu for this sensor pipeline.
+"""
+
+import numpy as np
+
+from . import log_io
+from .quat import euler_to_dcm
+
+# rot_lookup table (roll, pitch, yaw in degrees), rotation.h:107
+ROT_LOOKUP = [
+    (0, 0, 0), (0, 0, 45), (0, 0, 90), (0, 0, 135), (0, 0, 180), (0, 0, 225), (0, 0, 270),
+    (0, 0, 315), (180, 0, 0), (180, 0, 45), (180, 0, 90), (180, 0, 135), (0, 180, 0),
+    (180, 0, 225), (180, 0, 270), (180, 0, 315), (90, 0, 0), (90, 0, 45), (90, 0, 90),
+    (90, 0, 135), (270, 0, 0), (270, 0, 45), (270, 0, 90), (270, 0, 135), (0, 90, 0),
+    (0, 270, 0), (0, 180, 90), (0, 180, 270), (90, 90, 0), (180, 90, 0), (270, 90, 0),
+    (90, 180, 0), (270, 180, 0), (90, 270, 0), (180, 270, 0), (270, 270, 0), (90, 180, 90),
+    (90, 0, 270), (90, 68, 293), (0, 315, 0), (90, 315, 0), (0, 225, 0), (180, 45, 0),
+    (0, 90, 180),
+]
+
+
+def get_rot_matrix(rot):
+    """PX4 get_rot_matrix(enum Rotation): DCM from the rot_lookup Euler angles."""
+    r, p, y = ROT_LOOKUP[int(rot)]
+    return euler_to_dcm(np.radians(r), np.radians(p), np.radians(y))
+
+
+def sensor_rotation(params, cal_rot):
+    """Sensor->body rotation: board level offsets * board rotation for internal
+    sensors (CAL_*_ROT<0), or the per-sensor CAL_*_ROT (external)."""
+    off = euler_to_dcm(np.radians(params.get("SENS_BOARD_X_OFF", 0.0)),
+                       np.radians(params.get("SENS_BOARD_Y_OFF", 0.0)),
+                       np.radians(params.get("SENS_BOARD_Z_OFF", 0.0)))
+    rot_used = cal_rot if (cal_rot is not None and cal_rot >= 0) else int(params.get("SENS_BOARD_ROT", 0))
+    return off @ get_rot_matrix(rot_used)
+
+
+def find_cal(params, device_id, kind):
+    """(offset[3], scale[3], rot) for the CAL_{GYRO,ACC}n whose ID matches device_id."""
+    for n in range(4):
+        if int(params.get(f"CAL_{kind}{n}_ID", 0)) == int(device_id):
+            off = np.array([params.get(f"CAL_{kind}{n}_{a}OFF", 0.0) for a in "XYZ"])
+            scale = (np.array([params.get(f"CAL_{kind}{n}_{a}SCALE", 1.0) for a in "XYZ"])
+                     if kind == "ACC" else np.ones(3))
+            return off, scale, int(params.get(f"CAL_{kind}{n}_ROT", -1))
+    return np.zeros(3), np.ones(3), -1
+
+
+def _imu_by_device(ulog, name, gyro_dev, accel_dev):
+    for d in ulog.data_list:
+        if d.name == name and (gyro_dev is None or int(d.data["gyro_device_id"][0]) == int(gyro_dev)):
+            return d
+    return None
+
+
+def _fifo_by_device(ulog, name, device_id):
+    if device_id is None:
+        return None
+    for d in ulog.data_list:
+        if d.name == name and int(d.data["device_id"][0]) == int(device_id):
+            return d
+    return None
+
+
+def _deltas_from_sensor_combined(ulog):
+    d = log_io.require(log_io.get_dataset(ulog, "sensor_combined", 0), "sensor_combined")
+    t = log_io.tsec(d)
+    gyro = log_io.vec3(d, "gyro_rad")               # rad/s, body FRD
+    accel = log_io.vec3(d, "accelerometer_m_s2")    # m/s^2, body FRD
+    dt_ang = np.asarray(d.data["gyro_integral_dt"], dtype=np.float64) * 1e-6
+    dt_vel = np.asarray(d.data["accelerometer_integral_dt"], dtype=np.float64) * 1e-6
+    return t, gyro * dt_ang[:, None], accel * dt_vel[:, None], dt_ang, dt_vel
+
+
+def _deltas_from_vehicle_imu(ulog, gyro_dev=None, accel_dev=None):
+    d = log_io.require(_imu_by_device(ulog, "vehicle_imu", gyro_dev, accel_dev)
+                       or log_io.get_dataset(ulog, "vehicle_imu", 0), "vehicle_imu")
+    t = log_io.tsec(d)
+    dang = log_io.vec3(d, "delta_angle")            # rad (already integrated)
+    dvel = log_io.vec3(d, "delta_velocity")         # m/s (already integrated)
+    dt_ang = np.asarray(d.data["delta_angle_dt"], dtype=np.float64) * 1e-6
+    dt_vel = np.asarray(d.data["delta_velocity_dt"], dtype=np.float64) * 1e-6
+    return t, dang, dvel, dt_ang, dt_vel
+
+
+def _fifo_samples(d):
+    """Per-message batch trapezoidal-mean rate at timestamp_sample -- replicates
+    the driver (PX4Gyroscope/Accelerometer::updateFIFO)."""
+    ts = np.asarray(d.data["timestamp_sample"], np.float64) * 1e-6   # s, time of LAST sample
+    scale = np.asarray(d.data["scale"], np.float64)
+    ns = np.asarray(d.data["samples"]).astype(int)
+    nmax = int(ns.max())
+    valid = np.arange(nmax)[None, :] < ns[:, None]
+    rate = np.empty((len(ts), 3))
+    for ci, ax in enumerate("xyz"):
+        Xc = np.column_stack([np.asarray(d.data[f"{ax}[{k}]"], np.float64) for k in range(nmax)])
+        last = Xc[np.arange(len(ns)), ns - 1]                 # last raw sample of each batch
+        prev_last = np.concatenate([[last[0]], last[:-1]])    # previous batch's last sample
+        rowsum = np.where(valid, Xc, 0.0).sum(axis=1)
+        # trapezoidal sum over [prev_last, x0..x_{N-1}] = 0.5*prev_last + rowsum - 0.5*last
+        rate[:, ci] = (0.5 * prev_last + rowsum - 0.5 * last) / ns * scale
+    return ts, rate
+
+
+def _coning_beta(dag, w, nw):
+    """Per-window coning correction (IntegratorConing): beta += 0.5*((last_alpha +
+    last_delta_alpha/6) x delta_alpha), accumulated within each window."""
+    ca = np.cumsum(dag, axis=0)
+    nb = int(w.max()) + 1
+    last_idx = np.searchsorted(w, np.arange(nb), side="right") - 1     # last seg of each window
+    end_ca = np.zeros((nb, 3)); ok = last_idx >= 0
+    end_ca[np.arange(nb)[ok]] = ca[last_idx[ok]]
+    base = np.where(w[:, None] > 0, end_ca[np.clip(w - 1, 0, nb - 1)], 0.0)
+    alpha_incl = ca - base                                    # alpha within window up to & incl i
+    last_alpha = alpha_incl - dag                             # alpha within window before i
+    last_delta = np.vstack([np.zeros((1, 3)), dag[:-1]])
+    coning = 0.5 * np.cross(last_alpha + last_delta / 6.0, dag)
+    beta = np.zeros((nw, 3)); np.add.at(beta, w, coning)
+    return beta
+
+
+def _integrate_windows(tg, vg, ta, va, win_dt):
+    """Integrate gyro (trapezoidal + coning) & accel (trapezoidal) into common
+    win_dt windows, replicating VehicleIMU's Integrator/IntegratorConing.
+    Returns paired (t, d_ang, dt_ang, d_vel, dt_vel) in board FRD."""
+    t0 = min(tg[0], ta[0])
+    dtg = np.diff(tg); dag = 0.5 * (vg[1:] + vg[:-1]) * dtg[:, None]   # gyro trapezoidal deltas
+    wg = np.floor((tg[1:] - t0) / win_dt).astype(int)
+    dtv = np.diff(ta); dav = 0.5 * (va[1:] + va[:-1]) * dtv[:, None]   # accel trapezoidal deltas
+    wa = np.floor((ta[1:] - t0) / win_dt).astype(int)
+    nw = max(int(wg.max()), int(wa.max())) + 1
+
+    DANG = np.zeros((nw, 3)); DTG = np.zeros(nw); TG = np.zeros(nw)
+    np.add.at(DANG, wg, dag); np.add.at(DTG, wg, dtg); np.maximum.at(TG, wg, tg[1:])
+    DANG += _coning_beta(dag, wg, nw)                         # add coning per window
+    DVEL = np.zeros((nw, 3)); DTA = np.zeros(nw)
+    np.add.at(DVEL, wa, dav); np.add.at(DTA, wa, dtv)
+    ok = (DTG > 0.5 * win_dt) & (DTA > 0.5 * win_dt)          # keep ~full windows
+    return TG[ok], DANG[ok], DTG[ok], DVEL[ok], DTA[ok]
+
+
+def _deltas_from_fifo(ulog, params, gyro_dev, accel_dev):
+    """Rebuild vehicle_imu (delta_angle/velocity in body FRD) from raw FIFO."""
+    gd = log_io.require(_fifo_by_device(ulog, "sensor_gyro_fifo", gyro_dev),
+                        f"sensor_gyro_fifo (device {gyro_dev})")
+    ad = log_io.require(_fifo_by_device(ulog, "sensor_accel_fifo", accel_dev),
+                        f"sensor_accel_fifo (device {accel_dev})")
+    tg, vg = _fifo_samples(gd)
+    ta, va = _fifo_samples(ad)
+    win = 1.0 / int(params.get("IMU_INTEG_RATE", 200))
+    t, dang_raw, dt_ang, dvel_raw, dt_vel = _integrate_windows(tg, vg, ta, va, win)
+
+    g_off, _, g_rot = find_cal(params, gyro_dev, "GYRO")
+    a_off, a_scale, a_rot = find_cal(params, accel_dev, "ACC")
+    Rg = sensor_rotation(params, g_rot)
+    Ra = sensor_rotation(params, a_rot)
+    dang = (dang_raw - g_off * dt_ang[:, None]) @ Rg.T
+    dvel = ((dvel_raw - a_off * dt_vel[:, None]) * a_scale) @ Ra.T
+    return t, dang, dvel, dt_ang, dt_vel
+
+
+def get_imu_deltas(ulog, source, params, gyro_dev, accel_dev):
+    """Return (label, t[s], dang[N,3], dvel[N,3], dt_ang[N], dt_vel[N])."""
+    def vi_rate():
+        d = _imu_by_device(ulog, "vehicle_imu", gyro_dev, accel_dev)
+        if d is None:
+            return None
+        tt = log_io.tsec(d)
+        return (len(tt) - 1) / (tt[-1] - tt[0]) if len(tt) > 1 else 0.0
+
+    def fifo_present():
+        return (_fifo_by_device(ulog, "sensor_gyro_fifo", gyro_dev) is not None
+                and _fifo_by_device(ulog, "sensor_accel_fifo", accel_dev) is not None)
+
+    if source == "auto":
+        r = vi_rate()
+        if r is not None and r > 50.0:        # full-rate vehicle_imu: best
+            source = "vehicle_imu"
+        elif fifo_present():                  # rebuild full-rate from FIFO
+            source = "fifo"
+        elif r is not None:                   # decimated vehicle_imu (no FIFO)
+            source = "vehicle_imu"
+        else:
+            source = "sensor_combined"
+
+    if source == "fifo":
+        return ("fifo",) + _deltas_from_fifo(ulog, params, gyro_dev, accel_dev)
+    if source == "vehicle_imu":
+        return ("vehicle_imu",) + _deltas_from_vehicle_imu(ulog, gyro_dev, accel_dev)
+    return ("sensor_combined",) + _deltas_from_sensor_combined(ulog)

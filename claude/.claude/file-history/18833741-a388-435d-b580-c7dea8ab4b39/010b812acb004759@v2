@@ -1,0 +1,138 @@
+# Offline EKF2 Reconstruction & Tuning Tool
+
+## Context
+
+PX4 ships an offline EKF replay capability in-tree, but it's C++ and requires building firmware. We want a **Python** equivalent for *tuning studies*: take a real flight `.ulg`, a YAML of EKF2 tuning parameters (every noise term + every time-delay term), and **re-run EKF2** to produce position/velocity estimates *and their covariance*. If the YAML values equal what actually flew, the reconstruction should closely match the logged estimator. Changing a YAML value then shows, against the real flight, how the estimate and the ±3σ envelope would have moved.
+
+This builds directly on the existing strapdown tool `/home/choudhury/tools/dev/ekf_ned_reconstruction/ekf_ned_reconstruction.py` (IMU-only dead-reckoning, no Kalman correction). The new tool adds the full EKF2 prediction **and** measurement-update so covariance is reproduced, not just the trajectory. New home: **`/home/choudhury/tools/dev/ekf_verification/`** (the empty cwd).
+
+Test log: `/home/choudhury/analysis/flight_tests/oddjob/oddjob_flight-test_05-23-26/OD1A072_pos_hold.ulg` — RTK multicopter pos-hold, 42 s. Reference repo (this fork's exact EKF): `/home/choudhury/repos/PX4-Autopilot/src/modules/ekf2/EKF/`.
+
+**Decisions (confirmed with user):** Fidelity = *faithful & close* — SymPy analytic Jacobians (the same analytic math PX4's SymForce generates), float64, full sequential fusion, PX4's real init covariance; not chasing bit-exactness. Fusion scope = *full active set* the flight used.
+
+## Hard constraints discovered during exploration (these shape everything)
+
+1. **`vehicle_imu` is logged at only ~2 Hz** (logger decimation). It cannot drive a 100 Hz filter. The IMU **must be rebuilt from `sensor_gyro_fifo`/`sensor_accel_fifo`** (~770 Hz) via batch-mean + coning + calibration — exactly what the existing tool's `_deltas_from_fifo` / `_integrate_windows` / `_coning_beta` already do. **Reuse them verbatim.**
+2. **Only the *diagonal* of P is logged** (`estimator_states.covariances[0..23]`); off-diagonals are unrecorded. We therefore *cannot* seed the true full P. Strategy: initialize P like PX4 (`initialiseCovariance`, which is itself diagonal) and **propagate from the start of GPS-aided flight with a burn-in window**; off-diagonals self-organize within a few seconds because pos/vel are strongly observed by RTK GPS. Compare only after burn-in.
+3. **Compare against `estimator_states`** (the *delayed fusion-horizon* state, with the true P diagonal, ~1 Hz / 42 samples here), **not** `vehicle_local_position` (the output-predictor's forward-propagated 92 Hz signal). Our reconstruction lives at the fusion horizon, so this is the apples-to-apples target and lets us **skip the output predictor entirely**.
+4. **State layout (24-state SymForce filter, confirmed from `derivation.py:39-64`):** `[0:4]` quat (body→earth, w-first), `[4:7]` vel NED, `[7:10]` pos NED, `[10:13]` Δang(gyro) bias, `[13:16]` Δvel(accel) bias, `[16:19]` earth mag, `[19:22]` body mag, `[22:24]` wind NE. So `covariances[4:7]`=vel var, `covariances[7:10]`=pos var.
+5. **Two *different* propagation functions** (don't collapse them): the **state** uses trapezoidal position, earth-rotation correction, and the exact axis-angle quaternion (`ekf.cpp:predictState`); the **covariance Jacobian** uses rectangular position (`p+v·dt`), *no* earth rotation, and the small-angle `dq=[1, ½δθ]` (`derivation.py:predict_covariance`, lines 94-96).
+6. **This flight's active fusions:** GPS horizontal position + 3D velocity; **GPS height is the reference** (`EKF2_HGT_REF=1` → its bias estimator is inert, bias≡0); **baro height is secondary via a scalar bias estimator** (`estimator_baro_bias` shows ~434 m); **mag-heading** yaw (`cs_mag_hdg=1`, not 3D → mag_I/mag_B states inert). No flow/range/airspeed/wind/vision.
+7. **Update is sequential & ordered**, short-form (not Joseph): per cycle `mag-yaw → GPS vx,vy,vz → GPS px,py → baro pz → GPS-height pz`; each scalar update does `K=P·Hᵀ/S`, `P -= K·H·P`, `fixCovarianceErrors`, then `fuse` (`x -= K·innov`, renormalize quat). Order is load-bearing because each step mutates P.
+
+## Approach
+
+SymPy is used **once at startup** to build the analytic Jacobians, mirroring how PX4 uses SymForce: symbolically define the covariance-model `f_cov(x, Δvel, Δang, dt)` exactly as `derivation.py:predict_covariance`, take `A=∂f_cov/∂x` (24×24) and `G=∂f_cov/∂[Δvel;Δang]` (24×6), and `lambdify` both to fast NumPy callables. The filter algebra (`P = A P Aᵀ + G·var_u·Gᵀ + Q_add`, the scalar updates) runs in NumPy float64. The nonlinear **state** propagation is coded directly in NumPy (no symbolics needed). Measurement Jacobians: GPS pos/vel/height are direct single-state observations (H is a unit selector → no SymPy needed); mag-heading H comes from a SymPy `lambdify` of the 321/312 yaw predictor (`derivation.py:compute_yaw_321/312_innov_var_and_h`).
+
+No new dependencies (numpy, scipy, sympy, matplotlib, pyulog, PyYAML all present).
+
+## Tool layout & reuse map
+
+```
+ekf_verification/
+  ekf2_offline.py     # CLI: load log, load/dump YAML, run filter, make plots
+  ekf2/
+    __init__.py
+    log_io.py         # LIFT from existing tool: get_dataset/require/vec3/tsec, find_ekf_instance, ekf_imu_devices
+    imu_recon.py      # LIFT: _fifo_samples/_coning_beta/_integrate_windows/_deltas_from_fifo, calibration (find_cal, sensor_rotation, get_rot_matrix, ROT_LOOKUP), get_imu_deltas
+    geo.py            # LIFT: MapProjection, gps_to_ned ; + baro/mag readers (new)
+    quat.py           # LIFT: quat_mult, quat_to_dcm, axis_angle_to_quat, qnorm, euler_to_quat
+    params.py         # NEW: YAML schema (dataclass), load_yaml(), dump_params_from_log()
+    derivation.py     # NEW: SymPy build of A,G (predict) and yaw-H; cached lambdify
+    filter.py         # NEW: Ekf class — state, initialiseCovariance, predictState, predictCovariance, fuse_scalar, fixCovariance, the fusion routines
+    height.py         # NEW: BiasEstimator (scalar KF) for the baro height bias
+    plots.py          # ADAPT existing make_recon_figure into the 2 requested figures
+  configs/
+    OD1A072_params.yaml   # generated via --dump-params from the test log
+  requirements.txt
+  README.md
+```
+
+Lifted helpers are copied (the existing tool isn't a package); keep names/conventions identical so the two tools read alike. **Reuse the existing tool's IMU pipeline and device-id matching unchanged** — it already rebuilds the EKF's exact input and is validated against logged `vehicle_imu`.
+
+## YAML schema (every noise + every delay; `--dump-params` writes this from the log)
+
+```yaml
+predict:        { predict_rate_hz: 100, imu_integ_rate_hz: 200 }   # EKF2_PREDICT_US, IMU_INTEG_RATE
+process_noise:                                                     # input + random-walk
+  gyro_noise: 0.015        # EKF2_GYR_NOISE  -> var_u d_ang_var = (dt*gyro_noise)^2
+  accel_noise: 0.35        # EKF2_ACC_NOISE  -> var_u d_vel_var = (dt*accel_noise)^2
+  gyro_bias_noise: 0.001   # EKF2_GYR_B_NOISE-> Q_add[10:13]=(dt^2*val)^2  (Kahan in PX4; plain add here)
+  accel_bias_noise: 0.003  # EKF2_ACC_B_NOISE-> Q_add[13:16]=(dt^2*val)^2
+  mag_e_noise: 0.001       # EKF2_MAG_E_NOISE (inert: mag_3D off)
+  mag_b_noise: 0.0001      # EKF2_MAG_B_NOISE (inert)
+  wind_nsd: 0.01           # EKF2_WIND_NSD   (inert: wind off)
+measurement_noise:
+  gps_pos_noise: 1.0       # EKF2_GPS_P_NOISE (log value; default 0.5)
+  gps_vel_noise: 0.3       # EKF2_GPS_V_NOISE (vertical inflated x1.5^2)
+  baro_noise: 3.5          # EKF2_BARO_NOISE
+  mag_heading_noise: 0.3   # EKF2_HEAD_NOISE
+  baro_bias_nsd: 0.13      # EKF2_BARO_B_NSD (height bias estimator PSD)
+gates:                     # sigma; test_ratio = innov^2/(gate^2 * innov_var), reject if >1
+  gps_pos_gate: 7.0        # EKF2_GPS_P_GATE
+  gps_vel_gate: 5.0        # EKF2_GPS_V_GATE
+  baro_gate: 5.0           # EKF2_BARO_GATE
+  heading_gate: 2.6        # EKF2_HDG_GATE
+delays_ms:                 # buffer shift = delay_ms*1e3 + dt_ekf_avg*5e5
+  gps_delay: 110.0         # EKF2_GPS_DELAY
+  baro_delay: 0.0          # EKF2_BARO_DELAY
+  mag_delay: 0.0           # EKF2_MAG_DELAY
+init:                      # 1-sigma init uncertainties (scale initialiseCovariance)
+  angle_err_init: 0.1      # EKF2_ANGERR_INIT
+  gyro_bias_init: 0.1      # EKF2_GBIAS_INIT
+  accel_bias_init: 0.2     # EKF2_ABIAS_INIT
+  pos_noaid_noise: 10.0    # EKF2_NOAID_NOISE (cap when GPS is sole aid)
+geometry:                  # lever arms (m, body FRD)
+  imu_pos: [0.0, 0.0, -0.1512]   # EKF2_IMU_POS_*
+  gps_pos: [0.0, 0.0, -0.147]    # EKF2_GPS_POS_*
+height_ref: gps            # EKF2_HGT_REF (gps|baro)
+mag_declination_deg: 9.714 # EKF2_MAG_DECL (used unless geo/WMM; see Risks)
+```
+
+`dump_params_from_log()` reads `ulog.initial_parameters`, maps each `EKF2_*`/`IMU_INTEG_RATE` to the above keys, and writes the YAML. So the default config *is* the flight config → "same values ⇒ match."
+
+## Filter math reference (condensed; exact formulas live in the cited files)
+
+**State propagation** `Ekf.predictState` (mirror `ekf.cpp:253-293`, also existing tool `strapdown()` lines 419-446, but **add earth-rotation**): `δθc = δθ − b_gyro·dt − Rᵀ·ω_earth·dt`; `q = normalize(q ⊗ AxisAngleQuat(δθc))`; `δvc = δv − b_accel·dt`; `v_last=v`; `v += R(q)·δvc`; `v[2] += 9.80665·dt`; `p += ½(v_last+v)·dt`. Track `_dt_ekf_avg` as a slow LP filter of the IMU dt (init 0.01) — it scales all process noise.
+
+**Covariance prediction** `Ekf.predictCovariance` (`covariance.cpp:102-349`): `var_u = diag([d_vel_var×3, d_ang_var×3])` with `d_vel_var=(dt·accel_noise)²`, `d_ang_var=(dt·gyro_noise)²` (order = [Δvel,Δang], matching `G`). `P = A·P·Aᵀ + G·var_u·Gᵀ`; then add to diagonals only: `Q_add[10:13]=(dt²·gyro_bias_noise)²`, `Q_add[13:16]=(dt²·accel_bias_noise)²` (mag/wind terms are zero for this config). Symmetrize the 0:15 block; `fixCovarianceErrors` clamps diagonals.
+
+**Initial covariance** `initialiseCovariance` (`covariance.cpp:53-100`), diagonal (dt=`_dt_ekf_avg`): quat block from `angle_err_init²` + a yaw-err bump (transcribe `ekf_helper.cpp:926-1084` verbatim); `P44=P55=max(gps_vel_noise,0.01)²`, `P66=1.5²·P44`; `P77=P88=max(gps_pos_noise,0.01)²`, `P99=max(1.5·gps_pos_noise,0.01)²` (GPS is height ref); `P[10:13]=(gyro_bias_init·dt)²`, `P[13:16]=(accel_bias_init·dt)²`; mag `=mag_noise²`; wind `=1.0²`.
+
+**Generic scalar update** (`ekf.h:944-972`): given state index `s`, measurement `z`, noise `R`: `S = P[s,s] + R`; `K = P[:,s]/S`; gate `innov²/(gate²·S) ≤ 1`; if healthy `P -= outer(K, P[s,:])`, `fixCovarianceErrors(symmetry=True)`, then `x -= K·innov` (renormalize quat). `checkAndFixCovarianceUpdate` zeros a row/col if an update would drive its variance negative.
+
+**GPS velocity** (`gps_control.cpp`): `obs=gps.vel_ned` (lever-arm corrected by `ω×r`, R→earth); `R_v=(max(gps.sacc, gps_vel_noise))²`, vertical ×1.5²; fuse states 4,5,6 in order, gate `gps_vel_gate`. **GPS hpos:** `obs=gps NE` (projected); `R_p=max(gps.hacc,gps_pos_noise)²` (capped at `pos_noaid_noise` if sole aid); fuse states 7,8; gate `gps_pos_gate`. **GPS height (reference):** `obs = -(gps.hgt − origin_alt)`, `R=max(gps.vacc,1.5·gps_pos_noise)²`; fuse state 9.
+
+**Baro height (secondary, via bias estimator)** `height.BiasEstimator` (`bias_estimator.cpp`): each cycle `predict(dt)`: `state_var += baro_bias_nsd²·dt` (×1e3 if offset detected), clamp. On a baro sample: `fuseBias(meas=baro.hgt−(−pz), meas_var=baro_noise²+P99)`: `S=state_var+max(0.01²,meas_var)`, `K=state_var/S`, gate 3σ, `bias += K·innov`, `state_var -= K·state_var`. Then main-filter vertical fusion: `obs=-(baro.hgt − bias)`, `R=baro_noise²+bias_var`, fuse state 9 (gate `baro_gate`). Baro fuses **before** GPS-height each cycle.
+
+**Mag-heading** (`mag_control.cpp` + `mag_fusion.cpp:fuseYaw`): `R0z=updateYawInRotMat(0,R)`; `mag_e = R0z·(mag − mag_B)`; `meas_hdg = -atan2(mag_e_y, mag_e_x) + decl`; `innov = wrap_pi(getEulerYaw(R) − meas_hdg)`; `R=max(mag_heading_noise²,1e-4)`. H (nonzero only on quat [0:4]) and innov_var from SymPy yaw-321/312 (`derivation.py:256-305`); generic update; gate `heading_gate`. Only thing touching the quaternion, so it perturbs vel/pos covariance through cross-terms.
+
+## Event loop (`ekf2_offline.py` / `filter.run`)
+
+1. Rebuild IMU deltas from FIFO at `imu_integ_rate_hz`; accumulate to `predict_rate_hz` samples.
+2. Seed: pick `t0` at the first valid GPS-aided `estimator_states` sample (reuse `find_init`); set `x` from logged `states[0:10]` (+ logged biases); set `P = initialiseCovariance(params)`.
+3. Maintain a FIFO of the last `ceil(max_delay_ms / predict_period_ms)` IMU samples; the **oldest** is the fusion horizon `t_h`.
+4. Each step: update `_dt_ekf_avg`; `predictCovariance`; `predictState`; then controllers in order, each popping its sensor stream at shifted time `< t_h` (`sensor_t − delay_ms·1e3 − dt_ekf_avg·5e5`): mag-yaw → GPS (vel, hpos; stash sample) → baro-bias predict + baro pz → GPS-height pz.
+5. Record `x` and `diag(P)` at each `t_h`.
+
+## Plots (`plots.py`, two figures, PNG + `.fig.pkl` via existing `save_fig`)
+
+- **Figure 1 — pos/vel reconstruction** (3×2: N/E/D × pos/vel): logged flight EKF estimate (`estimator_states` states[4:10]); **reconstructed EKF**; **GPS** overlay (`gps_to_ned`, fix≥3); **±3σ band from the reconstructed signal** (`3·sqrt(diag(P)_recon)`). Adapt `make_recon_figure` (existing lines 524-563), swapping the IMU-only trace for the reconstructed EKF and drawing the band from the reconstruction.
+- **Figure 2 — variance comparison** (3×2: N/E/D × pos/vel): reconstructed variance `diag(P)_recon[4:10]` vs logged `estimator_states.covariances[4:10]`, sampled at the log's timestamps. Plot both variances (or σ) per component to expose where tuning diverges from the flight.
+
+## Verification (end-to-end)
+
+1. `python ekf2_offline.py <log> --dump-params configs/OD1A072_params.yaml` → inspect mapping.
+2. `python ekf2_offline.py <log> --params configs/OD1A072_params.yaml` → writes both figures. **Acceptance:** after burn-in, reconstructed pos/vel overlay the logged EKF; reconstructed variance tracks `covariances[4:9]` to sub-% in steady aiding; logged EKF estimate sits inside the reconstructed ±3σ.
+3. **Intermediate numeric checks** (printed): compare per-step innovations & innovation variances against `estimator_innovations` / `estimator_innovation_variances` (`gps_hpos/hvel/vpos/vvel`, `baro_vpos`, `heading`) — these isolate fusion-math errors from accumulated drift. Compare `height.BiasEstimator` output to `estimator_baro_bias.bias/bias_var`.
+4. **Tuning sanity:** double `gps_pos_noise` in the YAML → reconstructed position band must widen vs the flight; re-run confirms.
+
+## Risks / limitations (honest bounds on "identical")
+
+- **Off-diagonals are unobservable from the log** → exact cold-seed P is impossible; relies on burn-in convergence (sound for RTK-observed pos/vel; weaker for biases/quaternion).
+- **float32 (PX4) vs float64 (us)** and SymPy CSE ordering ⇒ no bit-exactness (accepted per fidelity choice).
+- **IMU rebuilt from FIFO** ≈ but ≠ the exact `vehicle_imu` stream (calibration/integration-window edges).
+- **Mag declination**: PX4 `EKF2_DECL_TYPE=7` uses a GPS-location WMM value, not `EKF2_MAG_DECL`. We use the param (overridable); minor 2nd-order effect on pos/vel covariance for a hover.
+- **Resets** in the log (`*_reset_counter`, EKFGSF yaw) are discontinuities; detect via counters and re-seed if encountered (the calm pos-hold test likely has none after init).
+- **Firmware match**: verify the log's `estimator_states` has 24 states in this layout (it does) and that the repo fork matches; flag if a different log uses the newer modular EKF.
+- **Manoeuvre-dependent accel-bias inhibit** and gravity fusion are omitted in v1 (negligible for a calm hover; revisit if bias variance diverges).

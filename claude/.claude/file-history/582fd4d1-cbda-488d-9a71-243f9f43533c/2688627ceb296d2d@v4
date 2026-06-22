@@ -1,0 +1,54 @@
+# Plan: Verify and report the gyro filter order in VehicleAngularVelocity
+
+## Context
+
+The user wants to know — by reading the actual source — when the **low-pass filter** and the
+**notch filter** are applied in `vehicle_angular_velocity`, and **which one comes first**.
+
+This is a narrow, single-file investigation with a definitive binary answer. The natural
+deliverable is an in-conversation answer with a code snippet and `file:line` citations — no new
+document, no edits to any other file. (Cross-references the prior `imu_clarification_2026-05-14.*`
+note, which already documents the chain at a higher level.)
+
+This supersedes the previous EKF2 documentation plan, which is complete (the
+`ekf2_estimator_pipeline_2026-05-25.*` deliverables are already shipped in
+`/home/choudhury/knightwerx-vault/px4-notes/`).
+
+## Verified findings (source @ HEAD `791030d721`, branch `hotfix`)
+
+The filter chain lives in `VehicleAngularVelocity::FilterAngularVelocity()` at
+`src/modules/sensors/vehicle_angular_velocity/VehicleAngularVelocity.cpp:725-768`. Each axis runs
+through this exact sequence:
+
+1. **Dynamic notch — ESC RPM** (`:729-740`) — `_dynamic_notch_filter_esc_rpm[h][axis][esc].applyArray(data, N)`; only if the array is allocated and `getNotchFreq() > 0`. Enabled by `IMU_GYRO_DNF_EN` bit 0.
+2. **Dynamic notch — FFT peaks** (`:742-749`) — `_dynamic_notch_filter_fft[axis][peak].applyArray(data, N)`; only if `_dynamic_notch_fft_available`. Enabled by `IMU_GYRO_DNF_EN` bit 1.
+3. **Static notch 0** (`:753-756`) — `_notch_filter0_velocity[axis].applyArray(data, N)`; only if `getNotchFreq() > 0`, i.e. `IMU_GYRO_NF0_FRQ > 0` (default 0 — disabled).
+4. **Static notch 1** (`:758-761`) — `_notch_filter1_velocity[axis].applyArray(data, N)`; only if `IMU_GYRO_NF1_FRQ > 0` (default 0 — disabled).
+5. **Low-pass biquad** (`:764`) — `_lp_filter_velocity[axis].applyArray(data, N)`; **always** applied; cutoff `IMU_GYRO_CUTOFF` (default 40 Hz).
+
+**Answer: all four notch stages run first; the low-pass is last.**
+
+**Why this order (standard signal-processing rationale):** notches need to attack the original
+narrow-band peaks (motor/ESC vibration, FFT-detected resonances) at their full amplitude. Running
+the broadband LPF first would attenuate and phase-shift the very peaks the notches are tuned to
+cancel, hurting their effectiveness, and would also add LPF group delay before the notches see the
+signal.
+
+**Bonus — angular acceleration (D-term) path.** `FilterAngularAcceleration()` at `:770-782`
+back-differences the **pre-LPF (raw) gyro** (`data[n] - _angular_velocity_raw_prev`) and then runs
+that through a separate alpha low-pass at `IMU_DGYRO_CUTOFF` — so the published
+`vehicle_angular_velocity.xyz_derivative` is NOT a numerical derivative of the LPF'd `xyz`. This is
+already documented in `imu_clarification_2026-05-14.*` §3.2 and FAQ.
+
+## Deliverable
+
+In-conversation reply listing the ordered chain with `file:line` citations and quoting the ~40-line
+function body so the order is unambiguous. **No file artifacts**; nothing modified or committed.
+
+## Verification
+
+- Source verified at commit `791030d721` (branch `hotfix`) via direct Reads of
+  `VehicleAngularVelocity.cpp` (the function body at 720-790) and `imu_gyro_parameters.c` for the
+  `IMU_GYRO_*` parameter defaults.
+- Consistent with the prior `imu_clarification_2026-05-14.*` §3.2 description.
+- No PX4 source modifications; no commits.

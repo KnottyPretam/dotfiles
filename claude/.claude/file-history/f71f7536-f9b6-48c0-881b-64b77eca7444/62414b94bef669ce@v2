@@ -1,0 +1,197 @@
+set(0,'DefaultLineLineWidth',2)
+set(0,'DefaultAxesFontSize',12);
+set(0,'DefaultFigureColor',[1,1,1])
+set(0,'DefaultFigureWindowStyle','docked')
+set(0,'DefaultFigureCreateFcn',@(fig,~)addToolbarExplorationButtons(fig))
+rng(1) % reset seed for the noise model
+
+addpath('/home/choudhury/repos/sysID_tool');
+addpath('/home/choudhury/repos/sysID_tool/Utilities');
+
+clc
+clear
+close all
+
+%% Input Frequency Sweep Test Data
+
+if 0
+    % Run simulation for system ID
+    generate_simulated_sys_id_data
+
+    tf_analytical = tf(Mdele, [1 0]);
+    
+    tf_analytical.InputDelay = Vehicle.input_time_delay_s;
+    
+    % Clean up simulated data
+    clearvars -except q_rps dele_total chirp_time_s freq_init_Hz freq_end_Hz tf_analytical
+
+else
+
+    % OR input flight test data:
+    % q_rps:            body rate data
+    % dele_total:       total input to the mixer
+    % chirp_time_s:     corresponding time vector
+    % freq_init_Hz:     starting frequency of the chirp
+    % freq_end_Hz:      ending frequency of the chirp
+
+   % load('sample_flight_data.mat');
+    logData = load('/home/choudhury/analysis/flight_tests/oddjob/oddjob_chirps_05-19-26/flightLogs/OD1A053_rpyChirp_PA60.mat');
+    command_time      = logData.d.vehicle_torque_setpoint_0.timestamp*1e-6;
+    command_defl      = logData.d.vehicle_torque_setpoint_0.rpy(:,2);
+    measured_time     = logData.d.vehicle_angular_velocity_0.timestamp*1e-6;
+    measured_rate     = logData.d.vehicle_angular_velocity_0.rpy(:,2);
+
+    chirp_time_s = command_time;
+    dele_total   = command_defl;
+    q_rps        = interp1(measured_time, measured_rate, chirp_time_s);
+
+    % Drop command samples that fall outside the measurement time range
+    % (interp1 returns NaN there; a single NaN poisons the cubic detrend and FFT).
+    valid        = ~isnan(q_rps);
+    chirp_time_s = chirp_time_s(valid);
+    dele_total   = dele_total(valid);
+    q_rps        = q_rps(valid);
+
+end
+
+%% Plot Chirp Time History
+chirp_time_s = chirp_time_s - chirp_time_s(1);
+freq_init_Hz = 0.01;
+freq_end_Hz  = 5.5;
+
+fig_td = figure('Name', 'Time Domain Data');
+
+subplot(2,1,1)
+plot(chirp_time_s, dele_total, 'b'); grid on; hold on
+ylabel('Dele Cmd')
+
+subplot(2,1,2)
+plot(chirp_time_s, q_rps*180/pi, 'b'); grid on; hold on
+ylabel('Q (deg/s)')
+
+xlabel('Time (sec)')
+
+%% Preprocessing
+dt = mean(diff(chirp_time_s));
+
+% resample data at consistent DT
+t               = [chirp_time_s(1):dt:chirp_time_s(end)]';
+dele_total      = interp1(chirp_time_s, dele_total, t);
+q_rps           = interp1(chirp_time_s, q_rps, t);
+chirp_time_s    = t;
+
+% Detrend the data:
+dele_total      = nonlinear_detrend(dele_total, chirp_time_s);
+q_rps           = nonlinear_detrend(q_rps, chirp_time_s);
+
+freq_sample     = 1/dt;             % sampling frequency
+freq_nyquist    = freq_sample/2;    % nyquist frequency
+
+freq_Hz         = linspace(0, 1, fix(length(chirp_time_s)/2)+1)*freq_nyquist;  % frequency vector of interest
+
+%% Estimate Frequency Response from Time History
+
+% Estimate gain and phase from the time history data:
+[mag_dB, phase_deg, freq_meas_Hz, coherence, Gyu, Syu, Syy, Suu] = estimate_freq_response(q_rps, dele_total, chirp_time_s, freq_init_Hz, freq_end_Hz);
+
+idx_keep = coherence > 0.6; % coherence cutoff limit
+
+freq_meas_Hz    = freq_meas_Hz(idx_keep);
+mag_dB          = mag_dB(idx_keep);
+phase_deg       = phase_deg(idx_keep);
+coherence       = coherence(idx_keep);
+
+% Plot the frequency domain estimates ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+fig_Bode = figure('Name','Plant Bode Plot');
+
+subplot(3,1,1)
+semilogx(freq_meas_Hz, mag_dB,'o','LineWidth',1.5,'MarkerSize',6);
+grid on; hold on
+
+ylabel('Gain (dB)')
+xlabel('Frequency (Hz)')
+
+legend('Transfer Function Truth/Analytical', 'Sys-ID Bode Est', 'Location', 'Best')
+
+subplot(3,1,2)
+semilogx(freq_meas_Hz, wrapTo180_custom(phase_deg),'o','LineWidth',1.5,'MarkerSize',6)
+grid on; hold on
+
+ylabel('Phase (deg)')
+xlabel('Frequency (Hz)')
+
+subplot(3,1,3)
+semilogx(freq_meas_Hz, coherence, 'LineWidth', 1.5, 'MarkerSize', 6)
+grid on; hold on
+
+ylabel('Coherence ')
+xlabel('Frequency (Hz)')
+
+linkaxes(findall(gcf,'type','axes'),'x')
+
+%% Estimate a Transfer Function
+
+% Estimate numerator, denominator, and time delay from gain and phase
+[num, den, tau] = estimate_tf_from_freq_response(freq_meas_Hz, mag_dB, phase_deg, 1, 0); 
+
+% Display the estimated transfer functions:
+tf_est = tf(num, den, 'InputDelay', tau)
+
+% Plot the tf estimates ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+sys_id_freqresp = freqresp(tf_est, freq_Hz, 'Hz'); 
+sys_id_freqresp = reshape(sys_id_freqresp, size(freq_Hz));
+
+figure(fig_Bode);
+subplot(3,1,1)
+semilogx(freq_Hz, 20*log10(abs(sys_id_freqresp))); grid on; hold on
+
+ylabel('Gain (dB)')
+xlabel('Frequency (Hz)')
+
+legend('Sys-ID Bode Est', 'Transfer Function Estimate', 'Location', 'Best')
+
+subplot(3,1,2)
+semilogx(freq_Hz, angle(sys_id_freqresp)*180/pi); grid on; hold on
+
+ylabel('Phase (deg)')
+xlabel('Frequency (Hz)')
+
+xlim([0.01, 1000])
+
+%% Compute Attitude Control Gains
+
+% Tuning parameters ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+% Phase margin target:
+PM_target_deg   = 60;               % Keep this between 45 deg and 90 deg. Lower PM gives faster response but reduces stability.
+% Bandwidth targets:
+wc_inner_Hz     = 3;                % Higher value gives faster response, but degrades nonlinear stability, saturates motors, etc
+wc_outer_Hz     = wc_inner_Hz/3;    % Outer loop bandwidth should be 3-5 times slower than the inner loop
+
+[Kp_rate, Ki_rate, Kp_attitude, GM_dB, PM_deg] = compute_attitude_control_gains(num, den, tau, PM_target_deg, wc_inner_Hz, wc_outer_Hz)
+
+%% Plot Linear Time History
+q_est_rps = lsim(tf_est, dele_total, chirp_time_s);
+ 
+figure(fig_td)
+
+subplot(2,1,1)
+plot(chirp_time_s, dele_total); grid on; hold on
+ylabel('Dele Cmd')
+
+legend('Raw Input', 'Detrended Input')
+
+subplot(2,1,2)
+plot(chirp_time_s, q_est_rps*180/pi); grid on; hold on
+ylabel('Q (deg/s)')
+
+legend('Non-Linear Measurements', 'Linear Sys-ID Model')
+
+xlabel('Time (sec)')
+
+
+
+
+
+
+
+

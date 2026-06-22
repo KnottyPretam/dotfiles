@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Sanity-check that vehicle_torque_setpoint vs. vehicle_rates_setpoint as the sysID
+# input do NOT give the same identified TF. The former identifies the open-loop plant
+# P_rate; the latter identifies the closed-loop rate transfer T_rate.
+#
+# Usage: ./compare_inputs.sh /path/to/log.ulg
+
+set -euo pipefail
+
+ulg="${1:?usage: compare_inputs.sh <path.ulg>}"
+if [[ ! -r "$ulg" || "$ulg" != *.ulg ]]; then
+    echo "not a readable .ulg: $ulg" >&2
+    exit 1
+fi
+
+ulg_abs="$(readlink -f "$ulg")"
+ts="$(date +%Y%m%d_%H%M%S)"
+base="$(basename "$ulg_abs" .ulg)"
+here="$(cd "$(dirname "$0")" && pwd)"
+cwd="$(pwd)"
+outdir="${cwd}/output/compare_inputs_${base}_${ts}"
+mkdir -p "$outdir"
+log="${outdir}/run.log"
+
+cd "$here"
+nohup matlab -batch "compare_inputs('${ulg_abs}','${outdir}')" > "$log" 2>&1 &
+pid=$!
+echo "PID=$pid"
+echo "log=$log"
+echo "outdir=$outdir"

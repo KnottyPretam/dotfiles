@@ -1,0 +1,40 @@
+function results = run_sysid(input_path, run_dir, opts)
+% RUN_SYSID  Drive sys-ID + gain design from either a .mat or a ULog.
+%
+%   results = run_sysid(input_path, run_dir)
+%   results = run_sysid(input_path, run_dir, opts)
+%
+% If INPUT_PATH is a ULog (.ulg/.ulog) it is converted to a Thunderball-
+% compatible .mat (struct 'd') with ulog_to_mat and saved inside RUN_DIR.
+% If it is a .mat it is used as-is. Then run_system_id_and_gain_design runs
+% for roll/pitch/yaw, writing figures + margins + results into RUN_DIR.
+% opts is forwarded to run_system_id_and_gain_design (see its help).
+
+if nargin < 3; opts = struct(); end
+
+here = fileparts(mfilename('fullpath'));
+addpath(here);
+
+if ~exist(run_dir, 'dir'); mkdir(run_dir); end
+
+[indir, inname, ext] = fileparts(input_path);
+switch lower(ext)
+    case '.mat'
+        mat_path = input_path;
+        % Locate the as-flown params (for current-system margins): a sibling
+        % <name>.prm, or a params.prm next to the .mat (e.g. a regenerated run).
+        for c = {fullfile(indir, [inname '.prm']), fullfile(indir, 'params.prm')}
+            if exist(c{1}, 'file'); opts.prm_path = c{1}; break; end
+        end
+    case {'.ulg', '.ulog'}
+        mat_path = ulog_to_mat(input_path, run_dir);
+        if exist(fullfile(run_dir, 'params.prm'), 'file')
+            opts.prm_path = fullfile(run_dir, 'params.prm');   % dumped by ulog_to_mat
+        end
+    otherwise
+        error('run_sysid:badInput', ...
+            'Unsupported input ''%s''. Expected a .mat or .ulg/.ulog file.', input_path);
+end
+
+results = run_system_id_and_gain_design(mat_path, run_dir, opts);
+end

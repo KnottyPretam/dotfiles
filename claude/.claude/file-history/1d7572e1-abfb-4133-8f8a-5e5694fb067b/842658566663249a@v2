@@ -1,0 +1,1324 @@
+#!/usr/bin/env python3
+"""
+IMU vibration & failure-mode analysis for log_1_2026-4-29-13-48-36.
+
+
+Outputs (all written to OUTDIR, default ./imuVibe_<logName>_plots/):
+  - imu_vibration_metrics.png        : per-IMU vibration metrics + clipping counters
+  - imu_accel_vehicle_imu_mag.png    : vehicle_imu per-axis acceleration (g)
+  - imu_gyro_vehicle_imu_mag.png     : vehicle_imu per-axis angular velocity (deg/s)
+  - imu_fft_<sensor>_<N>.png         : direct flat-top FFT PSD from sensor_*_fifo (raw)
+  - imu_fft_<sensor>_vehicle_imu_<N>.png : vehicle_imu FFT PSD per instance
+  - imu_gyro_vehicle_angular_velocity_mag.png : filtered controller rate, per-axis time series
+  - imu_fft_gyro_vehicle_angular_velocity.png : filtered controller rate FFT PSD
+  - imu_fft_vehicle_torque_setpoint.png : torque setpoint (roll/pitch/yaw) FFT PSD
+  - imu_consistency.png              : per-axis disagreement across the IMUs
+  - imu_timing_vehicle_imu.png       : vehicle_imu Δt + vehicle_imu_status error counters
+  - imu_timing_sensor_accel_fifo.png : sensor_accel_fifo per-sample Δt + inferred dropouts
+  - imu_bias_drift.png               : estimator_sensor_bias trends
+  - imu_selection.png                : which sensor was selected over time
+  - imu_innovations.png              : EKF innovations & test ratios
+  - motor_rpm_sources.png            : esc_status per-motor RPM (time-series + PSD)
+  - motor_current_sources.png        : esc_status per-motor current (time-series + PSD)
+  - motor_pwm_sources.png            : actuator_outputs PWM per channel (time-series + PSD)
+  - actuator_motor_sources.png       : actuator_motors control[*] time-series + flat-top FFT PSD
+  - actuator_servo_sources.png       : actuator_servos control[*] time-series + flat-top FFT PSD
+  - actuator_outputs_<i>_sources.png : actuator_outputs[i] output[*] time-series + flat-top FFT PSD
+  - imu_findings.txt                 : printed verdict
+
+Every *.png above also gets a companion *.pkl.gz (gzipped pickled matplotlib Figure)
+written alongside it. Reopen one interactively with `python show_figure.py <file.pkl.gz>`
+to zoom, read off exact values, and click-annotate data points.
+"""
+
+import argparse
+import gzip
+import pickle
+import sys
+from pathlib import Path
+import numpy as np
+import matplotlib.pyplot as plt
+from pyulog import ULog
+from scipy.signal import find_peaks, welch, detrend
+from scipy.signal.windows import flattop
+
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+
+# ---------- config ----------
+ULOG_PATH = "log_1_2026-4-29-13-48-36.ulg"
+EVENT_START_S = 72.76
+EVENT_END_S   = 102.91
+PRE_S         = 10.0
+OUTDIR        = None  # filled in by main() as ${PWD}/imuVibe_<logName>_plots
+                       # unless --outdir or YAML 'outdir' overrides.
+G_MS2         = 9.80665   # 1 g in m/s²
+RAD_TO_DEG    = 180.0 / np.pi
+SDLOG_MODE    = 0         # 0=log-from-boot, 1=armed-only, 2=armed+pre-buffer
+T_OFFSET      = 0.0       # set in main(); subtracted from every plotted t array
+
+# Software low-pass filter cutoffs (Hz). These are PX4 IMU_*_CUTOFF defaults;
+# override with what you have set on this airframe (param show IMU_*).
+LPF_CUTOFFS = {
+    "accel": {
+        "IMU_ACCEL_CUTOFF": 30.0,   # default 30 Hz software LPF on accel
+    },
+    "gyro": {
+        "IMU_GYRO_CUTOFF":  25.0,   # default 25 Hz software LPF on gyro for control
+        "IMU_DGYRO_CUTOFF": 30.0,   # derivative-of-gyro LPF for D term
+    },
+}
+
+# Hardware DLPF / Nyquist references per chip on the Control Zero.
+# These help identify aliasing risk in the FFT plots.
+HW_REFERENCES = {
+    "accel": [
+        ("ICM-20602 DLPF (~218 Hz)",  218.0),
+        ("BMI088 accel BW (~145 Hz)", 145.0),
+        ("ICM-20948 DLPF (~246 Hz)",  246.0),
+    ],
+    "gyro": [
+        ("ICM-20602 DLPF (~250 Hz)",  250.0),
+        ("BMI088 gyro BW (~230 Hz)",  230.0),
+        ("ICM-20948 DLPF (~197 Hz)",  197.0),
+    ],
+}
+
+# ---------- helpers ----------
+def load(ulog_path):
+    return ULog(ulog_path)
+
+def get_topic(ulog, name, instance=None):
+    for d in ulog.data_list:
+        if d.name == name and (instance is None or d.multi_id == instance):
+            return d
+    return None
+
+def all_instances(ulog, name):
+    return [d for d in ulog.data_list if d.name == name]
+
+def t_seconds(d, ulog):
+    # FMU-boot seconds, shifted by T_OFFSET (=0 unless SDLOG_MODE==0, in which
+    # case the actuator_outputs first sample becomes the new origin so plot
+    # axes start near zero). User-facing constants stay in absolute boot time;
+    # callers that compare against them subtract T_OFFSET themselves.
+    return d.data["timestamp"] / 1e6 - T_OFFSET
+
+def slice_window(t, x, t0, t1):
+    m = (t >= t0) & (t <= t1)
+    return t[m], x[m]
+
+def fifo_to_series(d):
+    """Expand a sensor_*_fifo topic (batched) into per-sample (t, x, y, z)
+    arrays in physical units. Each ULog row carries up to 32 raw int16
+    samples; we keep only the first `samples` of each row, scale them, and
+    rebuild per-sample timestamps from `timestamp_sample` (last sample) and
+    `dt` (intra-batch period)."""
+    ts_last = d.data["timestamp_sample"].astype(np.int64)  # µs, last sample
+    dt_us   = d.data["dt"].astype(np.int64)                # µs, intra-batch
+    nsamp   = d.data["samples"].astype(np.int32)
+    scale   = d.data["scale"].astype(np.float64)
+
+    X = np.stack([d.data[f"x[{k}]"] for k in range(32)], axis=1).astype(np.float64)
+    Y = np.stack([d.data[f"y[{k}]"] for k in range(32)], axis=1).astype(np.float64)
+    Z = np.stack([d.data[f"z[{k}]"] for k in range(32)], axis=1).astype(np.float64)
+
+    out_t, out_x, out_y, out_z = [], [], [], []
+    for i in range(len(ts_last)):
+        n = int(nsamp[i])
+        if n <= 0:
+            continue
+        # sample k (0..n-1) was taken at ts_last - (n-1-k)*dt
+        t_us = ts_last[i] - (n - 1 - np.arange(n)) * dt_us[i]
+        out_t.append(t_us)
+        out_x.append(X[i, :n] * scale[i])
+        out_y.append(Y[i, :n] * scale[i])
+        out_z.append(Z[i, :n] * scale[i])
+
+    t = np.concatenate(out_t) / 1e6 - T_OFFSET  # FMU-boot seconds, shifted
+    return t, np.concatenate(out_x), np.concatenate(out_y), np.concatenate(out_z)
+
+def direct_fft(x, fs, t=None):
+    """Single flat-top-windowed rfft over the whole segment.
+    Returns (freq, amp, psd):
+      amp — coherent-gain-corrected one-sided peak amplitude in signal units.
+      psd — one-sided power spectral density in units²/Hz.
+    Matches fft_accel_fifo.amplitude_spectrum (flat-top picks accurate peak
+    heights regardless of bin alignment); the PSD view is the same FFT
+    re-normalized by the window's noise gain.
+
+    Preprocessing (the rfft assumes a uniformly-sampled, trend-free segment):
+    if sample times t are given, x is first resampled onto a uniform grid at
+    rate fs spanning [t[0], t[-1]] (fills timing jitter / dropped samples);
+    then scipy.signal.detrend removes the linear trend before windowing."""
+    x = np.asarray(x, dtype=np.float64)
+    if t is not None:
+        t = np.asarray(t, dtype=np.float64)
+        n = max(int(round((t[-1] - t[0]) * fs)) + 1, 2)
+        t_uniform = t[0] + np.arange(n) / fs
+        x = np.interp(t_uniform, t, x)
+    x = detrend(x, type="linear")
+    N = x.size
+    w = flattop(N)
+    X = np.fft.rfft(x * w)
+    freq = np.fft.rfftfreq(N, d=1.0 / fs)
+
+    amp = (2.0 / (N * w.mean())) * np.abs(X)
+    amp[0] /= 2.0
+    if N % 2 == 0:
+        amp[-1] /= 2.0
+
+    psd = (np.abs(X) ** 2) / (fs * np.sum(w * w))
+    if N % 2 == 0:
+        psd[1:-1] *= 2.0
+    else:
+        psd[1:] *= 2.0
+    return freq, amp, psd
+
+def annotate_top_peaks(ax, freqs, psd, n_peaks=6, color="darkorange"):
+    """Mark the top-N peaks by prominence on a log-PSD plot."""
+    if len(psd) < 16:
+        return
+    log_psd = np.log10(np.maximum(psd, 1e-30))
+    # distance=5 bins keeps us from picking shoulders of the same peak
+    peaks, props = find_peaks(log_psd, distance=5, prominence=0.3)
+    if len(peaks) == 0:
+        return
+    order = np.argsort(props["prominences"])[::-1][:n_peaks]
+    for idx in order:
+        f = freqs[peaks[idx]]
+        p = psd[peaks[idx]]
+        ax.plot(f, p, "v", color=color, markersize=5)
+        ax.annotate(f"{f:.0f} Hz", xy=(f, p), xytext=(0, 8),
+                    textcoords="offset points", fontsize=7,
+                    color=color, ha="center")
+
+def add_lpf_lines(ax, sensor_kind, fs, include_hw=True):
+    """Draw vertical lines for software LPF cutoffs and chip hardware DLPFs.
+    Skip lines past Nyquist. Set include_hw=False to omit the chip-specific
+    HW DLPF lines (e.g. for control signals that aren't sensor measurements)."""
+    nyq = fs / 2.0
+    sw = LPF_CUTOFFS.get(sensor_kind, {})
+    for name, f in sw.items():
+        if f < nyq:
+            ax.axvline(f, color="green", linestyle="--", linewidth=1.2,
+                       alpha=0.8, label=f"{name}={f:g} Hz")
+    if include_hw:
+        for name, f in HW_REFERENCES.get(sensor_kind, []):
+            if f < nyq:
+                ax.axvline(f, color="purple", linestyle=":", linewidth=1,
+                           alpha=0.6, label=name)
+    ax.axvline(nyq, color="red", linestyle="-", linewidth=0.8, alpha=0.4,
+               label=f"Nyquist={nyq:.0f} Hz")
+
+def save_fig(fig, outpath, dpi=120):
+    """Write a figure as PNG and as a gzipped pickle (.pkl.gz) alongside it,
+    then close it. The .pkl.gz can be reopened interactively with show_figure.py."""
+    fig.savefig(outpath, dpi=dpi)
+    gz_path = outpath.with_suffix(".pkl.gz")
+    with gzip.open(gz_path, "wb") as f:
+        pickle.dump(fig, f)
+    plt.close(fig)
+
+# ---------- 1. vibration metrics & clipping ----------
+def plot_vibration_metrics(ulog, outpath):
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    instances = all_instances(ulog, "vehicle_imu_status")
+    print(f"[vibration] found {len(instances)} vehicle_imu_status instances")
+
+    for d in instances:
+        i = d.multi_id
+        t = t_seconds(d, ulog)
+        if "accel_vibration_metric" in d.data:
+            axes[0].plot(t, d.data["accel_vibration_metric"], label=f"IMU{i}")
+        if "gyro_vibration_metric" in d.data:
+            axes[1].plot(t, d.data["gyro_vibration_metric"] * RAD_TO_DEG,
+                         label=f"IMU{i}")
+        # pyulog flattens vector fields into per-index keys.
+        clip_keys = [f"accel_clipping[{k}]" for k in range(3)
+                     if f"accel_clipping[{k}]" in d.data]
+        if clip_keys:
+            total = sum(d.data[k] for k in clip_keys)
+            axes[2].plot(t, total, label=f"IMU{i} (XYZ sum)")
+
+    for ax in axes:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="upper left", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("accel_vibration_metric\n(m/s² RMS HP)")
+    axes[1].set_ylabel("gyro_vibration_metric\n(deg/s RMS HP)")
+    axes[2].set_ylabel("cumulative\naccel clipping count")
+    axes[2].set_xlabel("time (s)")
+    fig.suptitle("IMU vibration metrics & clipping")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[vibration] wrote {outpath}")
+
+# ---------- 2. FFT per IMU around the event ----------
+def fft_around_event(ulog, outdir, t0, t1, show_lpf=True):
+    """Compute FFT for sensor_accel_fifo and sensor_gyro_fifo per instance
+    over the [t0, t1] window. The FIFO topics carry the raw high-rate stream
+    (kHz)."""
+
+    accel_inst = all_instances(ulog, "sensor_accel_fifo")
+    gyro_inst  = all_instances(ulog, "sensor_gyro_fifo")
+    print(f"[fft] {len(accel_inst)} sensor_accel_fifo, {len(gyro_inst)} sensor_gyro_fifo")
+
+    for sensor_kind, instances, ylabel, scale in [
+        ("accel", accel_inst, "PSD g²/Hz",       1.0 / G_MS2),
+        ("gyro",  gyro_inst,  "PSD (deg/s)²/Hz", RAD_TO_DEG),
+    ]:
+        for d in instances:
+            i = d.multi_id
+            dev_id = int(d.data["device_id"][0]) if "device_id" in d.data else None
+            dev_str = f", device_id={dev_id}" if dev_id is not None else ""
+            t, x, y, z = fifo_to_series(d)
+            mask = (t >= t0) & (t <= t1)
+            if mask.sum() < 256:
+                print(f"[fft]   {sensor_kind}{i}: too few samples")
+                continue
+            tw = t[mask]
+            x, y, z = x[mask] * scale, y[mask] * scale, z[mask] * scale
+            dt = float(np.median(d.data["dt"])) / 1e6
+            fs = 1.0 / dt
+
+            fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+            for ax, axis_data, axis_name in zip(axes, [x, y, z], ["X", "Y", "Z"]):
+                freqs, _, psd = direct_fft(axis_data, fs, t=tw)
+                ax.plot(freqs, psd, color="steelblue", linewidth=0.8)
+                annotate_top_peaks(ax, freqs, psd, n_peaks=6)
+                ax.set_ylabel(f"{axis_name} {ylabel}")
+                ax.grid(True, which="both", alpha=0.3)
+                ax.set_xlim(0, fs / 2)
+                if show_lpf:
+                    add_lpf_lines(ax, sensor_kind, fs)
+                ax.legend(loc="upper right", fontsize=7)
+            axes[-1].set_xlabel("Frequency (Hz)")
+            res_hz = fs / len(x)
+            fig.suptitle(f"FFT PSD (flat-top) of sensor_{sensor_kind}_fifo_{i}"
+                         f"{dev_str}, fs={fs:.0f} Hz")
+            fig.tight_layout()
+            outpath = outdir / f"imu_fft_{sensor_kind}_{i}.png"
+            save_fig(fig, outpath)
+            print(f"[fft] wrote {outpath}")
+
+# ---------- 2b. magnitude time series from FIFO topics ----------
+def plot_fifo_magnitude_timeseries(ulog, outdir):
+    """Per-axis (X, Y, Z) time series from the high-rate FIFO topics, one
+    file per IMU instance."""
+    for sensor_kind, units, scale in [
+        ("accel", "g",     1.0 / G_MS2),
+        ("gyro",  "deg/s", RAD_TO_DEG),
+    ]:
+        instances = all_instances(ulog, f"sensor_{sensor_kind}_fifo")
+        if not instances:
+            print(f"[mag_ts] no sensor_{sensor_kind}_fifo; skipping")
+            continue
+        for d in instances:
+            i = d.multi_id
+            dev_id = int(d.data["device_id"][0]) if "device_id" in d.data else None
+            dev_str = f", device_id={dev_id}" if dev_id is not None else ""
+            t, x, y, z = fifo_to_series(d)
+            fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+            for ax, axis_data in zip(axes, [x, y, z]):
+                ax.plot(t, axis_data * scale, color="steelblue",
+                        label=f"sensor_{sensor_kind}_fifo_{i}",
+                        linewidth=0.4, alpha=0.6)
+            for ax, axis_name in zip(axes, ["X", "Y", "Z"]):
+                ax.set_ylabel(f"{sensor_kind} {axis_name} ({units})")
+                ax.legend(loc="upper right", fontsize=8)
+                ax.grid(True, alpha=0.3)
+            axes[-1].set_xlabel("time (s)")
+            fig.suptitle(f"sensor_{sensor_kind}_fifo_{i}{dev_str} "
+                         f"per-axis time series")
+            fig.tight_layout()
+            outpath = outdir / f"imu_{sensor_kind}_fifo_mag_{i}.png"
+            save_fig(fig, outpath)
+            print(f"[mag_ts] wrote {outpath}")
+
+# ---------- 2a'. FFT per vehicle_imu instance (delta_velocity / delta_angle) ----------
+def fft_vehicle_imu(ulog, outdir, t0, t1, show_lpf=True):
+    """Direct flat-top FFT PSD of vehicle_imu acceleration (delta_velocity /
+    delta_velocity_dt, g) and angular velocity (delta_angle / delta_angle_dt,
+    deg/s) over [t0, t1], per instance. Matches the layout of fft_around_event
+    for sensor_*_fifo. Note: vehicle_imu publish rate is typically far lower
+    than the raw FIFO stream, so usable bandwidth is correspondingly limited."""
+    instances = all_instances(ulog, "vehicle_imu")
+    if not instances:
+        print("[fft_vehicle_imu] no vehicle_imu; skipping")
+        return
+    for sensor_kind, delta_field, dt_field, ylabel, scale in [
+        ("accel", "delta_velocity", "delta_velocity_dt", "PSD g²/Hz",       1.0 / G_MS2),
+        ("gyro",  "delta_angle",    "delta_angle_dt",    "PSD (deg/s)²/Hz", RAD_TO_DEG),
+    ]:
+        for d in instances:
+            i = d.multi_id
+            if dt_field not in d.data:
+                continue
+            t = t_seconds(d, ulog)
+            dt_int = d.data[dt_field].astype(np.float64) / 1e6
+            valid = dt_int > 0
+            axes_data = []
+            for k in range(3):
+                key = f"{delta_field}[{k}]"
+                if key not in d.data:
+                    break
+                rate = np.zeros_like(dt_int)
+                rate[valid] = d.data[key][valid] / dt_int[valid]
+                axes_data.append(rate * scale)
+            if len(axes_data) < 3:
+                continue
+            mask = (t >= t0) & (t <= t1) & valid
+            if mask.sum() < 256:
+                print(f"[fft_vehicle_imu]   {sensor_kind} vehicle_imu_{i}: "
+                      f"too few samples ({int(mask.sum())})")
+                continue
+            tw = t[mask]
+            x, y, z = [a[mask] for a in axes_data]
+            dt_pub = float(np.median(np.diff(tw)))
+            if dt_pub <= 0:
+                continue
+            fs = 1.0 / dt_pub
+
+            fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+            for ax, axis_data, axis_name in zip(axes, [x, y, z], ["X", "Y", "Z"]):
+                freqs, _, psd = direct_fft(axis_data, fs, t=tw)
+                ax.plot(freqs, psd, color="steelblue", linewidth=0.8)
+                annotate_top_peaks(ax, freqs, psd, n_peaks=6)
+                ax.set_ylabel(f"{axis_name} {ylabel}")
+                ax.grid(True, which="both", alpha=0.3)
+                ax.set_xlim(0, fs / 2)
+                if show_lpf:
+                    add_lpf_lines(ax, sensor_kind, fs)
+                ax.legend(loc="upper right", fontsize=7)
+            axes[-1].set_xlabel("Frequency (Hz)")
+            fig.suptitle(f"FFT PSD (flat-top) of vehicle_imu_{i} {sensor_kind}, "
+                         f"fs={fs:.1f} Hz")
+            fig.tight_layout()
+            outpath = outdir / f"imu_fft_{sensor_kind}_vehicle_imu_{i}.png"
+            save_fig(fig, outpath)
+            print(f"[fft_vehicle_imu] wrote {outpath}")
+
+# ---------- 2b'. magnitude time series from vehicle_imu ----------
+def plot_vehicle_imu_magnitude_timeseries(ulog, outdir):
+    """Per-axis (X, Y, Z) time series from vehicle_imu, all IMU instances
+    overlaid. Acceleration in g (delta_velocity / delta_velocity_dt) and
+    angular velocity in deg/s (delta_angle / delta_angle_dt)."""
+    instances = all_instances(ulog, "vehicle_imu")
+    if not instances:
+        print("[vehicle_imu_mag] no vehicle_imu; skipping")
+        return
+    cycle = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    for sensor_kind, delta_field, dt_field, units, scale in [
+        ("accel", "delta_velocity", "delta_velocity_dt", "g",     1.0 / G_MS2),
+        ("gyro",  "delta_angle",    "delta_angle_dt",    "deg/s", RAD_TO_DEG),
+    ]:
+        fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+        plotted_any = False
+        for d in instances:
+            i = d.multi_id
+            color = cycle[i % len(cycle)]
+            if dt_field not in d.data:
+                continue
+            t = t_seconds(d, ulog)
+            dt_s = d.data[dt_field].astype(np.float64) / 1e6
+            valid = dt_s > 0
+            for ax, k in zip(axes, range(3)):
+                key = f"{delta_field}[{k}]"
+                if key not in d.data:
+                    continue
+                rate = np.full_like(dt_s, np.nan)
+                rate[valid] = d.data[key][valid] / dt_s[valid]
+                ax.plot(t, rate * scale, color=color,
+                        label=f"vehicle_imu_{i}",
+                        linewidth=1.0, alpha=0.85)
+                plotted_any = True
+        if not plotted_any:
+            plt.close(fig)
+            print(f"[vehicle_imu_mag] no {delta_field} fields; skipping {sensor_kind}")
+            continue
+        for ax, axis_name in zip(axes, ["X", "Y", "Z"]):
+            ax.set_ylabel(f"{sensor_kind} {axis_name} ({units})")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+        axes[-1].set_xlabel("time (s)")
+        fig.suptitle(f"vehicle_imu per-axis {sensor_kind} time series")
+        fig.tight_layout()
+        outpath = outdir / f"imu_{sensor_kind}_vehicle_imu_mag.png"
+        save_fig(fig, outpath)
+        print(f"[vehicle_imu_mag] wrote {outpath}")
+
+# ---------- 2c. vehicle_angular_velocity (filtered controller rate) ----------
+def plot_vehicle_angular_velocity_timeseries(ulog, outdir):
+    """Per-axis (X, Y, Z) time series of vehicle_angular_velocity — the
+    filtered angular rate the rate controller runs on (post software LPF/
+    notch), in deg/s. Same layout/style as the sensor_gyro_fifo time-series
+    plot."""
+    d = get_topic(ulog, "vehicle_angular_velocity")
+    if d is None:
+        print("[ang_vel_ts] no vehicle_angular_velocity; skipping")
+        return
+    t = t_seconds(d, ulog)
+    scale = RAD_TO_DEG
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+    for ax, k in zip(axes, range(3)):
+        key = f"xyz[{k}]"
+        if key not in d.data:
+            continue
+        ax.plot(t, d.data[key] * scale, color="steelblue",
+                label="vehicle_angular_velocity",
+                linewidth=0.4, alpha=0.6)
+    for ax, axis_name in zip(axes, ["X", "Y", "Z"]):
+        ax.set_ylabel(f"gyro {axis_name} (deg/s)")
+        ax.legend(loc="upper right", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle("vehicle_angular_velocity per-axis time series")
+    fig.tight_layout()
+    outpath = outdir / "imu_gyro_vehicle_angular_velocity_mag.png"
+    save_fig(fig, outpath)
+    print(f"[ang_vel_ts] wrote {outpath}")
+
+
+def plot_gyro_fifo_with_angular_velocity_timeseries(ulog, outdir):
+    """Per-axis (X, Y, Z) time series of the raw high-rate sensor_gyro_fifo
+    (one file per IMU instance) with the filtered vehicle_angular_velocity —
+    the rate the controller runs on, post software LPF/notch — overlaid on the
+    same deg/s y-axis, so the effect of the filtering is visible directly."""
+    instances = all_instances(ulog, "sensor_gyro_fifo")
+    if not instances:
+        print("[gyro_overlay] no sensor_gyro_fifo; skipping")
+        return
+    scale = RAD_TO_DEG
+    av = get_topic(ulog, "vehicle_angular_velocity")
+    if av is None:
+        print("[gyro_overlay] no vehicle_angular_velocity; plotting raw FIFO only")
+        t_av, av_axes = None, None
+    else:
+        t_av = t_seconds(av, ulog)
+        av_axes = [av.data[f"xyz[{k}]"] * scale if f"xyz[{k}]" in av.data else None
+                   for k in range(3)]
+    for d in instances:
+        i = d.multi_id
+        dev_id = int(d.data["device_id"][0]) if "device_id" in d.data else None
+        dev_str = f", device_id={dev_id}" if dev_id is not None else ""
+        t, x, y, z = fifo_to_series(d)
+        fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+        for ax, axis_data, k in zip(axes, [x, y, z], range(3)):
+            ax.plot(t, axis_data * scale, color="steelblue",
+                    label=f"sensor_gyro_fifo_{i} (raw)",
+                    linewidth=0.4, alpha=0.5)
+            if av_axes is not None and av_axes[k] is not None:
+                ax.plot(t_av, av_axes[k], color="darkorange",
+                        label="vehicle_angular_velocity (filtered)",
+                        linewidth=0.9, alpha=0.9)
+        for ax, axis_name in zip(axes, ["X", "Y", "Z"]):
+            ax.set_ylabel(f"gyro {axis_name} (deg/s)")
+            ax.legend(loc="upper right", fontsize=8)
+            ax.grid(True, alpha=0.3)
+        axes[-1].set_xlabel("time (s)")
+        fig.suptitle(f"sensor_gyro_fifo_{i}{dev_str} (raw) vs "
+                     f"vehicle_angular_velocity (filtered)")
+        fig.tight_layout()
+        outpath = outdir / f"imu_gyro_fifo_vs_angular_velocity_{i}.png"
+        save_fig(fig, outpath)
+        print(f"[gyro_overlay] wrote {outpath}")
+
+
+def fft_vehicle_angular_velocity(ulog, outdir, t0, t1, show_lpf=True):
+    """Direct flat-top FFT PSD of vehicle_angular_velocity (deg/s) over
+    [t0, t1]. Same layout/style as the sensor_gyro_fifo FFT plot. fs is
+    derived from sample spacing since vehicle_angular_velocity carries no
+    intra-batch dt field."""
+    d = get_topic(ulog, "vehicle_angular_velocity")
+    if d is None:
+        print("[fft_ang_vel] no vehicle_angular_velocity; skipping")
+        return
+    t = t_seconds(d, ulog)
+    scale = RAD_TO_DEG
+    mask = (t >= t0) & (t <= t1)
+    if mask.sum() < 256:
+        print(f"[fft_ang_vel] too few samples ({int(mask.sum())}); skipping")
+        return
+    dt_pub = float(np.median(np.diff(t[mask])))
+    if dt_pub <= 0:
+        print("[fft_ang_vel] non-positive dt; skipping")
+        return
+    fs = 1.0 / dt_pub
+    tw = t[mask]
+    cols = [d.data[f"xyz[{k}]"][mask] * scale for k in range(3)]
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    for ax, axis_data, axis_name in zip(axes, cols, ["X", "Y", "Z"]):
+        freqs, _, psd = direct_fft(axis_data, fs, t=tw)
+        ax.plot(freqs, psd, color="steelblue", linewidth=0.8)
+        annotate_top_peaks(ax, freqs, psd, n_peaks=6)
+        ax.set_ylabel(f"{axis_name} PSD (deg/s)²/Hz")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_xlim(0, fs / 2)
+        if show_lpf:
+            add_lpf_lines(ax, "gyro", fs)
+        ax.legend(loc="upper right", fontsize=7)
+    axes[-1].set_xlabel("Frequency (Hz)")
+    fig.suptitle(f"FFT PSD (flat-top) of vehicle_angular_velocity gyro, "
+                 f"fs={fs:.0f} Hz")
+    fig.tight_layout()
+    outpath = outdir / "imu_fft_gyro_vehicle_angular_velocity.png"
+    save_fig(fig, outpath)
+    print(f"[fft_ang_vel] wrote {outpath}")
+
+
+# ---------- 2d. vehicle_torque_setpoint (rate-controller demand) ----------
+def fft_vehicle_torque_setpoint(ulog, outdir, t0, t1, show_lpf=True):
+    """Direct flat-top FFT PSD of vehicle_torque_setpoint roll/pitch/yaw
+    (xyz, normalized [-1, 1]) over [t0, t1]. Same layout/style as the other
+    FFT plots. Auto-selects the instance carrying real signal (valid timing +
+    nonzero variance), since some logs publish an empty second instance.
+    Torque is the rate-controller output, so the gyro LPF cutoffs are drawn
+    (chip HW DLPF lines omitted)."""
+    instances = all_instances(ulog, "vehicle_torque_setpoint")
+    if not instances:
+        print("[fft_torque] no vehicle_torque_setpoint; skipping")
+        return
+    chosen = None
+    best_var = -1.0
+    for d in instances:
+        if not all(f"xyz[{k}]" in d.data for k in range(3)):
+            continue
+        t = t_seconds(d, ulog)
+        mask = (t >= t0) & (t <= t1)
+        if mask.sum() < 256:
+            continue
+        if float(np.median(np.diff(t[mask]))) <= 0:
+            continue
+        v = sum(float(np.nanstd(d.data[f"xyz[{k}]"][mask])) for k in range(3))
+        if v > best_var:
+            best_var = v
+            chosen = d
+    if chosen is None or best_var <= 0:
+        print("[fft_torque] no vehicle_torque_setpoint instance with usable "
+              "signal; skipping")
+        return
+
+    i = chosen.multi_id
+    t = t_seconds(chosen, ulog)
+    mask = (t >= t0) & (t <= t1)
+    dt_pub = float(np.median(np.diff(t[mask])))
+    fs = 1.0 / dt_pub
+    tw = t[mask]
+    cols = [chosen.data[f"xyz[{k}]"][mask] for k in range(3)]  # normalized
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+    for ax, axis_data, axis_name in zip(axes, cols, ["Roll", "Pitch", "Yaw"]):
+        freqs, _, psd = direct_fft(axis_data, fs, t=tw)
+        ax.plot(freqs, psd, color="steelblue", linewidth=0.8)
+        annotate_top_peaks(ax, freqs, psd, n_peaks=6)
+        ax.set_ylabel(f"{axis_name} PSD (norm²/Hz)")
+        ax.grid(True, which="both", alpha=0.3)
+        ax.set_xlim(0, fs / 2)
+        if show_lpf:
+            add_lpf_lines(ax, "gyro", fs, include_hw=False)
+        ax.legend(loc="upper right", fontsize=7)
+    axes[-1].set_xlabel("Frequency (Hz)")
+    fig.suptitle(f"FFT PSD (flat-top) of vehicle_torque_setpoint_{i} "
+                 f"(roll/pitch/yaw), fs={fs:.0f} Hz")
+    fig.tight_layout()
+    outpath = outdir / "imu_fft_vehicle_torque_setpoint.png"
+    save_fig(fig, outpath)
+    print(f"[fft_torque] wrote {outpath}")
+
+# ---------- 3. consistency between IMUs ----------
+def plot_consistency(ulog, outpath):
+    instances = all_instances(ulog, "vehicle_imu_status")
+    fig, axes = plt.subplots(2, 1, figsize=(12, 7), sharex=True)
+    for d in instances:
+        i = d.multi_id
+        t = t_seconds(d, ulog)
+        if "accel_inconsistency_m_s_s" in d.data:
+            v = d.data["accel_inconsistency_m_s_s"]
+            mag = np.linalg.norm(v, axis=1) if v.ndim == 2 else v
+            axes[0].plot(t, mag, label=f"IMU{i}")
+        if "gyro_inconsistency_rad_s" in d.data:
+            v = d.data["gyro_inconsistency_rad_s"]
+            mag = np.linalg.norm(v, axis=1) if v.ndim == 2 else v
+            axes[1].plot(t, mag * RAD_TO_DEG, label=f"IMU{i}")
+    for ax in axes:
+        if ax.get_legend_handles_labels()[0]:
+            ax.legend(loc="upper left", fontsize=8)
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("|accel inconsistency|\n(m/s²)")
+    axes[1].set_ylabel("|gyro inconsistency|\n(deg/s)")
+    axes[1].set_xlabel("time (s)")
+    fig.suptitle("Per-axis disagreement between IMU instances")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[consistency] wrote {outpath}")
+
+# ---------- 4. per-topic timing + dropout views ----------
+def gap_based_dropped_count(t, expected_dt_s=None):
+    """Estimate dropped samples in a uniformly-sampled time series via gap
+    inference: any Δt > 1.5×expected contributes round(Δt/expected) - 1."""
+    if len(t) < 2:
+        return 0
+    dt = np.diff(t)
+    expected = (expected_dt_s if expected_dt_s is not None
+                else float(np.median(dt)))
+    if expected <= 0:
+        return 0
+    over = dt > 1.5 * expected
+    if not over.any():
+        return 0
+    return int(np.maximum(
+        np.round(dt[over] / expected).astype(int) - 1, 0).sum())
+
+
+def _plot_dt_with_outliers(ax, t, label, expected_dt_s=None,
+                           n_recorded=None, n_dropped=None):
+    """Plot Δt vs time on a log axis. Mark Δt > 1.5×expected as red dots and
+    annotate max-Δt. expected_dt_s defaults to the median of np.diff(t).
+    n_recorded / n_dropped are appended to the legend label when given."""
+    if len(t) < 2:
+        return
+    dt_ms = np.diff(t) * 1000.0
+    tt = t[1:]
+    expected_ms = (expected_dt_s if expected_dt_s is not None
+                   else float(np.median(np.diff(t)))) * 1000.0
+    full_label = label
+    if n_recorded is not None or n_dropped is not None:
+        parts = []
+        if n_recorded is not None:
+            parts.append(f"recorded: {n_recorded}")
+        if n_dropped is not None:
+            parts.append(f"dropped: {n_dropped}")
+        full_label = f"{label} ({', '.join(parts)})"
+    ax.plot(tt, dt_ms, ".", markersize=1, color="steelblue", label=full_label)
+    if expected_ms > 0:
+        thresh = 1.5 * expected_ms
+        out = dt_ms > thresh
+        if out.any():
+            ax.plot(tt[out], dt_ms[out], ".", markersize=4, color="red",
+                    label=f"Δt > {thresh:.2f} ms")
+        ax.axhline(expected_ms, color="green", linestyle="--", linewidth=0.8,
+                   alpha=0.6, label=f"expected={expected_ms:.2f} ms")
+    imax = int(np.argmax(dt_ms))
+    ax.annotate(f"max Δt={dt_ms[imax]:.1f} ms @ t={tt[imax]:.1f}s",
+                xy=(tt[imax], dt_ms[imax]),
+                xytext=(0.7, 0.85), textcoords="axes fraction",
+                fontsize=8,
+                arrowprops=dict(arrowstyle="->", color="black"))
+    ax.set_ylabel("Δt (ms)")
+    ax.set_yscale("log")
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="upper left", fontsize=7)
+
+
+def plot_timing_vehicle_imu(ulog, outpath):
+    instances = all_instances(ulog, "vehicle_imu")
+    if not instances:
+        print("[timing_vehicle_imu] no vehicle_imu; skipping")
+        return
+    status_by_id = {d.multi_id: d
+                    for d in all_instances(ulog, "vehicle_imu_status")}
+    fig, axes = plt.subplots(2 * len(instances), 1,
+                              figsize=(12, 4.0 * len(instances)),
+                              sharex=True, squeeze=False)
+    axes = axes.ravel()
+    for row, d in enumerate(instances):
+        i = d.multi_id
+        ts_sample = d.data["timestamp_sample"].astype(np.int64) / 1e6 - T_OFFSET
+        ax_dt = axes[2 * row]
+        ax_ct = axes[2 * row + 1]
+        _plot_dt_with_outliers(ax_dt, ts_sample, f"vehicle_imu_{i}",
+                               n_recorded=len(ts_sample),
+                               n_dropped=gap_based_dropped_count(ts_sample))
+        s = status_by_id.get(i)
+        if s is not None:
+            ts = t_seconds(s, ulog)
+            if "accel_error_count" in s.data:
+                ax_ct.plot(ts, s.data["accel_error_count"], color="darkred",
+                           label=f"vehicle_imu_status_{i}.accel_error_count")
+            if "gyro_error_count" in s.data:
+                ax_ct.plot(ts, s.data["gyro_error_count"], color="darkorange",
+                           label=f"vehicle_imu_status_{i}.gyro_error_count")
+        ax_ct.set_ylabel("error_count")
+        ax_ct.grid(True, alpha=0.3)
+        if ax_ct.get_legend_handles_labels()[0]:
+            ax_ct.legend(loc="upper left", fontsize=7)
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle("vehicle_imu per-instance timing with vehicle_imu_status error counters")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[timing_vehicle_imu] wrote {outpath}")
+
+
+def fifo_dropout_events(d):
+    """Return (gap_times_s, missed_counts) for inferred dropouts in a
+    sensor_*_fifo topic. A dropout is any inter-batch gap larger than
+    1.5 × dt[i]; missed_count = round(gap / dt[i]) - 1."""
+    ts_last = d.data["timestamp_sample"].astype(np.int64)   # µs, last sample
+    dt_us   = d.data["dt"].astype(np.int64)                 # µs, intra-batch
+    nsamp   = d.data["samples"].astype(np.int32)
+    if len(ts_last) < 2:
+        return np.array([]), np.array([], dtype=int)
+    t_first = ts_last - (nsamp - 1) * dt_us                 # µs, first sample
+    gap_us  = t_first[1:] - ts_last[:-1]                    # µs
+    dt_next = dt_us[1:]
+    valid   = dt_next > 0
+    over    = np.zeros_like(gap_us, dtype=bool)
+    over[valid] = gap_us[valid] > 1.5 * dt_next[valid]
+    missed  = np.zeros_like(gap_us, dtype=int)
+    missed[over] = np.maximum(
+        np.round(gap_us[over] / dt_next[over]).astype(int) - 1, 0)
+    gap_t_s = t_first[1:] / 1e6 - T_OFFSET
+    keep = missed > 0
+    return gap_t_s[keep], missed[keep]
+
+
+def plot_timing_sensor_accel_fifo(ulog, outpath):
+    instances = all_instances(ulog, "sensor_accel_fifo")
+    if not instances:
+        print("[timing_sensor_accel_fifo] no sensor_accel_fifo; skipping")
+        return
+    fig, axes = plt.subplots(2 * len(instances), 1,
+                              figsize=(12, 4.0 * len(instances)),
+                              sharex=True, squeeze=False)
+    axes = axes.ravel()
+    id_labels = []
+    for row, d in enumerate(instances):
+        i = d.multi_id
+        dev_id = int(d.data["device_id"][0]) if "device_id" in d.data else None
+        id_labels.append(f"instance={i} (device_id={dev_id})"
+                         if dev_id is not None else f"instance={i}")
+        t, _, _, _ = fifo_to_series(d)
+        expected = float(np.median(d.data["dt"])) / 1e6
+        ax_dt = axes[2 * row]
+        ax_dr = axes[2 * row + 1]
+        gap_t, missed = fifo_dropout_events(d)
+        n_dropped = int(missed.sum())
+        _plot_dt_with_outliers(ax_dt, t, f"sensor_accel_fifo_{i}",
+                               expected_dt_s=expected,
+                               n_recorded=len(t),
+                               n_dropped=n_dropped)
+        if len(gap_t):
+            ax_dr.stem(gap_t, missed,
+                       linefmt="C3-", markerfmt="C3o", basefmt=" ",
+                       label=f"sensor_accel_fifo_{i}")
+        else:
+            ax_dr.text(0.5, 0.5, "no dropouts inferred",
+                       transform=ax_dr.transAxes, ha="center", va="center",
+                       fontsize=10, color="gray")
+        ax_dr.set_ylabel("missed samples")
+        ax_dr.grid(True, alpha=0.3)
+        if ax_dr.get_legend_handles_labels()[0]:
+            ax_dr.legend(loc="upper left", fontsize=7)
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle("sensor_accel_fifo per-sample timing & inferred dropouts — "
+                 + ", ".join(id_labels))
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[timing_sensor_accel_fifo] wrote {outpath}")
+
+# ---------- 5. EKF bias trends ----------
+def plot_bias(ulog, outpath):
+    bias = all_instances(ulog, "estimator_sensor_bias")
+    if not bias:
+        print("[bias] no estimator_sensor_bias topic; skipping")
+        return
+    fig, axes = plt.subplots(2, 1, figsize=(12, 6), sharex=True)
+    for d in bias:
+        i = d.multi_id
+        t = t_seconds(d, ulog)
+        for axis_idx, axis_name in enumerate("xyz"):
+            key_a = f"accel_bias[{axis_idx}]"
+            key_g = f"gyro_bias[{axis_idx}]"
+            if key_a in d.data:
+                axes[0].plot(t, d.data[key_a], label=f"EKF{i} a{axis_name}", alpha=0.7)
+            if key_g in d.data:
+                axes[1].plot(t, d.data[key_g] * RAD_TO_DEG,
+                             label=f"EKF{i} g{axis_name}", alpha=0.7)
+    for ax in axes:
+        ax.legend(loc="upper left", fontsize=7, ncol=3)
+        ax.grid(True, alpha=0.3)
+    axes[0].set_ylabel("accel bias (m/s²)")
+    axes[1].set_ylabel("gyro bias (deg/s)")
+    axes[1].set_xlabel("time (s)")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[bias] wrote {outpath}")
+
+# ---------- 6. sensor selection ----------
+def plot_selection(ulog, outpath):
+    """sensor_selection tells you which accel/gyro device the
+    consolidator picked. Frequent changes = sensor voter struggling."""
+    sel = get_topic(ulog, "sensor_selection")
+    if sel is None:
+        print("[selection] no sensor_selection topic; skipping")
+        return
+    t = t_seconds(sel, ulog)
+    fig, axes = plt.subplots(2, 1, figsize=(12, 5), sharex=True)
+    if "accel_device_id" in sel.data:
+        ids = sel.data["accel_device_id"]
+        uniq = {v: i for i, v in enumerate(sorted(set(ids)))}
+        idx = np.array([uniq[v] for v in ids])
+        axes[0].step(t, idx, where="post")
+        axes[0].set_yticks(list(uniq.values()))
+        axes[0].set_yticklabels([f"0x{v:08x}" for v in uniq.keys()],
+                                fontsize=7)
+        axes[0].set_ylabel("selected accel\ndevice_id")
+    if "gyro_device_id" in sel.data:
+        ids = sel.data["gyro_device_id"]
+        uniq = {v: i for i, v in enumerate(sorted(set(ids)))}
+        idx = np.array([uniq[v] for v in ids])
+        axes[1].step(t, idx, where="post")
+        axes[1].set_yticks(list(uniq.values()))
+        axes[1].set_yticklabels([f"0x{v:08x}" for v in uniq.keys()],
+                                fontsize=7)
+        axes[1].set_ylabel("selected gyro\ndevice_id")
+    for ax in axes:
+        ax.grid(True, alpha=0.3)
+    axes[1].set_xlabel("time (s)")
+    fig.suptitle("Sensor voter selection (steps = primary IMU switch)")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[selection] wrote {outpath}")
+
+# ---------- 7. EKF innovations ----------
+def plot_innovations(ulog, outpath):
+    """estimator_innovations and estimator_innovation_test_ratios show
+    how badly the EKF was fighting its sensors. Test ratio > 1 = sensor
+    measurement was rejected."""
+    innov = all_instances(ulog, "estimator_innovations")
+    ratios = all_instances(ulog, "estimator_innovation_test_ratios")
+
+    if not innov and not ratios:
+        print("[innovations] no estimator_innovation* topics; skipping")
+        return
+
+    panel_specs = []
+    for field in ["gps_hvel", "gps_vvel", "gps_hpos", "gps_vpos",
+                  "mag_field", "heading", "baro"]:
+        for d in innov:
+            if field in d.data or f"{field}[0]" in d.data:
+                panel_specs.append(("innov", field))
+                break
+    if ratios:
+        panel_specs.append(("ratio", "all"))
+
+    n_panels = len(panel_specs)
+    if n_panels == 0:
+        print("[innovations] nothing to plot; skipping")
+        return
+
+    fig, axes = plt.subplots(n_panels, 1, figsize=(12, 2.2 * n_panels),
+                              sharex=True, squeeze=False)
+    axes = axes.ravel()
+    p = 0
+    for kind, field in panel_specs:
+        ax = axes[p]
+        if kind == "innov":
+            for d in innov:
+                i = d.multi_id
+                t = t_seconds(d, ulog)
+                if field in d.data:
+                    ax.plot(t, d.data[field], label=f"EKF{i}", alpha=0.8)
+                else:
+                    for k in range(3):
+                        key = f"{field}[{k}]"
+                        if key in d.data:
+                            ax.plot(t, d.data[key], label=f"EKF{i}[{k}]", alpha=0.6)
+            ax.set_ylabel(f"{field}\ninnovation")
+        else:
+            for d in ratios:
+                i = d.multi_id
+                t = t_seconds(d, ulog)
+                for k in d.data.keys():
+                    if k == "timestamp":
+                        continue
+                    try:
+                        ax.plot(t, d.data[k], label=f"EKF{i}.{k}",
+                                alpha=0.6, linewidth=0.8)
+                    except Exception:
+                        pass
+            ax.axhline(1.0, color="red", linestyle="--", linewidth=1,
+                       label="reject threshold (=1.0)")
+            ax.set_ylabel("innovation\ntest ratio")
+            ax.set_yscale("log")
+        ax.legend(loc="upper left", fontsize=6, ncol=4)
+        ax.grid(True, alpha=0.3)
+        p += 1
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle("EKF innovations & test ratios (>1 = measurement rejected)")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[innovations] wrote {outpath}")
+
+# ---------- 8. motor PSD vs IMU PSD ----------
+def _plot_source_panel(t, channels, title, units, outpath, t0, t1,
+                       fft_kind="direct"):
+    """Time series (top) + PSD (bottom) for a set of related motor/actuator/
+    ESC channels. fft_kind="welch" uses a Welch density PSD; fft_kind="direct"
+    uses the flat-top direct_fft, matching the imu_fft plots. Channels with
+    <16 in-window samples, any non-finite (NaN) in-window value, or near-zero
+    variance are skipped; the FFT window matches fft_around_event so source
+    spectra line up directly with the IMU FFT plots."""
+    mask = (t >= t0) & (t <= t1)
+    n_in = int(mask.sum())
+    if n_in < 16:
+        print(f"[sources] {outpath.name}: too few samples in [{t0:.1f},{t1:.1f}]s")
+        return
+    dt = float(np.median(np.diff(t[mask])))
+    fs = 1.0 / dt if dt > 0 else 1.0
+    nperseg = min(n_in, 4096)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8))
+    plotted = 0
+    for label, sig in channels.items():
+        sig = np.asarray(sig, dtype=float)
+        seg = sig[mask]
+        if not np.isfinite(seg).all():
+            continue  # unpopulated / NaN channel
+        if np.std(seg) < 1e-6:
+            continue  # disarmed / static channel
+        axes[0].plot(t, sig, label=label, linewidth=0.8, alpha=0.85)
+        if fft_kind == "direct":
+            freqs, _, psd = direct_fft(seg, fs, t=t[mask])
+        else:
+            freqs, psd = welch(seg, fs=fs, window="hann",
+                               nperseg=nperseg, noverlap=nperseg // 2,
+                               scaling="density", detrend="constant")
+        axes[1].plot(freqs, psd, label=label, linewidth=0.9, alpha=0.85)
+        plotted += 1
+
+    if plotted == 0:
+        plt.close(fig)
+        print(f"[sources] {outpath.name}: no channels with variance; skipping")
+        return
+
+    axes[0].set_ylabel(units)
+    axes[0].set_xlabel("time (s)")
+    axes[0].grid(True, alpha=0.3)
+    axes[0].legend(loc="upper right", fontsize=7, ncol=2)
+
+    axes[1].set_xlim(0, fs / 2)
+    axes[1].set_xlabel("Frequency (Hz)")
+    axes[1].set_ylabel(f"PSD ({units}²/Hz)")
+    axes[1].grid(True, alpha=0.3)
+    axes[1].legend(loc="upper right", fontsize=7, ncol=2)
+
+    if fft_kind == "direct":
+        method, res = "flat-top FFT", (fs / n_in)
+    else:
+        method, res = "Welch", (fs / nperseg)
+    fig.suptitle(f"{title}  —  {method}, window t={t0:.1f}–{t1:.1f}s, "
+                 f"fs≈{fs:.0f} Hz, Δf≈{res:.2f} Hz")
+    fig.tight_layout()
+    save_fig(fig, outpath)
+    print(f"[sources] wrote {outpath}")
+
+
+def plot_vibration_sources(ulog, outdir, t0, t1):
+    """Characterize the three signals that drive airframe vibration —
+    per-motor RPM, per-motor current (both from esc_status), and the PWM
+    output the autopilot is sending each ESC (actuator_outputs). Each
+    PNG: time series on top, Welch density PSD on bottom over [t0, t1]."""
+
+    esc = get_topic(ulog, "esc_status")
+    if esc is None:
+        print("[sources] no esc_status topic; skipping RPM and current")
+    else:
+        t_esc = t_seconds(esc, ulog)
+        for field, units, fname, title in [
+            ("esc_rpm",     "RPM", "motor_rpm_sources.png",
+             "esc_status per-motor RPM"),
+            ("esc_current", "A",   "motor_current_sources.png",
+             "esc_status per-motor current"),
+        ]:
+            keys = sorted(k for k in esc.data.keys()
+                          if k.startswith("esc[") and k.endswith(f".{field}"))
+            if not keys:
+                print(f"[sources] no esc[].{field}; skipping {fname}")
+                continue
+            channels = {k: esc.data[k] for k in keys}
+            _plot_source_panel(t_esc, channels, title, units,
+                               outdir / fname, t0, t1)
+
+    # Pick the actuator_outputs instance whose channels actually move inside
+    # the analysis window — same heuristic as the old plot_motor_vs_imu_psd,
+    # because some airframes publish an idle "raw" instance with high full-
+    # log variance but no signal in the hover slice.
+    motors = None
+    best_var = 0.0
+    for cand in all_instances(ulog, "actuator_outputs"):
+        tc = cand.data["timestamp"] / 1e6
+        m = (tc >= t0) & (tc <= t1)
+        if m.sum() < 64:
+            continue
+        ch_keys = [k for k in cand.data.keys() if k.startswith("output[")]
+        v = sum(float(np.nanstd(cand.data[k][m])) for k in ch_keys)
+        if v > best_var:
+            best_var = v
+            motors = cand
+    if motors is None:
+        print("[sources] no usable actuator_outputs; skipping motor_pwm_sources.png")
+        return
+    tm = t_seconds(motors, ulog)
+    out_keys = sorted((k for k in motors.data.keys() if k.startswith("output[")),
+                      key=lambda s: int(s[len("output["):-1]))
+    channels = {k: motors.data[k] for k in out_keys}
+    _plot_source_panel(
+        tm, channels,
+        f"actuator_outputs[{motors.multi_id}] PWM per channel",
+        "PWM", outdir / "motor_pwm_sources.png", t0, t1,
+    )
+
+
+def plot_actuator_control_sources(ulog, outdir, t0, t1):
+    """Per-channel actuator command sources, overlaid, with the same flat-top
+    direct_fft used by the imu_fft plots (time series top, PSD bottom). Mirrors
+    the motor_current_sources layout.
+      actuator_motors.control[*]      -> actuator_motor_sources.png
+      actuator_servos.control[*]      -> actuator_servo_sources.png
+      actuator_outputs[i].output[*]   -> actuator_outputs_<i>_sources.png (per instance)
+    """
+    specs = [
+        ("actuator_motors", "control[", "norm", "actuator_motor_sources.png",
+         "actuator_motors control per channel", False),
+        ("actuator_servos", "control[", "norm", "actuator_servo_sources.png",
+         "actuator_servos control per channel", False),
+        ("actuator_outputs", "output[", "PWM", None, None, True),
+    ]
+    for topic, prefix, units, fname, title, per_instance in specs:
+        instances = all_instances(ulog, topic)
+        if not instances:
+            print(f"[act_sources] no {topic}; skipping")
+            continue
+        for d in instances:
+            if "timestamp_sample" in d.data:
+                t = d.data["timestamp_sample"].astype(np.int64) / 1e6 - T_OFFSET
+            else:
+                t = t_seconds(d, ulog)
+            keys = sorted((k for k in d.data if k.startswith(prefix)),
+                          key=lambda s: int(s[len(prefix):-1]))
+            if not keys:
+                continue
+            channels = {k: d.data[k] for k in keys}
+            if per_instance:
+                out_fname = f"{topic}_{d.multi_id}_sources.png"
+                out_title = f"{topic}[{d.multi_id}] output per channel"
+            else:
+                out_fname, out_title = fname, title
+            _plot_source_panel(t, channels, out_title, units,
+                               outdir / out_fname, t0, t1, fft_kind="direct")
+
+# ---------- verdict ----------
+def write_verdict(ulog, outpath):
+    lines = ["=== IMU vibration / failure verdict ===", ""]
+    # EVENT_* are in absolute FMU-boot seconds; t_seconds() returns shifted
+    # time, so convert once and use shifted bounds throughout this function.
+    event_start = EVENT_START_S - T_OFFSET
+    event_end   = EVENT_END_S   - T_OFFSET
+
+    instances = all_instances(ulog, "vehicle_imu_status")
+    for d in instances:
+        i = d.multi_id
+        t = t_seconds(d, ulog)
+        mask = (t >= event_start - 5) & (t <= event_end + 5)
+        if mask.sum() == 0:
+            lines.append(f"IMU{i}: no samples in event window "
+                         f"[{event_start-5:.1f},{event_end+5:.1f}] s — "
+                         f"data range [{t.min():.1f},{t.max():.1f}] s")
+            lines.append("")
+            continue
+        if "accel_vibration_metric" in d.data:
+            v = d.data["accel_vibration_metric"][mask]
+            lines.append(f"IMU{i}: accel_vibration_metric  "
+                         f"max={v.max():.2f} m/s²  mean={v.mean():.2f}  "
+                         f"(>5 degraded, >10 dangerous)")
+        if "gyro_vibration_metric" in d.data:
+            v = d.data["gyro_vibration_metric"][mask] * RAD_TO_DEG
+            lines.append(f"IMU{i}: gyro_vibration_metric   "
+                         f"max={v.max():.2f} deg/s  mean={v.mean():.2f}  "
+                         f"(>11.5 bad)")
+        clip_keys = [f"accel_clipping[{k}]" for k in range(3)
+                     if f"accel_clipping[{k}]" in d.data]
+        if clip_keys:
+            delta = [int(d.data[k][-1]) - int(d.data[k][0]) for k in clip_keys]
+            lines.append(f"IMU{i}: accel_clipping total over flight  "
+                         f"X={delta[0]} Y={delta[1]} Z={delta[2]}")
+        lines.append("")
+
+    sel = get_topic(ulog, "sensor_selection")
+    if sel is not None:
+        if "accel_device_id" in sel.data:
+            ids = sel.data["accel_device_id"]
+            t = t_seconds(sel, ulog)
+            switches = int(np.sum(np.diff(ids) != 0))
+            in_event = int(np.sum((t[:-1] >= event_start) &
+                                   (t[:-1] <= event_end) &
+                                   (np.diff(ids) != 0)))
+            lines.append(f"sensor_selection accel switches: total={switches}, "
+                         f"during dropout={in_event}")
+        if "gyro_device_id" in sel.data:
+            ids = sel.data["gyro_device_id"]
+            t = t_seconds(sel, ulog)
+            switches = int(np.sum(np.diff(ids) != 0))
+            in_event = int(np.sum((t[:-1] >= event_start) &
+                                   (t[:-1] <= event_end) &
+                                   (np.diff(ids) != 0)))
+            lines.append(f"sensor_selection gyro switches:  total={switches}, "
+                         f"during dropout={in_event}")
+        lines.append("")
+
+    lines.append("")
+    lines.append("=== dropout summary ===")
+    for s in all_instances(ulog, "vehicle_imu_status"):
+        i = s.multi_id
+        if "accel_error_count" in s.data:
+            a = s.data["accel_error_count"]
+            lines.append(f"vehicle_imu_status_{i}: accel_error_count "
+                         f"start={int(a[0])} end={int(a[-1])} "
+                         f"delta={int(a[-1]) - int(a[0])}")
+        if "gyro_error_count" in s.data:
+            g = s.data["gyro_error_count"]
+            lines.append(f"vehicle_imu_status_{i}: gyro_error_count  "
+                         f"start={int(g[0])} end={int(g[-1])} "
+                         f"delta={int(g[-1]) - int(g[0])}")
+    for d in all_instances(ulog, "sensor_accel_fifo"):
+        i = d.multi_id
+        gap_t, missed = fifo_dropout_events(d)
+        if len(gap_t) == 0:
+            lines.append(f"sensor_accel_fifo_{i}: no dropouts inferred "
+                         f"(gap > 1.5×dt)")
+            continue
+        order = np.argsort(missed)[::-1][:3]
+        top = ", ".join(f"(t={gap_t[k]:.2f}s, missed={int(missed[k])})"
+                        for k in order)
+        lines.append(f"sensor_accel_fifo_{i}: events={len(gap_t)} "
+                     f"total_missed={int(missed.sum())}  top3: {top}")
+
+    txt = "\n".join(lines)
+    print("\n" + txt)
+    outpath.write_text(txt)
+    print(f"\n[verdict] wrote {outpath}")
+
+# ---------- main ----------
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("ulog", nargs="?", default=ULOG_PATH,
+                   help="Path to .ulg file (default: %(default)s)")
+    p.add_argument("--config", default=None,
+                   help="Optional YAML config; overrides built-in defaults.")
+    p.add_argument("--start", type=float, default=None,
+                   help="FFT window start (s). Overrides config and default.")
+    p.add_argument("--end",   type=float, default=None,
+                   help="FFT window end   (s). Overrides config and default.")
+    p.add_argument("--outdir", default=None,
+                   help="Directory to write plots and findings "
+                        "(default: ./imuVibe_<logName>_plots; overrides config).")
+    return p.parse_args()
+
+
+def apply_yaml_config(path):
+    """Mutate module-level config globals from a YAML file. Keys are optional."""
+    if not _HAS_YAML:
+        sys.exit("--config requires PyYAML: pip install pyyaml")
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+    global EVENT_START_S, EVENT_END_S, PRE_S, OUTDIR, LPF_CUTOFFS, HW_REFERENCES, SDLOG_MODE
+    if "event_start_s" in cfg: EVENT_START_S = float(cfg["event_start_s"])
+    if "event_end_s"   in cfg: EVENT_END_S   = float(cfg["event_end_s"])
+    if "pre_s"         in cfg: PRE_S         = float(cfg["pre_s"])
+    if "outdir"        in cfg: OUTDIR        = Path(cfg["outdir"])
+    if "lpf_cutoffs"   in cfg: LPF_CUTOFFS   = cfg["lpf_cutoffs"]
+    if "hw_references" in cfg: HW_REFERENCES = cfg["hw_references"]
+    if "sdlog_mode"    in cfg: SDLOG_MODE    = int(cfg["sdlog_mode"])
+
+
+def compute_time_offset(ulog):
+    """For SDLOG_MODE=0, return the timestamp of the first actuator_outputs
+    sample (seconds, FMU-boot). Walks instance ids 0, 1, 2, ... in order and
+    uses the first one that exists. For modes 1 and 2, returns 0.0 (no shift)."""
+    if SDLOG_MODE != 0:
+        return 0.0
+    instances = sorted(all_instances(ulog, "actuator_outputs"),
+                       key=lambda d: d.multi_id)
+    for d in instances:
+        ts = d.data.get("timestamp")
+        if ts is not None and len(ts) > 0:
+            return float(ts[0]) / 1e6
+    print("[time-shift] no actuator_outputs found; T_OFFSET=0")
+    return 0.0
+
+
+def fft_window(ulog, cli_start, cli_end, config_loaded=False):
+    """Decide the (t0, t1) time window for all FFT plots.
+    User-facing values (CLI flags, YAML/script EVENT_*) are interpreted as
+    absolute FMU-boot seconds and converted to the script's shifted frame by
+    subtracting T_OFFSET. Default falls back to the full sensor_accel_fifo
+    span (already shifted)."""
+    if cli_start is not None and cli_end is not None:
+        return float(cli_start) - T_OFFSET, float(cli_end) - T_OFFSET
+    if config_loaded:
+        return float(EVENT_START_S) - T_OFFSET, float(EVENT_END_S) - T_OFFSET
+    accel = get_topic(ulog, "sensor_accel_fifo")
+    if accel is not None and "timestamp_sample" in accel.data:
+        t = accel.data["timestamp_sample"] / 1e6 - T_OFFSET
+    else:
+        any_d = ulog.data_list[0]
+        t = any_d.data["timestamp"] / 1e6 - T_OFFSET
+    return float(t.min()), float(t.max())
+
+
+def main():
+    args = parse_args()
+    if args.config:
+        apply_yaml_config(args.config)
+    global OUTDIR
+    if args.outdir:
+        OUTDIR = Path(args.outdir)
+    elif OUTDIR is None:
+        OUTDIR = Path.cwd() / f"imuVibe_{Path(args.ulog).stem}_plots"
+
+    path = Path(args.ulog)
+    if not path.exists():
+        print(f"ERROR: {path} not found.")
+        sys.exit(1)
+    print(f"Loading {path}...")
+    ulog = load(str(path))
+
+    global T_OFFSET
+    T_OFFSET = compute_time_offset(ulog)
+    print(f"SDLOG_MODE={SDLOG_MODE}  T_OFFSET={T_OFFSET:.3f}s "
+          f"({'shift active' if T_OFFSET else 'no shift'})")
+
+    t0, t1 = fft_window(ulog, args.start, args.end, config_loaded=bool(args.config))
+    print(f"FFT window: t0={t0:.2f}s  t1={t1:.2f}s  ({t1-t0:.2f}s)")
+
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    print(f"Writing outputs to {OUTDIR}/")
+    plot_vibration_metrics(ulog, OUTDIR / "imu_vibration_metrics.png")
+    plot_fifo_magnitude_timeseries(ulog, OUTDIR)
+    plot_vehicle_imu_magnitude_timeseries(ulog, OUTDIR)
+    fft_around_event(ulog, OUTDIR, t0, t1, show_lpf=True)
+    fft_vehicle_imu(ulog, OUTDIR, t0, t1, show_lpf=True)
+    plot_vehicle_angular_velocity_timeseries(ulog, OUTDIR)
+    plot_gyro_fifo_with_angular_velocity_timeseries(ulog, OUTDIR)
+    fft_vehicle_angular_velocity(ulog, OUTDIR, t0, t1, show_lpf=True)
+    fft_vehicle_torque_setpoint(ulog, OUTDIR, t0, t1, show_lpf=True)
+    plot_consistency(ulog, OUTDIR / "imu_consistency.png")
+    plot_timing_vehicle_imu(ulog, OUTDIR / "imu_timing_vehicle_imu.png")
+    plot_timing_sensor_accel_fifo(ulog, OUTDIR / "imu_timing_sensor_accel_fifo.png")
+    plot_bias(ulog, OUTDIR / "imu_bias_drift.png")
+    plot_selection(ulog, OUTDIR / "imu_selection.png")
+    plot_innovations(ulog, OUTDIR / "imu_innovations.png")
+    plot_vibration_sources(ulog, OUTDIR, t0, t1)
+    plot_actuator_control_sources(ulog, OUTDIR, t0, t1)
+    write_verdict(ulog, OUTDIR / "imu_findings.txt")
+    print("\nDone.")
+
+if __name__ == "__main__":
+    main()

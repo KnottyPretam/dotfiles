@@ -1,0 +1,233 @@
+# Make `analyze_imu_vibration.py` FFT window generic + YAML config
+
+## Context
+
+The script currently hardcodes the FFT analysis window to this specific log's
+event timeline:
+
+```python
+t0 = max(0.0, 56.0 - PRE_S)            # 46.0 s — based on EVENT_START_S=72.76
+t1 = min(EVENT_START_S + 5, 80.0)      # 77.76 s — same source
+```
+
+The constants `56.0`, `80.0`, `EVENT_START_S=72.76`, `EVENT_END_S=102.91`, and
+`PRE_S=10.0` were chosen to capture the build-up to the
+`manual_control_signal_lost` event in `log_1_2026-4-29-13-48-36.ulg`. On any
+other log this window is meaningless. We need:
+
+1. A generic default window (full log).
+2. An explicit override path when the user wants to focus on a known event.
+3. A way to externalize the airframe-specific bits (event times, LPF cutoffs,
+   HW DLPF references) so multiple logs / airframes don't require code edits.
+
+## Decisions (from clarification)
+
+1. **Default FFT window:** the full log (sensor_accel_fifo timestamp span).
+   No automatic in-flight detection.
+2. **Override paths:** CLI flags `--start`/`--end` (highest precedence),
+   then optional YAML config (`--config FILE`), then script defaults.
+3. **YAML config:** new file `imuConfig.yaml` next to the script, holding the
+   current defaults. Loading is opt-in via `--config`. PyYAML is the only new
+   dependency.
+4. **Existing constants stay in the script** as the no-config-no-flags fallback,
+   so the script still runs against the original log with no change in
+   behaviour when invoked as `python analyze_imu_vibration.py --config imuConfig.yaml`.
+
+## CLI surface
+
+```
+python analyze_imu_vibration.py                                     # full log
+python analyze_imu_vibration.py LOG.ulg                             # full log
+python analyze_imu_vibration.py LOG.ulg --start 30 --end 60         # explicit window
+python analyze_imu_vibration.py LOG.ulg --config imuConfig.yaml     # YAML overrides
+python analyze_imu_vibration.py LOG.ulg --config imuConfig.yaml --start 30 --end 60
+```
+
+Precedence: `--start`/`--end` > YAML `event_start_s`/`event_end_s` > full‑log default.
+(YAML event times act as the FFT window only when CLI flags are absent.)
+
+## File changes
+
+### A. New file — `imuConfig.yaml`
+
+Lives next to `analyze_imu_vibration.py`. Holds the current Python defaults
+verbatim so behavior is preserved when loaded:
+
+```yaml
+# Defaults from analyze_imu_vibration.py — pass with --config to apply.
+event_start_s: 72.76
+event_end_s:   102.91
+pre_s:         10.0
+outdir:        "."
+
+lpf_cutoffs:
+  accel:
+    IMU_ACCEL_CUTOFF: 30.0
+  gyro:
+    IMU_GYRO_CUTOFF:  25.0
+    IMU_DGYRO_CUTOFF: 30.0
+
+hw_references:
+  accel:
+    - ["ICM-20602 DLPF (~218 Hz)", 218.0]
+    - ["BMI088 accel BW (~145 Hz)", 145.0]
+    - ["ICM-20948 DLPF (~246 Hz)", 246.0]
+  gyro:
+    - ["ICM-20602 DLPF (~250 Hz)", 250.0]
+    - ["BMI088 gyro BW (~230 Hz)", 230.0]
+    - ["ICM-20948 DLPF (~197 Hz)", 197.0]
+```
+
+### B. `analyze_imu_vibration.py` changes
+
+#### 1. Imports
+
+Add at top, gated so missing PyYAML doesn't break the no-config path:
+
+```python
+import argparse
+try:
+    import yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+```
+
+#### 2. Replace `main()` (currently around line 798) with an argparse-driven
+flow:
+
+```python
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("ulog", nargs="?", default=ULOG_PATH,
+                   help="Path to .ulg file (default: %(default)s)")
+    p.add_argument("--config", default=None,
+                   help="Optional YAML config; overrides built-in defaults.")
+    p.add_argument("--start", type=float, default=None,
+                   help="FFT window start (s). Overrides config and default.")
+    p.add_argument("--end",   type=float, default=None,
+                   help="FFT window end   (s). Overrides config and default.")
+    return p.parse_args()
+
+
+def apply_yaml_config(path):
+    """Mutate module-level config globals from a YAML file. Keys are optional."""
+    if not _HAS_YAML:
+        sys.exit("--config requires PyYAML: pip install pyyaml")
+    with open(path) as f:
+        cfg = yaml.safe_load(f) or {}
+    global EVENT_START_S, EVENT_END_S, PRE_S, OUTDIR, LPF_CUTOFFS, HW_REFERENCES
+    if "event_start_s" in cfg: EVENT_START_S = float(cfg["event_start_s"])
+    if "event_end_s"   in cfg: EVENT_END_S   = float(cfg["event_end_s"])
+    if "pre_s"         in cfg: PRE_S         = float(cfg["pre_s"])
+    if "outdir"        in cfg: OUTDIR        = Path(cfg["outdir"])
+    if "lpf_cutoffs"   in cfg: LPF_CUTOFFS   = cfg["lpf_cutoffs"]
+    if "hw_references" in cfg:
+        # YAML lists [name, freq]; the rest of the code just iterates them.
+        HW_REFERENCES = cfg["hw_references"]
+
+
+def fft_window(ulog, cli_start, cli_end):
+    """Decide the (t0, t1) time window for all FFT plots.
+    Precedence: CLI flags > YAML event times (when both supplied) > full log."""
+    if cli_start is not None and cli_end is not None:
+        return float(cli_start), float(cli_end)
+    accel = get_topic(ulog, "sensor_accel_fifo")
+    if accel is None:
+        # Final fallback: any topic with timestamps.
+        any_d = next(iter(ulog.data_list))
+        t = any_d.data["timestamp"] / 1e6
+    else:
+        t = accel.data["timestamp_sample"] / 1e6
+    return float(t.min()), float(t.max())
+
+
+def main():
+    args = parse_args()
+    if args.config:
+        apply_yaml_config(args.config)
+
+    path = Path(args.ulog)
+    if not path.exists():
+        print(f"ERROR: {path} not found.")
+        sys.exit(1)
+    print(f"Loading {path}...")
+    ulog = load(str(path))
+
+    t0, t1 = fft_window(ulog, args.start, args.end)
+    print(f"FFT window: t0={t0:.2f}s  t1={t1:.2f}s  ({t1-t0:.2f}s)")
+
+    OUTDIR.mkdir(exist_ok=True)
+    plot_vibration_metrics(ulog, OUTDIR / "imu_vibration_metrics.png")
+    plot_fifo_magnitude_timeseries(ulog, OUTDIR)
+    fft_around_event(ulog, OUTDIR, t0, t1, show_lpf=True)
+    fft_magnitude_around_event(ulog, OUTDIR, t0, t1, show_lpf=True)
+    fft_spectrum_around_event(ulog, OUTDIR, t0, t1, show_lpf=True)
+    plot_consistency(ulog, OUTDIR / "imu_consistency.png")
+    plot_timing(ulog, OUTDIR / "imu_timing.png")
+    plot_bias(ulog, OUTDIR / "imu_bias_drift.png")
+    plot_selection(ulog, OUTDIR / "imu_selection.png")
+    plot_innovations(ulog, OUTDIR / "imu_innovations.png")
+    plot_vibration_sources(ulog, OUTDIR, t0, t1)
+    write_verdict(ulog, OUTDIR / "imu_findings.txt")
+    print("\nDone.")
+```
+
+#### 3. Plumb `(t0, t1)` through the four FFT-window-using functions
+
+Each currently has these two lines at the top:
+
+```python
+t0 = max(0.0, 56.0 - PRE_S)
+t1 = min(EVENT_START_S + 5, 80.0)
+```
+
+Replace with parameters in the signatures. Affected functions and current
+locations:
+
+- `fft_around_event(ulog, outdir, show_lpf=True)` — around line 218.
+  → `fft_around_event(ulog, outdir, t0, t1, show_lpf=True)`. Drop the
+  inline t0/t1 computation. Update the title which references `t0`/`t1`.
+- `fft_magnitude_around_event(ulog, outdir, show_lpf=True)` — around 322.
+  Same change.
+- `fft_spectrum_around_event(ulog, outdir, show_lpf=True)` — around 372.
+  Same change.
+- `plot_vibration_sources(ulog, outdir)` — around 619. Same change; passes
+  (t0, t1) on to `_plot_source_panel`, which already accepts them.
+
+#### 4. Things NOT changed
+
+- `EVENT_START_S`, `EVENT_END_S`, `PRE_S` constants stay in the config block
+  as fallback defaults (still consumed by `write_verdict` for its "during the
+  event" metric stats — these reference the dropout window, not the FFT window).
+- `LPF_CUTOFFS` and `HW_REFERENCES` keep their current defaults; YAML can
+  override them at load time. `add_lpf_lines` keeps reading the module
+  globals, no signature change.
+- All plotting style, FFT methods, units (g for accel, deg/s for gyro),
+  filenames, source-plot logic — untouched.
+
+## Critical files
+
+- `/home/choudhury/analysis/flight_tests/oddjob/firstHover/UNORGANIZED/first_tunes/analyze_imu_vibration.py` — edited.
+- `/home/choudhury/analysis/flight_tests/oddjob/firstHover/UNORGANIZED/first_tunes/imuConfig.yaml` — new file.
+- Reference: `px4_accel_fifo_fft.py` `--start`/`--duration` argparse
+  pattern (already used in this directory) — same naming feel for consistency.
+
+## Verification
+
+1. Default run (no flags): `python analyze_imu_vibration.py log_1_2026-4-29-13-48-36.ulg`
+   - Should print `FFT window: t0=…s  t1=…s  (~66s)` covering the full log.
+   - Generates all 17 PNGs without crash.
+2. CLI override: `python analyze_imu_vibration.py log_1_2026-4-29-13-48-36.ulg --start 46 --end 77.76`
+   - FFT window matches the previous hardcoded one. Comparing PSD/spectrum
+     PNGs against the pre-change run on the same log should yield identical
+     curves (modulo Δf changes from `nperseg` capping).
+3. YAML override: `python analyze_imu_vibration.py log_1_2026-4-29-13-48-36.ulg --config imuConfig.yaml`
+   - Loads `imuConfig.yaml`. Since YAML defaults match script defaults,
+     verdict text and LPF lines should be identical to the no-config run.
+4. PyYAML missing handling: temporarily uninstall yaml or rename it on the
+   import path, rerun with `--config` → script should exit cleanly with
+   "PyYAML required" message rather than crash.
+5. New log: drop another `.ulg` in the dir, run with no flags → should
+   produce all plots over the full log with no edits to the script.
