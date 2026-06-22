@@ -1,6 +1,0 @@
-# Run artifacts (ulogs, copied params, SITL stdout logs)
-logs/
-
-# Python bytecode
-__pycache__/
-*.pyc

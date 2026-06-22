@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-set -e
-export PX4_HOST_REPO="${PX4_HOST_REPO:-$PWD}"
-COMPOSE_FILE="${HOME}/tools/dev/docker_runner/docker-compose.dev.yaml"
-docker compose -f "$COMPOSE_FILE" up -d px4_dev
-exec docker compose -f "$COMPOSE_FILE" exec px4_dev bash

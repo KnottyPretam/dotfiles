@@ -1,4 +1,0 @@
-# Memory Index
-
-- [px4-notes workflow](px4-notes-workflow.md) — how to author the user's PX4 deep-dive notes (md+html+svg, provenance, pandoc)
-- [px4 repo environment](px4-repo-environment.md) — CodeGraphContext DB is indexed; pandoc/inkscape yes, graphviz no

@@ -1,1 +1,0 @@
-- [EKF NED reconstruction tool](ekf-ned-reconstruction-tool.md) — IMU-only strapdown vs EKF vs GPS; uses vehicle_imu[0] (the EKF's input, confirmed via params+source); flight log shows GPS *position* drifts ~6m while stationary

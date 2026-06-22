@@ -1,1 +1,0 @@
-- [EKF NED reconstruction tool](ekf-ned-reconstruction-tool.md) — IMU-only strapdown vs EKF vs GPS; now at tools/dev/ekf_ned_reconstruction/; rebuilds vehicle_imu from raw FIFO (batch-mean+coning) when absent; matches by device_id; airborne vibration drives real divergence, ground GPS position drifts ~6m

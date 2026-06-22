@@ -1,2 +1,0 @@
-- [oddjob vibe PSD summary](oddjob-vibe-psd-summary.md) — CSV tooling, gyro device_id 6684714, real peak ~99.4 Hz
-- [oddjob recreate angular velocity](oddjob-recreate-angular-velocity.md) — recreate_angular_velocity.py: rebuild vehicle_angular_velocity from FIFO + tune filters; FIFO-dropout ringing gotcha; controller gyro 3670026 @8kHz
