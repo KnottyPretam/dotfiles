@@ -4,23 +4,15 @@
       "source": "github",
       "repo": "anthropics/claude-plugins-official"
     },
-    "installLocation": "/home/choudhury/.claude/plugins/marketplaces/claude-plugins-official",
-    "lastUpdated": "2026-06-09T17:40:15.470Z"
+    "installLocation": "/home/pchoudhury/.claude/plugins/marketplaces/claude-plugins-official",
+    "lastUpdated": "2026-09-18T20:58:46.848Z"
   },
-  "mempalace": {
+  "openai-codex": {
     "source": {
       "source": "github",
-      "repo": "MemPalace/mempalace"
+      "repo": "openai/codex-plugin-cc"
     },
-    "installLocation": "/home/choudhury/.claude/plugins/marketplaces/mempalace",
-    "lastUpdated": "2026-04-30T12:26:08.728Z"
-  },
-  "hamel-review": {
-    "source": {
-      "source": "github",
-      "repo": "hamelsmu/claude-review-loop"
-    },
-    "installLocation": "/home/choudhury/.claude/plugins/marketplaces/hamel-review",
-    "lastUpdated": "2026-06-05T21:20:25.880Z"
+    "installLocation": "/home/pchoudhury/.claude/plugins/marketplaces/openai-codex",
+    "lastUpdated": "2026-09-18T20:07:53.791Z"
   }
 }

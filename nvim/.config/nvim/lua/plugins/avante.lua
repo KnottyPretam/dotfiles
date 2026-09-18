@@ -1,3 +1,21 @@
+-- Codex (ChatGPT plan) credentials come from the Codex CLI's auth.json.
+-- The access token rotates every few hours and only `codex` itself refreshes
+-- it, so it is re-read per request via api_key_name = "cmd:...". The account
+-- id is stable, so it is read once here at startup.
+local codex_auth_path = vim.fn.expand("~/.codex/auth.json")
+
+local function codex_account_id()
+  local ok, lines = pcall(vim.fn.readfile, codex_auth_path)
+  if not ok or type(lines) ~= "table" then return "" end
+  local ok2, data = pcall(vim.json.decode, table.concat(lines, "\n"))
+  if not ok2 or type(data) ~= "table" then return "" end
+  local tokens = type(data.tokens) == "table" and data.tokens or {}
+  return tokens.account_id or data.account_id or ""
+end
+
+-- Codex sends a stable per-process session id.
+local codex_session_id = vim.fn.trim(vim.fn.system("uuidgen"))
+
 return {
   "yetone/avante.nvim",
   event = "VeryLazy",
@@ -19,26 +37,49 @@ return {
   opts = {
     mode = "agentic",
 
-    -- Use Codex via ACP, not the OpenAI API provider.
+    -- Default: Codex gpt-5.6-sol on the ChatGPT plan.
     provider = "codex",
 
-    -- Explicit Codex ACP setup for ChatGPT-subscription auth.
-    -- Do NOT pass OPENAI_API_KEY/CODEX_API_KEY here if you want subscription billing.
-    acp_providers = {
-      ["codex"] = {
-        command = "npx",
-        args = { "-y", "-g", "@zed-industries/codex-acp" },
-        env = {
-          NODE_NO_WARNINGS = "1",
-          HOME = os.getenv("HOME"),
-          PATH = os.getenv("PATH"),
+    -- Traditional API providers
+    providers = {
+      -- Codex on your ChatGPT plan. NOTE: chatgpt.com/backend-api/codex is the
+      -- Codex CLI's private backend, not a public API -- the request shape and
+      -- these headers are reverse-engineered and may break without notice.
+      -- If auth fails, run `codex` once to refresh the token, then retry.
+      codex = {
+        __inherited_from = "openai",
+        endpoint = "https://chatgpt.com/backend-api/codex",
+        model = "gpt-5.6-sol",
+        timeout = 60000,
+        -- Codex speaks the Responses API, not /chat/completions.
+        use_response_api = true,
+        api_key_name = [[cmd:python3 -c "import json,sys;d=json.load(open('/home/pchoudhury/.codex/auth.json'));t=d.get('tokens') or {};sys.stdout.write(t.get('access_token') or d.get('OPENAI_API_KEY') or '')"]],
+        extra_headers = {
+          ["chatgpt-account-id"] = codex_account_id(),
+          ["OpenAI-Beta"] = "responses=experimental",
+          ["originator"] = "codex_cli_rs",
+          ["session_id"] = codex_session_id,
+        },
+        extra_request_body = {
+          -- avante rewrites reasoning_effort -> reasoning.effort for the
+          -- Responses API. "minimal" = answer immediately, no deliberation.
+          reasoning_effort = "minimal",
+          store = false,
         },
       },
-    },
-
-
-    -- Traditional API providers. Both Ollama models live here.
-    providers = {
+      claude = {
+        endpoint = "https://api.anthropic.com",
+        model = "claude-haiku-4-5",
+        timeout = 60000,
+        api_key_name = "ANTHROPIC_API_KEY",
+        -- Avante deep-merges its default extra_request_body
+        -- ({ temperature = 0.75, max_tokens = 64000 }) into this block; 64000 is
+        -- well past what a quick answer needs. temperature is stripped
+        -- automatically for claude-haiku-[4-9].
+        extra_request_body = {
+          max_tokens = 8192,
+        },
+      },
       ollama = {
         endpoint = "http://127.0.0.1:11434",  -- no /v1
         model = "gpt-oss:20b",
@@ -102,6 +143,9 @@ return {
       "MeanderingProgrammer/render-markdown.nvim",
       opts = {
         file_types = { "markdown" },
+        -- No LaTeX in these notes, and no latex2text/utftex installed to render
+        -- it; leaving it on is three health warnings for nothing.
+        latex = { enabled = false },
       },
       ft = { "markdown" },
     },

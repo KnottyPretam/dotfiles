@@ -1,21 +1,59 @@
 {
+  "permissions": {
+    "allow": [
+      "Bash(/home/pchoudhury/.claude/forgejo-get.sh:*)",
+      "Bash(git -C /home/pchoudhury/obsidian_vaults/tiberius add:*)",
+      "Bash(git -C /home/pchoudhury/obsidian_vaults/tiberius commit:*)",
+      "Bash(git -C /home/pchoudhury/obsidian_vaults/tiberius push:*)",
+      "Bash(git -C /home/pchoudhury/obsidian_vaults/tiberius pull:*)",
+      "Bash(git -C /home/pchoudhury/obsidian_vaults/tiberius status:*)"
+    ]
+  },
+  "model": "sonnet",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/pchoudhury/.local/bin/graphify hook-guard search"
+          }
+        ]
+      },
+      {
+        "matcher": "Read|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/home/pchoudhury/.local/bin/graphify hook-guard read"
+          }
+        ]
+      }
+    ]
+  },
   "enabledPlugins": {
-    "mempalace@mempalace": true,
-    "review-loop@hamel-review": true
+    "clangd-lsp@claude-plugins-official": true,
+    "lua-lsp@claude-plugins-official": true,
+    "codex@openai-codex": true
   },
   "extraKnownMarketplaces": {
-    "mempalace": {
+    "openai-codex": {
       "source": {
         "source": "github",
-        "repo": "MemPalace/mempalace"
-      }
-    },
-    "hamel-review": {
-      "source": {
-        "source": "github",
-        "repo": "hamelsmu/claude-review-loop"
+        "repo": "openai/codex-plugin-cc"
       }
     }
   },
-  "effortLevel": "xhigh"
+  "effortLevel": "xhigh",
+  "modelSettings": {
+    "claude-haiku-4-5": {
+      "effortLevel": "high"
+    },
+    "claude-opus-5": {
+      "effortLevel": "xhigh"
+    }
+  },
+  "tui": "fullscreen",
+  "theme": "dark"
 }

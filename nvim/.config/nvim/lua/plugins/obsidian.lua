@@ -13,12 +13,11 @@ return {
     legacy_commands = false,
     workspaces = {
       {
-        name = "knightwerx",
-        path = "~/knightwerx-vault",     -- <-- point to YOUR existing vault folder
+        name = "tiberius",
+        path = "~/obsidian_vaults/tiberius",     -- <-- point to YOUR existing vault folder
       },
     },
     completion = {
-      nvim_cmp = true,              -- set false if you use blink.cmp
       min_chars = 2,
     },
     picker = { name = "telescope.nvim" },

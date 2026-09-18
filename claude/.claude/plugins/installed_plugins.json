@@ -1,24 +1,40 @@
 {
   "version": 2,
   "plugins": {
-    "mempalace@mempalace": [
+    "clangd-lsp@claude-plugins-official": [
+      {
+        "scope": "project",
+        "projectPath": "/home/pchoudhury",
+        "installPath": "/home/pchoudhury/.claude/plugins/cache/claude-plugins-official/clangd-lsp/1.0.0",
+        "version": "1.0.0",
+        "installedAt": "2026-08-12T19:47:44.824Z",
+        "lastUpdated": "2026-08-12T19:47:44.824Z"
+      },
       {
         "scope": "user",
-        "installPath": "/home/choudhury/.claude/plugins/cache/mempalace/mempalace/3.3.3",
-        "version": "3.3.3",
-        "installedAt": "2026-04-30T12:26:08.968Z",
-        "lastUpdated": "2026-04-30T12:26:08.968Z",
-        "gitCommitSha": "fdfaf017abd54270fe44fe8faa5528c42e7d47f3"
+        "installPath": "/home/pchoudhury/.claude/plugins/cache/claude-plugins-official/clangd-lsp/1.0.0",
+        "version": "1.0.0",
+        "installedAt": "2026-08-14T13:51:55.433Z",
+        "lastUpdated": "2026-08-14T13:51:55.433Z"
       }
     ],
-    "review-loop@hamel-review": [
+    "lua-lsp@claude-plugins-official": [
       {
         "scope": "user",
-        "installPath": "/home/choudhury/.claude/plugins/cache/hamel-review/review-loop/1.8.0",
-        "version": "1.8.0",
-        "installedAt": "2026-06-05T21:20:26.184Z",
-        "lastUpdated": "2026-06-05T21:20:26.184Z",
-        "gitCommitSha": "244f4c7bc15e98552af7cc5a67e70dfcdea9ab12"
+        "installPath": "/home/pchoudhury/.claude/plugins/cache/claude-plugins-official/lua-lsp/1.0.0",
+        "version": "1.0.0",
+        "installedAt": "2026-09-02T22:01:28.187Z",
+        "lastUpdated": "2026-09-02T22:01:28.187Z"
+      }
+    ],
+    "codex@openai-codex": [
+      {
+        "scope": "user",
+        "installPath": "/home/pchoudhury/.claude/plugins/cache/openai-codex/codex/1.0.6",
+        "version": "1.0.6",
+        "installedAt": "2026-09-18T20:08:01.255Z",
+        "lastUpdated": "2026-09-18T20:08:01.255Z",
+        "gitCommitSha": "db52e28f4d9ded852ab3942cea316258ae4ef346"
       }
     ]
   }

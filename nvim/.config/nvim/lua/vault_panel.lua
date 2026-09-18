@@ -6,7 +6,7 @@ local state = {
 }
 
 local config = {
-  vault  = vim.fn.expand("~/knightwerx-vault"),  -- <-- your vault path
+  vault  = vim.fn.expand("${HOME}/obsidian_vaults/tiberius"),  -- <-- your vault path
   index  = "index.md",
   height = 15,
 }

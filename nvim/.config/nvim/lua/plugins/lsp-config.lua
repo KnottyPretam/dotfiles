@@ -36,8 +36,30 @@ return {
         },
       })
 
+      -- Harper is a grammar checker. Left at defaults it puts ~140 diagnostics on
+      -- a single wiki page: SentenceCapitalization fires on every markdown list
+      -- item, LongSentences on every nav strip. Keep the spell check, drop the
+      -- prose-style linters, and report at HINT so it underlines rather than
+      -- filling the sign column.
       vim.lsp.config("harper_ls", {
         capabilities = capabilities,
+        settings = {
+          ["harper-ls"] = {
+            diagnosticSeverity = "hint",
+            -- The vault is written in British English (334 British spellings to
+            -- 80 American); harper defaults to American and flags every one.
+            dialect = "British",
+            linters = {
+              SentenceCapitalization = false,
+              OxfordComma = false,
+              LongSentences = false,
+              PhrasalVerbAsCompoundNoun = false,
+              SpellCheck = true,
+            },
+            markdown = { IgnoreLinkTitle = true },
+            userDictPath = vim.fn.expand("~/.config/nvim/harper-dict.txt"),
+          },
+        },
       })
 
       vim.lsp.enable("lua_ls")

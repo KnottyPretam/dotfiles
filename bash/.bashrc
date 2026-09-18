@@ -2,6 +2,31 @@
 # see /usr/share/doc/bash/examples/startup-files (in the package bash-doc)
 # for examples
 
+# Forgejo API credentials. Placed above the non-interactive guard on
+# purpose: a shell that sources this file non-interactively returns at
+# that guard, and would never reach an export placed after it.
+export FORGEJO_URL="https://code.grail.tiberius.com"
+# FORGEJO_TOKEN is exported from ~/.bashrc.local (untracked, not in dotfiles).
+[ -f ~/.bashrc.local ] && . ~/.bashrc.local
+
+# WSLg: this user is not the WSL default user, so no per-user runtime dir is
+# created and XDG_RUNTIME_DIR is inherited from root's session (/run/user/0,
+# mode 700). Point it somewhere we own and link in the world-accessible WSLg
+# sockets. Keep the path short: sockaddr_un.sun_path caps at 108 bytes.
+if [ ! -w "${XDG_RUNTIME_DIR:-/nonexistent}" ]; then
+    if [ -w "/run/user/$(id -u)" ]; then
+        export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    else
+        export XDG_RUNTIME_DIR="/tmp/runtime-$(id -u)"
+        mkdir -p "$XDG_RUNTIME_DIR" && chmod 700 "$XDG_RUNTIME_DIR"
+    fi
+fi
+if [ -S /mnt/wslg/runtime-dir/wayland-0 ] && [ ! -e "$XDG_RUNTIME_DIR/wayland-0" ]; then
+    ln -sf /mnt/wslg/runtime-dir/wayland-0 "$XDG_RUNTIME_DIR/wayland-0"
+fi
+export WAYLAND_DISPLAY=wayland-0
+[ -S /mnt/wslg/PulseServer ] && export PULSE_SERVER=unix:/mnt/wslg/PulseServer
+
 # If not running interactively, don't do anything
 case $- in
     *i*) ;;
@@ -120,5 +145,20 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 export PATH="$HOME/tools/bin:$PATH"
 
+# CLAUDE
+NPM_PACKAGES="$HOME/.npm-packages"
+export PATH="$PATH:$NPM_PACKAGES/bin"
+
 # STARSHIP
 eval "$(starship init bash)"
+
+export STM32_PRG_PATH=/home/pchoudhury/STMicroelectronics/STM32Cube/STM32CubeProgrammer/bin
+# Auto-mount GCS buckets under ~/google (see ~/.local/bin/gcs-mount).
+if [[ $- == *i* ]] && ! mountpoint -q "$HOME/google/gnc-ci"; then
+  gcs-mount
+fi
+
+# >>> grok installer >>>
+export PATH="$HOME/.grok/bin:$PATH"
+[[ -r "$HOME/.grok/completions/bash/grok.bash" ]] && source "$HOME/.grok/completions/bash/grok.bash"
+# <<< grok installer <<<
